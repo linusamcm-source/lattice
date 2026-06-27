@@ -1,0 +1,16 @@
+# team-sprint configuration for the Lattice build.
+# Stories execute in isolated git worktrees and merge back to `main`.
+plan_path: docs/sprints/phase-0-walking-skeleton.md
+target_branch: main
+coverage_threshold: 80
+coverage_mode: new
+graphify: off          # tiny codebase; repomix text-grep is sufficient recon
+crew: auto             # resolves .claude/crews/<lang>.json (rust + typescript built)
+push_on_merge: false
+
+commands:
+  test: just test
+  lint: just lint
+  typecheck: cargo check
+  # cargo-llvm-cov 0.8.7 installed; emits cobertura where coverage_check.sh autodetects it.
+  coverage: "mkdir -p target/tarpaulin && cargo llvm-cov --all --cobertura --output-path target/tarpaulin/cobertura.xml"
