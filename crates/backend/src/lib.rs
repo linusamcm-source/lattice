@@ -8,7 +8,11 @@
 //!   [`wire::Edge`], and [`wire::EventEnvelope`] types, the Phase-0 payload
 //!   variants, and the deterministic id helpers ([`wire::node_id`] /
 //!   [`wire::edge_id`]) that mirror `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
+//! - [`parser`] — a `syn`-based Rust source parser that lowers a single file to
+//!   the structural [`wire::Node`]/[`wire::Edge`] graph contribution
+//!   ([`parser::parse_rust_source`]), recovering panic-free from syntax errors.
 
+pub mod parser;
 pub mod wire;
 
 /// Returns the CLV wire-protocol sentinel this build speaks.
