@@ -14,9 +14,13 @@
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a `snapshot` and diffing a re-parsed file into `node.*`/`edge.*`
 //!   patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
+//! - [`watcher`] — a debounced `notify` filesystem watcher
+//!   ([`watcher::watch`]) that forwards changed `.rs` file paths, coalescing
+//!   rapid bursts within [`watcher::DEBOUNCE`].
 
 pub mod graph;
 pub mod parser;
+pub mod watcher;
 pub mod wire;
 
 /// Returns the CLV wire-protocol sentinel this build speaks.
