@@ -1,3 +1,10 @@
-<!-- Placeholder index route (P0-7). The WS client + SvelteFlow render arrives in P0-8. -->
-<!-- The text-red-500 utility forces Tailwind's JIT to emit the class into the built CSS. -->
-<p class="text-red-500">Lattice</p>
+<!-- P0-8 index route: the SvelteFlow two-tier live render fed by the WS store. -->
+<script lang="ts">
+	import Graph from '$lib/Graph.svelte';
+</script>
+
+<main class="relative h-screen w-screen">
+	<!-- Keeps Tailwind's JIT emitting `text-red-500` (P0-7's built-CSS assertion). -->
+	<header class="absolute left-3 top-3 z-10 text-red-500">Lattice</header>
+	<Graph />
+</main>

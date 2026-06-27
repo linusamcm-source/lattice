@@ -1,9 +1,9 @@
 # Lattice Frontend
 
 SvelteKit + Vite + TypeScript (strict) client for the Lattice live code & agent
-visualiser. Phase 0 is a scaffold only: a placeholder index route plus the test,
-lint, and build toolchain. The typed WebSocket client and the SvelteFlow two-tier
-render land in Story P0-8.
+visualiser. The Phase 0 walking skeleton streams CLV envelopes over a WebSocket
+into a reactive store and renders a flat two-tier SvelteFlow canvas (file nodes
+and their direct function children).
 
 ## Stack
 
@@ -32,11 +32,44 @@ All commands run from the `frontend/` directory, or from the repo root with
 | `npm test`         | Run the Vitest suite once.                                      |
 | `npm run coverage` | Run Vitest with v8 coverage → `coverage/coverage-final.json`.   |
 
+## WebSocket event flow (P0-8)
+
+The CLV wire contract is mirrored, `any`-free, in `src/lib/types.ts`. The
+`EventEnvelope` type is a discriminated union over `type`, so the five Phase 0
+payloads (`snapshot`, `node.upsert`, `node.remove`, `edge.upsert`, `edge.remove`)
+narrow without casts. `src/lib/ws.ts` is the client:
+
+1. `connect(url)` opens a `WebSocket` and registers an `onmessage` handler.
+2. `parseEnvelope(raw)` validates each untrusted message (JSON-parsing strings,
+   rejecting unknown `type`s and non-object payloads) and returns a typed
+   `EventEnvelope` or `null` — it never throws and never widens to `any`.
+3. `applyEvent(state, envelope)` is a **pure reducer** that folds one envelope
+   into an immutable `GraphState` (`Map<string, Node>` / `Map<string, Edge>`),
+   so it is unit-testable without a live socket. `snapshot` replaces the whole
+   graph; `*.upsert` inserts-or-updates by id; `*.remove` deletes by id.
+4. `ingest(envelope)` applies the reducer to the `graphStore`; components consume
+   the derived `nodes` / `edges` stores. Auto-reconnect is deferred to Phase 9.
+
+## Two-tier render model (P0-8)
+
+`src/lib/Graph.svelte` renders a flat **two-tier** SvelteFlow canvas from the
+`nodes` store. The CLV `Node` carries no coordinates, so `src/lib/layout.ts`
+(`buildTwoTier`) assigns deterministic positions: every `file` node stacks in a
+left column (`x = 0`), and each file's direct `function` children (nodes whose
+`parentId` equals a present file id) sit in a right column (`x = 280`), stepped
+so they never overlap. Labels render through SvelteFlow's default node
+(`data.label`). There is **no expand/collapse** — lazy-load and zoom-gating are
+Phase 1. The canvas mounts only after `onMount`, so SvelteKit prerender/SSR never
+instantiates the browser-only SvelteFlow component.
+
 ## Notes
 
 - Coverage uses the v8 provider and emits `coverage/coverage-final.json`
   (istanbul-compatible filename) which the sprint coverage gate autodetects.
-  A coverage threshold is intentionally deferred until P0-8 ships real source
-  to cover.
-- Tailwind is wired so the placeholder route's `text-red-500` is emitted into
-  the built CSS, confirming the JIT pipeline works end to end.
+  `ws.ts` and its reducer are covered ≥80% (currently 100% lines).
+- `vite.config.ts` registers `@testing-library/svelte/vite`'s `svelteTesting()`
+  plugin (adds the `browser` resolve condition under Vitest so Svelte 5's client
+  build is used) and `src/test-setup.ts`, which stubs the `ResizeObserver`,
+  `DOMMatrixReadOnly`, and `matchMedia` globals `@xyflow/svelte` needs in jsdom.
+- Tailwind is wired so the index route's `text-red-500` is emitted into the
+  built CSS, confirming the JIT pipeline works end to end.
