@@ -11,7 +11,11 @@
 //! - [`parser`] — a `syn`-based Rust source parser that lowers a single file to
 //!   the structural [`wire::Node`]/[`wire::Edge`] graph contribution
 //!   ([`parser::parse_rust_source`]), recovering panic-free from syntax errors.
+//! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
+//!   rendering a `snapshot` and diffing a re-parsed file into `node.*`/`edge.*`
+//!   patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
 
+pub mod graph;
 pub mod parser;
 pub mod wire;
 
