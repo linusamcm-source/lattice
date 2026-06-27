@@ -1,0 +1,14 @@
+[package]
+name = "lattice-backend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lattice_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[dependencies]

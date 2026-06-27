@@ -1,0 +1,7 @@
+.repomix-output.xml
+.claude/repomix/
+/target
+**/target
+node_modules/
+.DS_Store
+.lattice/
