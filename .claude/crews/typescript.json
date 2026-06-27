@@ -1,0 +1,49 @@
+{
+  "language": "typescript",
+  "stack_profile": ".claude/crews/typescript.profile.md",
+  "commands": {
+    "test": "npm test",
+    "coverage": "npm test -- --coverage",
+    "lint": "npm run lint",
+    "typecheck": "npm run check",
+    "build": "npm run build",
+    "dev": "npm run dev",
+    "e2e": "npx playwright test"
+  },
+  "crew": {
+    "architect": "architect-reviewer",
+    "developer": "typescript-developer",
+    "tester": "typescript-tester",
+    "profiler": "typescript-profiler",
+    "security": "typescript-security",
+    "code_reviewer": "code-reviewer",
+    "simplifier": "typescript-simplifier",
+    "docs_writer": "typescript-docs-writer",
+    "dependency_auditor": "typescript-dependency-auditor",
+    "accessibility": "typescript-accessibility"
+  },
+  "validation": {
+    "typescript-developer": "A",
+    "typescript-tester": "A",
+    "typescript-profiler": "A",
+    "typescript-security": "A",
+    "typescript-simplifier": "A",
+    "typescript-docs-writer": "A",
+    "typescript-dependency-auditor": "A",
+    "typescript-accessibility": "A"
+  },
+  "generated": [
+    "typescript-developer",
+    "typescript-tester",
+    "typescript-profiler",
+    "typescript-security",
+    "typescript-simplifier",
+    "typescript-docs-writer",
+    "typescript-dependency-auditor",
+    "typescript-accessibility"
+  ],
+  "reused": [
+    "architect-reviewer",
+    "code-reviewer"
+  ]
+}

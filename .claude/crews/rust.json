@@ -1,0 +1,47 @@
+{
+  "language": "rust",
+  "stack_profile": ".claude/crews/rust.profile.md",
+  "commands": {
+    "test": "just test",
+    "coverage": "",
+    "lint": "just lint",
+    "typecheck": "",
+    "build": "just build",
+    "quality_gate": "just qg",
+    "fmt": "just fmt",
+    "fmt_check": "just fmt-check"
+  },
+  "crew": {
+    "architect": "architect-reviewer",
+    "developer": "rust-developer",
+    "tester": "rust-tester",
+    "profiler": "rust-profiler",
+    "security": "rust-security",
+    "code_reviewer": "code-reviewer",
+    "simplifier": "rust-simplifier",
+    "docs_writer": "rust-docs-writer",
+    "dependency_auditor": "rust-dependency-auditor"
+  },
+  "validation": {
+    "rust-developer": "A",
+    "rust-tester": "A",
+    "rust-profiler": "A",
+    "rust-security": "A",
+    "rust-simplifier": "A",
+    "rust-docs-writer": "A",
+    "rust-dependency-auditor": "A"
+  },
+  "generated": [
+    "rust-developer",
+    "rust-tester",
+    "rust-profiler",
+    "rust-security",
+    "rust-simplifier",
+    "rust-docs-writer",
+    "rust-dependency-auditor"
+  ],
+  "reused": [
+    "architect-reviewer",
+    "code-reviewer"
+  ]
+}
