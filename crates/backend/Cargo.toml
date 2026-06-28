@@ -17,7 +17,17 @@ serde_json = "1"
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 notify = "8"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

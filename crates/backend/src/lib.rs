@@ -17,11 +17,16 @@
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed `.rs` file paths, coalescing
 //!   rapid bursts within [`watcher::DEBOUNCE`].
+//! - [`ws`] — a `tokio-tungstenite` WebSocket server ([`ws::serve`]) that sends
+//!   each connecting client the current [`graph::Graph`] `snapshot` and then
+//!   streams broadcast [`wire::EventEnvelope`]s, replying to a client snapshot
+//!   request with a fresh snapshot.
 
 pub mod graph;
 pub mod parser;
 pub mod watcher;
 pub mod wire;
+pub mod ws;
 
 /// Returns the CLV wire-protocol sentinel this build speaks.
 ///
