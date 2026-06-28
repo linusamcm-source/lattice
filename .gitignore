@@ -6,3 +6,5 @@ node_modules/
 .DS_Store
 .lattice/
 .team-sprint/
+.env
+graphify-out/
