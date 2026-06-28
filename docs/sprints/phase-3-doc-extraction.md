@@ -9,9 +9,9 @@ shown doc.
 **Grounding (read this session; Phases 0–2 + run-recipe merged at `ec0d0d2`):**
 - `crates/backend/src/wire.rs` — `Node.docs: Option<String>` (wire.rs:230) already exists in the model.
 - `crates/backend/src/parser/mod.rs` (Rust/syn path) — `push_function(nodes, edges, file_id, path,
-  ident: &syn::Ident, body: Option<&syn::Block>)` builds function nodes with `docs: None` (mod.rs:175);
-  variable nodes set `docs: None` (mod.rs:208); the `file` node is built via `file_node(...)` with
-  `docs: None` (mod.rs:270). `push_function` is **not** currently passed the item's `attrs`, so Rust
+  ident: &syn::Ident, body: Option<&syn::Block>)` builds function nodes with `docs: None` (mod.rs:233);
+  variable nodes set `docs: None` (mod.rs:295); the `file` node is built via `file_node(...)` with
+  `docs: None` (mod.rs:202). `push_function` is **not** currently passed the item's `attrs`, so Rust
   doc extraction must thread `&[syn::Attribute]` (outer `///`/`#[doc]`) through it, and read the
   module-level inner doc (`//!`) from `syn::File.attrs` for the file node. (Mirrors how P1-1 threaded
   the function `Block` in.)
@@ -25,7 +25,14 @@ shown doc.
 
 **Scope discipline (BUILD_PLAN.md Phase 3):** doc extraction + hover/sidebar surfacing only. No
 param/data-flow edges (Phase 4), no test-tracking (Phase 5). The node/edge structure, ids, lazy
-pipeline, and the existing tests are unchanged; only `docs` is now populated and rendered. Commands:
+pipeline, and the existing tests are unchanged; only `docs` is now populated and rendered.
+**Doc-scope (deliberate subset of SPEC §6.5):** Phase 3 extracts **function** docs for all three
+languages, plus the **Rust module (`//!`)** doc onto the file node. Python/TypeScript module
+(file-level) docstrings and **class/interface-level** docs, and **variable-level** docs for every
+language, are deferred to a later refinement — BUILD_PLAN.md's Phase-3 "Accept when" is function-level,
+so the phase gate is unaffected. The "updating the source updates the shown doc" acceptance rides the
+existing `apply_parsed` → `node.upsert` pipeline (a changed `docs` makes the node non-byte-equal, so
+it is re-emitted — see P3-1/P3-3 ACs). Commands:
 backend `just qg`/`just test`; frontend (from `frontend/`, real npm `/opt/homebrew/bin/npm`) `npm run
 check`/`lint`/`test`/`build`. Coverage gate **90%** new-code.
 
@@ -50,6 +57,9 @@ None` (Rust `let` bindings carry no doc comments). Panic-free; ids/structure unc
 - Parsing `"fn bare() {}"` yields `fn:a.rs:bare` with `docs == None`.
 - Parsing `"//! Module docs.\nfn f() {}"` yields the `file:a.rs` node with `docs` containing
   `"Module docs."`.
+- Re-deriving docs reflects source edits: parsing `"/// v1\nfn f() {}"` then `"/// v2\nfn f() {}"` at
+  the same path yields `fn:a.rs:f` with `docs == Some("v1")` then `docs == Some("v2")` (so a doc edit
+  makes the node non-byte-equal and rides the existing `apply_parsed` → `node.upsert` live path).
 - All existing Phase-0/1/2 parser tests still pass (structure/ids unchanged).
 
 ### Definition of Done
@@ -63,10 +73,13 @@ Extend the generic tree-sitter extractor in `crates/backend/src/parser/treesitte
 per-language documentation rule (e.g. a `doc_for: fn(&TsNode, &[u8]) -> Option<String>` on
 `LanguageConfig`, or an equivalent strategy) that populates a function node's `docs`. **Python:** the
 docstring is the first statement of the function body when it is an `expression_statement` wrapping a
-`string`; strip the surrounding quotes (and `"""`), returning the inner text trimmed. **TypeScript:** a
-JSDoc block is a `comment` node of the form `/** ... */` immediately preceding the
-`function_declaration`; strip the `/**`, `*/`, and per-line leading `*`, returning the text trimmed.
-`None` when absent. Variable docs stay `None`. Panic-free; ids/structure unchanged.
+`string`; read that string's `string_content` child node text (this covers `"`, `'`, `"""`, `'''`,
+and `r`/`b`/`f`-prefixed strings uniformly — do **not** hand-strip quotes), trimmed. **TypeScript:** a
+JSDoc block is the `function_declaration`'s `prev_sibling()` of kind `comment` whose text begins with
+`/**`; strip the `/**`, trailing `*/`, and per-line leading `* `, returning the text trimmed
+(tree-sitter does not tokenise whitespace, so the newline between the comment and the declaration is
+not an intervening node). `None` when absent. Variable + module/class docs stay `None` (deferred per
+the doc-scope note). Panic-free; ids/structure unchanged.
 
 ### Depends On: none
 ### Touches: crates/backend/src/parser/treesitter.rs
@@ -87,26 +100,38 @@ JSDoc block is a `comment` node of the form `/** ... */` immediately preceding t
 
 ## Story P3-3: Frontend doc tooltip + selection sidebar
 
-Surface `node.docs` in the SvelteFlow UI. In `frontend/src/lib/HierarchyNode.svelte`, expose the node's
-`docs` as a hover tooltip (e.g. a `title` attribute / tooltip element carrying the docs text, present
-at every tier — file/function/variable). Add a `frontend/src/lib/Sidebar.svelte` that, given the
-currently selected node, renders its `label` and `docs` (or an explicit "no documentation" state when
-`docs` is absent); wire node selection (clicking a node selects it) through `Graph.svelte` /
-`+page.svelte`. `node.docs` is already typed (`types.ts:82`); no `any` introduced.
+Surface `node.docs` in the SvelteFlow UI. **Thread docs through the layout** (`HierarchyNode` only
+sees the `data` built by `buildHierarchy`): extend `HierarchyNodeData` in `frontend/src/lib/layout.ts`
+with `docs?: string` and an `onSelect: (id: string) => void`, and have `buildHierarchy` copy each
+node's `docs` into its data. In `HierarchyNode.svelte`, bind `data.docs` to a **`title` attribute** on
+the node's content (a hover tooltip that is queryable in jsdom even under SvelteFlow's
+`visibility:hidden`, present at every tier — file/function/variable), and make the label/content region
+a `data-testid`-bearing clickable that calls `data.onSelect(id)`; the existing expand `<button>` must
+call `event.stopPropagation()` before `data.onToggle(id)` so expanding does **not** also select. Add a
+`frontend/src/lib/Sidebar.svelte` rendering the selected node's `label` and `docs` (or an explicit "no
+documentation" empty state when `docs` is absent). In `Graph.svelte` hold a `selected` node id (set via
+`onSelect`), pass the selected node to `Sidebar`, and render the sidebar alongside the canvas;
+`+page.svelte` mounts it. `node.docs` is already typed (`types.ts:82`); no `any`. Component tests mount
+`HierarchyNode` inside a `SvelteFlowProvider` (it imports `Handle`) and assert via `title` /
+`data-testid` + text — not SvelteFlow node-selection internals — matching the existing harness
+(`Graph.test.ts` already documents the `visibility:hidden` / `data-testid` approach).
 
 ### Depends On: P3-1, P3-2
-### Touches: frontend/src/lib/Graph.svelte, frontend/src/lib/HierarchyNode.svelte, frontend/src/lib/Sidebar.svelte, frontend/src/lib/Sidebar.test.ts, frontend/src/routes/+page.svelte
+### Touches: frontend/src/lib/Graph.svelte, frontend/src/lib/HierarchyNode.svelte, frontend/src/lib/layout.ts, frontend/src/lib/Sidebar.svelte, frontend/src/lib/Sidebar.test.ts, frontend/src/lib/Graph.test.ts, frontend/src/routes/+page.svelte
 
 ### Acceptance Criteria
-- A `@testing-library/svelte` test mounting a node whose `docs == "Hello docs"` renders an element
-  carrying that text as a hover tooltip (assert a `title="Hello docs"` attribute or a tooltip element
-  containing the text) on the node.
+- A `@testing-library/svelte` test mounting `HierarchyNode` (inside a `SvelteFlowProvider`) with
+  `data.docs == "Hello docs"` renders an element carrying `title="Hello docs"`.
 - Mounting `Sidebar.svelte` with a selected node `{ label: "add", docs: "Adds two numbers." }` renders
   both the label `add` and the docs text `Adds two numbers.`.
 - Mounting `Sidebar.svelte` with a selected node whose `docs` is undefined renders the label and a
-  "no documentation" (or equivalent empty-state) indicator, not a crash or `undefined` text.
-- Selecting a node in `Graph.svelte` (simulated click) updates the sidebar to show that node's docs
-  (assert the docs text appears after selection).
+  "no documentation" (or equivalent empty-state) indicator — not a crash or the literal `undefined`.
+- In `Graph.svelte`, clicking a node's `data-testid` content region invokes `onSelect` with that node's
+  id and the sidebar shows that node's docs; clicking the expand **button** does NOT change the
+  selection (the button `stopPropagation`s).
+- Applying a `node.upsert` whose node carries updated `docs` for the currently-selected node updates
+  the rendered sidebar text (proves the live "updating the source updates the shown doc" path through
+  the existing store → render pipeline).
 
 ### Definition of Done
 - RED component tests first (`typescript-tester`), then `typescript-developer`; new component logic
