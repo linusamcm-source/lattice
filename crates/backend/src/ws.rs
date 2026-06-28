@@ -4,10 +4,12 @@
 //! [`BoundServer`] exposing the **actual** bound address (so a test may pass
 //! `127.0.0.1:0` and read back the ephemeral port) plus a shutdown handle. Each
 //! accepted connection is handled independently and panic-free: the per-connection
-//! task first sends the current graph `snapshot`, then forwards every
+//! task first sends the current graph (root-only) `snapshot`, then forwards every
 //! [`EventEnvelope`](crate::wire::EventEnvelope) published on the shared
-//! [`broadcast`] channel as JSON text, while concurrently honouring a client
-//! `{"type":"snapshot"}` request with a fresh snapshot.
+//! [`broadcast`] channel as JSON text, while concurrently honouring two client
+//! requests — `{"type":"snapshot"}` with a fresh snapshot and
+//! `{"type":"expand","nodeId":...}` with that node's `subtree` (its direct
+//! children), the Phase-1 lazy-hierarchy load path.
 //!
 //! Per `AGENT_PROTOCOL.md` §6 nothing here unwraps on bad input: a client that
 //! closes, errors, or lags simply drops out of the fan-out without disturbing the
@@ -71,9 +73,10 @@ impl BoundServer {
 /// a [`BoundServer`] immediately so a caller can connect without racing the loop.
 ///
 /// Each accepted client is served by [`handle_connection`]: it is first sent the
-/// current `graph` snapshot, then every [`EventEnvelope`] broadcast on `events`,
-/// and a client `{"type":"snapshot"}` text frame triggers a fresh snapshot reply.
-/// `graph` is shared behind a [`Mutex`] so the snapshot reflects concurrent
+/// current `graph` (root-only) snapshot, then every [`EventEnvelope`] broadcast on
+/// `events`; a client `{"type":"snapshot"}` frame triggers a fresh snapshot reply
+/// and a `{"type":"expand","nodeId":...}` frame triggers that node's `subtree`
+/// reply. `graph` is shared behind a [`Mutex`] so replies reflect concurrent
 /// mutations; `events` is the fan-out [`broadcast`] sender the graph publishes on.
 ///
 /// # Errors
@@ -115,10 +118,11 @@ pub async fn serve(
 /// Upgrades `stream` to a WebSocket, subscribes to `events` **before** sending the
 /// initial snapshot (so a client that has received the snapshot is guaranteed to be
 /// in the fan-out and will miss no subsequent broadcast), then loops: forwarding
-/// each broadcast [`EventEnvelope`] as JSON text and replying to a client
-/// `{"type":"snapshot"}` request with a fresh snapshot. Returns when the client
-/// closes or errors, or the broadcast channel closes. Lagged broadcasts are skipped
-/// rather than fatal.
+/// each broadcast [`EventEnvelope`] as JSON text and replying to client requests —
+/// `{"type":"snapshot"}` with a fresh root-only snapshot and
+/// `{"type":"expand","nodeId":...}` with that node's `subtree`. Returns when the
+/// client closes or errors, or the broadcast channel closes. Lagged broadcasts are
+/// skipped rather than fatal.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     graph: Arc<Mutex<Graph>>,
@@ -147,12 +151,18 @@ async fn handle_connection(
                     if msg.is_close() {
                         break;
                     }
-                    let wants_snapshot = msg.to_text().map(is_snapshot_request).unwrap_or(false);
-                    if wants_snapshot {
-                        let snapshot = graph.lock().await.snapshot();
-                        write
-                            .send(Message::text(serde_json::to_string(&snapshot)?))
-                            .await?;
+                    if let Ok(text) = msg.to_text() {
+                        if is_snapshot_request(text) {
+                            let snapshot = graph.lock().await.snapshot();
+                            write
+                                .send(Message::text(serde_json::to_string(&snapshot)?))
+                                .await?;
+                        } else if let Some(node_id) = expand_request_node_id(text) {
+                            let subtree = graph.lock().await.subtree(&node_id);
+                            write
+                                .send(Message::text(serde_json::to_string(&subtree)?))
+                                .await?;
+                        }
                     }
                 }
                 Some(Err(_)) | None => break,
@@ -177,6 +187,25 @@ fn is_snapshot_request(text: &str) -> bool {
                 .map(|t| t == "snapshot")
         })
         .unwrap_or(false)
+}
+
+/// Returns the requested node id when `text` is a client `expand` request.
+///
+/// The Phase-1 client lazily loads a node's direct children by sending the JSON
+/// text `{"type":"expand","nodeId":"<id>"}` (mirroring the `{"type":"snapshot"}`
+/// resync request); the server replies with that node's `subtree`. Returns
+/// `Some(node_id)` only for a well-formed request. Parsing is panic-free: any
+/// non-JSON, non-object, `type != "expand"`, or missing/non-string `nodeId`
+/// yields `None`.
+fn expand_request_node_id(text: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str)? != "expand" {
+        return None;
+    }
+    value
+        .get("nodeId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -307,5 +336,88 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(is_snapshot_request(input), want, "input: {input}");
         }
+    }
+
+    #[test]
+    fn expand_request_node_id_extracts_only_well_formed_expand() {
+        let cases = [
+            (
+                "{\"type\":\"expand\",\"nodeId\":\"file:a.rs\"}",
+                Some("file:a.rs"),
+            ),
+            ("{\"type\":\"snapshot\"}", None),
+            ("{\"type\":\"expand\"}", None),
+            ("{\"nodeId\":\"file:a.rs\"}", None),
+            ("not json", None),
+            ("{}", None),
+            ("[]", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                expand_request_node_id(input).as_deref(),
+                want,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expand_request_yields_a_subtree_of_direct_children() {
+        let mut graph = Graph::new();
+        graph.upsert_node(Node {
+            id: "file:src/x.rs".to_string(),
+            node_type: NodeType::File,
+            label: "x.rs".to_string(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            status: NodeStatus::Unknown,
+            docs: None,
+            signature: None,
+            meta: None,
+        });
+        graph.upsert_node(Node {
+            id: "fn:src/x.rs:f".to_string(),
+            node_type: NodeType::Function,
+            label: "f".to_string(),
+            parent_id: Some("file:src/x.rs".to_string()),
+            child_ids: Vec::new(),
+            status: NodeStatus::Unknown,
+            docs: None,
+            signature: None,
+            meta: None,
+        });
+        let graph = Arc::new(Mutex::new(graph));
+        let (tx, _rx) = broadcast::channel(16);
+        let server = serve("127.0.0.1:0".parse().unwrap(), graph, tx)
+            .await
+            .expect("server binds");
+        let mut ws = connect(server.addr).await;
+
+        // Drain the lazy snapshot first.
+        let snapshot = next_envelope(&mut ws).await;
+        assert_eq!(snapshot.event_type, EventType::Snapshot);
+
+        ws.send(Message::text(
+            "{\"type\":\"expand\",\"nodeId\":\"file:src/x.rs\"}",
+        ))
+        .await
+        .expect("send expand");
+
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Subtree);
+        match env.payload {
+            Payload::Subtree {
+                parent_id, nodes, ..
+            } => {
+                assert_eq!(parent_id, "file:src/x.rs");
+                assert!(
+                    nodes.iter().any(|n| n.id == "fn:src/x.rs:f"),
+                    "subtree must include the direct function child: {nodes:?}"
+                );
+            }
+            other => panic!("expected subtree payload, got {other:?}"),
+        }
+
+        server.shutdown().await;
     }
 }

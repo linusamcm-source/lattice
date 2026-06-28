@@ -134,7 +134,7 @@ mod tests {
     use super::*;
     use crate::watcher::DEBOUNCE;
     use crate::wire::{EventType, NodeStatus, Payload};
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn initial_snapshot_contains_repo_relative_function_id() {
+    async fn initial_snapshot_is_root_only_then_expand_yields_the_function() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.rs"), "fn alpha() {}").expect("write");
         let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
@@ -174,15 +174,46 @@ mod tests {
         let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
             .await
             .expect("connect");
+
+        // The initial snapshot is lazy: the root file node, but not its function child.
         let env = next_envelope(&mut ws).await;
         assert_eq!(env.event_type, EventType::Snapshot);
         match env.payload {
-            Payload::Snapshot { nodes, .. } => assert!(
-                nodes.iter().any(|n| n.id == "fn:a.rs:alpha"),
-                "ids: {:?}",
-                nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
-            ),
+            Payload::Snapshot { nodes, .. } => {
+                assert!(
+                    nodes.iter().any(|n| n.id == "file:a.rs"),
+                    "snapshot must carry the root file node: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+                assert!(
+                    !nodes.iter().any(|n| n.id == "fn:a.rs:alpha"),
+                    "lazy snapshot must NOT carry the child function: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
             other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        // Expanding the repo-relative file id yields a subtree with the function.
+        ws.send(Message::text(
+            "{\"type\":\"expand\",\"nodeId\":\"file:a.rs\"}",
+        ))
+        .await
+        .expect("send expand");
+        let subtree = next_envelope(&mut ws).await;
+        assert_eq!(subtree.event_type, EventType::Subtree);
+        match subtree.payload {
+            Payload::Subtree {
+                parent_id, nodes, ..
+            } => {
+                assert_eq!(parent_id, "file:a.rs");
+                assert!(
+                    nodes.iter().any(|n| n.id == "fn:a.rs:alpha"),
+                    "expand must reveal the function child: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected subtree, got {other:?}"),
         }
         handle.shutdown().await;
     }

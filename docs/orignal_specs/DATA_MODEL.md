@@ -64,9 +64,11 @@ edge: e:<source-symbol>-><target-symbol>   e.g.  e:authenticate->verify_token
 ```json
 { "v": 1, "ts": "2026-06-27T10:32:01.123Z", "sessionId": "sess-abc123", "type": "node.upsert", "payload": {} }
 ```
-- **`type`**: `node.upsert | node.remove | edge.upsert | edge.remove | status.update | test.result | agent.activity | hot_edge | agent.roster | snapshot | error`
-- `snapshot` carries the full current graph (sent on connect / reconnect resync).
-- Client→server requests: `expand` (request a subtree), `snapshot` (request full resync).
+- **`type`**: `node.upsert | node.remove | edge.upsert | edge.remove | status.update | test.result | agent.activity | hot_edge | agent.roster | snapshot | subtree | error`
+- `snapshot` is the **lazy (root-only) top level**: it carries only root nodes (file nodes, `parentId == null`) and the edges among them, sent on connect / reconnect resync. Deeper tiers (functions, variables) load on demand via `expand`.
+- `subtree` is the server's reply to an `expand` request. Payload: `{ "parentId": "<id>", "nodes": Node[], "edges": Edge[] }`, where `nodes` are `parentId`'s **direct** children (one tier down, not grandchildren) and `edges` are the `contains` edges from `parentId` to them.
+- Client→server requests: `expand` (request a node's direct children → `subtree`), `snapshot` (request a fresh root-level resync).
+- Reconnect-resync of already-expanded subtrees is **deferred to Phase 9**: on reconnect a client receives the root-only `snapshot` and re-issues `expand` for the nodes it wants open.
 
 ### A.5 Payloads
 

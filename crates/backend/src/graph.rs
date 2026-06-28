@@ -12,16 +12,20 @@
 //! [`ParsedFile`](crate::parser::ParsedFile) and emits `node.upsert`/`edge.upsert`
 //! for added-or-changed elements and `node.remove`/`edge.remove` for elements that
 //! vanished from that file, so re-applying an identical parse is a no-op.
-//! [`Graph::snapshot`] renders the whole graph as one `snapshot` envelope for a
-//! freshly connected client.
+//!
+//! Reads are lazy (Phase 1). [`Graph::snapshot`] renders only the **root** tier
+//! (file nodes and the edges among them) for a freshly connected client; deeper
+//! tiers load on demand: [`Graph::children_of`] returns a node's direct children,
+//! and [`Graph::subtree`] wraps them in a `subtree` envelope replying to an
+//! `expand` request.
 //!
 //! Per `AGENT_PROTOCOL.md` §6 this is panic-free: a clock error or a parse with no
 //! `file` node degrades to a safe default rather than unwrapping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::ParsedFile;
-use crate::wire::{Edge, EventEnvelope, EventType, Node, NodeType, Payload};
+use crate::wire::{Edge, EdgeKind, EventEnvelope, EventType, Node, NodeType, Payload};
 
 /// CLV protocol version stamped on every envelope this graph emits.
 const PROTOCOL_VERSION: u32 = 1;
@@ -82,14 +86,83 @@ impl Graph {
         self.edges.insert(edge.id.clone(), edge);
     }
 
-    /// Renders the whole current graph as one `snapshot` [`EventEnvelope`].
+    /// Renders the top-level (root-only) graph as one `snapshot` [`EventEnvelope`].
     ///
-    /// The payload is [`Payload::Snapshot`] carrying every current node and edge;
-    /// the WebSocket server sends this to each client on connect and on resync.
+    /// The payload is [`Payload::Snapshot`] carrying only **root** nodes (those
+    /// with no `parent_id`, i.e. files) and the edges whose source and target are
+    /// both roots; child tiers (functions, variables) are omitted and load lazily
+    /// via [`Graph::subtree`]. The WebSocket server sends this to each client on
+    /// connect and on resync.
     pub fn snapshot(&self) -> EventEnvelope {
-        let nodes = self.nodes.values().cloned().collect();
-        let edges = self.edges.values().cloned().collect();
+        let root_ids: HashSet<&str> = self
+            .nodes
+            .values()
+            .filter(|n| n.parent_id.is_none())
+            .map(|n| n.id.as_str())
+            .collect();
+        let nodes = self
+            .nodes
+            .values()
+            .filter(|n| n.parent_id.is_none())
+            .cloned()
+            .collect();
+        let edges = self
+            .edges
+            .values()
+            .filter(|e| {
+                root_ids.contains(e.source.as_str()) && root_ids.contains(e.target.as_str())
+            })
+            .cloned()
+            .collect();
         self.envelope(EventType::Snapshot, Payload::Snapshot { nodes, edges })
+    }
+
+    /// Returns a node's **direct** children and the `contains` edges to them.
+    ///
+    /// Selects every node whose `parent_id` is exactly `node_id` (one tier down,
+    /// never grandchildren) and the `contains` [`Edge`]s from `node_id` to those
+    /// children. Backs the lazy-hierarchy `expand` flow: expanding a `file` node
+    /// yields its `function` children, expanding a `function` yields its
+    /// `variable` children. Returns empty vectors when `node_id` is unknown or
+    /// childless.
+    pub fn children_of(&self, node_id: &str) -> (Vec<Node>, Vec<Edge>) {
+        let nodes: Vec<Node> = self
+            .nodes
+            .values()
+            .filter(|n| n.parent_id.as_deref() == Some(node_id))
+            .cloned()
+            .collect();
+        let child_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let edges: Vec<Edge> = self
+            .edges
+            .values()
+            .filter(|e| {
+                e.kind == EdgeKind::Contains
+                    && e.source == node_id
+                    && child_ids.contains(e.target.as_str())
+            })
+            .cloned()
+            .collect();
+        (nodes, edges)
+    }
+
+    /// Renders a node's direct children as one `subtree` [`EventEnvelope`].
+    ///
+    /// Wraps [`Graph::children_of`] in a [`Payload::Subtree`] stamped (via the
+    /// private [`Graph::envelope`] helper) with this graph's session id and
+    /// protocol version — exactly like [`Graph::snapshot`] — so the WebSocket
+    /// server can reply to a client `expand` request without reaching into the
+    /// graph's private session state. The payload's `parent_id` echoes `node_id`.
+    pub fn subtree(&self, node_id: &str) -> EventEnvelope {
+        let (nodes, edges) = self.children_of(node_id);
+        self.envelope(
+            EventType::Subtree,
+            Payload::Subtree {
+                parent_id: node_id.to_string(),
+                nodes,
+                edges,
+            },
+        )
     }
 
     /// Applies a freshly parsed file and returns the patch events it produces.
@@ -196,7 +269,7 @@ mod tests {
     use super::Graph;
     use crate::parser::parse_rust_source;
     use crate::wire::{
-        node_id, Edge, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload,
+        edge_id, node_id, Edge, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -262,28 +335,93 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_contains_all_current_nodes_and_edges() {
+    fn snapshot_contains_only_root_nodes_and_edges() {
         let mut graph = Graph::new();
-        let parsed = parse_rust_source("src/x.rs", "fn foo() {}");
-        let _ = graph.apply_parsed(parsed.clone());
+        let _ = graph.apply_parsed(parse_rust_source("src/x.rs", "fn foo() {}"));
 
         let env = graph.snapshot();
         assert_eq!(env.event_type, EventType::Snapshot);
         let nodes = snapshot_nodes(&env);
         let edges = snapshot_edges(&env);
-        for want in &parsed.nodes {
-            assert!(
-                nodes.iter().any(|n| n.id == want.id),
-                "snapshot missing node {}",
-                want.id
-            );
-        }
-        for want in &parsed.edges {
-            assert!(
-                edges.iter().any(|e| e.id == want.id),
-                "snapshot missing edge {}",
-                want.id
-            );
+
+        // The file node is a root (parentId == None) and is present.
+        assert!(
+            nodes.iter().any(|n| n.id == "file:src/x.rs"),
+            "snapshot must contain the root file node: {nodes:?}"
+        );
+        // The function is a child of the file, so the lazy top level omits it.
+        assert!(
+            !nodes.iter().any(|n| n.id == "fn:src/x.rs:foo"),
+            "lazy snapshot must NOT contain the child function node: {nodes:?}"
+        );
+        // The file→function `contains` edge straddles tiers, so it is omitted too.
+        let contains = edge_id("file:src/x.rs", "fn:src/x.rs:foo");
+        assert!(
+            !edges.iter().any(|e| e.id == contains),
+            "lazy snapshot must NOT contain the file→function contains edge: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn children_of_file_returns_direct_functions_not_grandchild_variables() {
+        let mut graph = Graph::new();
+        let _ = graph.apply_parsed(parse_rust_source("src/x.rs", "fn f() { let x = 1; }"));
+
+        let (nodes, edges) = graph.children_of("file:src/x.rs");
+        assert!(
+            nodes.iter().any(|n| n.id == "fn:src/x.rs:f"),
+            "expected the direct function child: {nodes:?}"
+        );
+        assert!(
+            !nodes.iter().any(|n| n.id == "var:src/x.rs:f:x"),
+            "grandchild variable must NOT appear in direct children: {nodes:?}"
+        );
+        let contains = edge_id("file:src/x.rs", "fn:src/x.rs:f");
+        assert!(
+            edges.iter().any(|e| e.id == contains),
+            "expected the file→function contains edge: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn children_of_function_returns_its_variable_children() {
+        let mut graph = Graph::new();
+        let _ = graph.apply_parsed(parse_rust_source("src/x.rs", "fn f() { let x = 1; }"));
+
+        let (nodes, edges) = graph.children_of("fn:src/x.rs:f");
+        assert!(
+            nodes.iter().any(|n| n.id == "var:src/x.rs:f:x"),
+            "expected the variable child of the function: {nodes:?}"
+        );
+        let contains = edge_id("fn:src/x.rs:f", "var:src/x.rs:f:x");
+        assert!(
+            edges.iter().any(|e| e.id == contains),
+            "expected the function→variable contains edge: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn subtree_wraps_direct_children_in_a_subtree_envelope() {
+        let mut graph = Graph::new();
+        let _ = graph.apply_parsed(parse_rust_source("src/x.rs", "fn f() { let x = 1; }"));
+
+        let env = graph.subtree("file:src/x.rs");
+        assert_eq!(env.event_type, EventType::Subtree);
+        match env.payload {
+            Payload::Subtree {
+                parent_id, nodes, ..
+            } => {
+                assert_eq!(parent_id, "file:src/x.rs");
+                assert!(
+                    nodes.iter().any(|n| n.id == "fn:src/x.rs:f"),
+                    "subtree nodes must include the direct function child: {nodes:?}"
+                );
+                assert!(
+                    !nodes.iter().any(|n| n.id == "var:src/x.rs:f:x"),
+                    "subtree must carry direct children only, not grandchildren: {nodes:?}"
+                );
+            }
+            other => panic!("expected subtree payload, got {other:?}"),
         }
     }
 
