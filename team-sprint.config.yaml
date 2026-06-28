@@ -1,6 +1,6 @@
 # team-sprint configuration for the Lattice build.
 # Stories execute in isolated git worktrees and merge back to `main`.
-plan_path: docs/sprints/phase-0-walking-skeleton.md
+plan_path: docs/sprints/phase-1-hierarchy-lazy-loading.md
 target_branch: main
 coverage_threshold: 90
 coverage_mode: new
