@@ -29,7 +29,10 @@ const COLUMN_WIDTH = 280;
 /**
  * Per-node payload carried in a SvelteFlow node's `data`, consumed by the
  * `HierarchyNode` custom node component. `onToggle` is injected by
- * `Graph.svelte` at render time and is therefore not part of this layout type.
+ * `Graph.svelte` at render time and is therefore not part of this layout type;
+ * `onSelect` and `docs`, by contrast, are threaded through {@link buildHierarchy}
+ * so `HierarchyNode` can surface a node's documentation (title tooltip) and
+ * report selection without `Graph.svelte` re-deriving the data block.
  */
 export type HierarchyNodeData = {
 	/** Display label (the CLV node's `label`). */
@@ -38,6 +41,17 @@ export type HierarchyNodeData = {
 	expandable: boolean;
 	/** Whether the node is currently expanded (its children are revealed). */
 	expanded: boolean;
+	/**
+	 * The CLV node's documentation, surfaced as a hover tooltip. Absent when the
+	 * node carries no extracted docs.
+	 */
+	docs?: string;
+	/**
+	 * Selection callback invoked with the node's id when its content region is
+	 * activated. Threaded in by `Graph.svelte` so clicking a node opens it in the
+	 * selection sidebar.
+	 */
+	onSelect: (nodeId: string) => void;
 };
 
 /** A positioned SvelteFlow node of the custom `hierarchy` type. */
@@ -60,11 +74,14 @@ function compareId(a: string, b: string): number {
  *
  * @param graphNodes - all current CLV nodes from the `nodes` store.
  * @param expanded - ids of nodes whose children should be revealed (the zoom gate).
+ * @param onSelect - selection callback threaded into every node's data block
+ *   (defaults to a no-op so layout-only callers need not supply one).
  * @returns positioned SvelteFlow nodes for exactly the visible tiers.
  */
 export function buildHierarchy(
 	graphNodes: Node[],
-	expanded: ReadonlySet<string>
+	expanded: ReadonlySet<string>,
+	onSelect: (nodeId: string) => void = () => {}
 ): HierarchyFlowNode[] {
 	const childrenOf = (id: string): Node[] =>
 		graphNodes.filter((n) => n.parentId === id).sort((a, b) => compareId(a.id, b.id));
@@ -83,7 +100,9 @@ export function buildHierarchy(
 			data: {
 				label: node.label,
 				expandable: hasChildren(node),
-				expanded: expanded.has(node.id)
+				expanded: expanded.has(node.id),
+				docs: node.docs,
+				onSelect
 			}
 		});
 		row += 1;

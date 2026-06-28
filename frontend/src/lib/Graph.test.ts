@@ -3,6 +3,7 @@ import { render, cleanup, fireEvent } from '@testing-library/svelte';
 import { get } from 'svelte/store';
 import { tick } from 'svelte';
 import Graph from './Graph.svelte';
+import HierarchyNodeHarness from './HierarchyNode.harness.svelte';
 import { ingest, graphStore, initialState } from './ws';
 import type { Node, EventEnvelope } from './types';
 
@@ -50,6 +51,16 @@ function subtree(parentId: string, nodes: Node[]): EventEnvelope {
 		sessionId: 'sess-test',
 		type: 'subtree',
 		payload: { parentId, nodes, edges: [] }
+	};
+}
+
+function upsert(node: Node): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:02.000Z',
+		sessionId: 'sess-test',
+		type: 'node.upsert',
+		payload: { node }
 	};
 }
 
@@ -152,5 +163,79 @@ describe('Graph.svelte lazy hierarchy render', () => {
 		expect(state.nodes.has('file:src/x.rs')).toBe(true);
 		expect(state.nodes.has('fn:src/x.rs:alpha')).toBe(false);
 		expect(state.nodes.has('var:src/x.rs:alpha:y')).toBe(false);
+	});
+});
+
+// P3-3: doc tooltip + selection sidebar.
+const selectId = (nodeId: string): string => `select-${nodeId}`;
+
+const docFile: Node = {
+	id: 'file:src/x.rs',
+	type: 'file',
+	label: 'x.rs',
+	parentId: null,
+	childIds: ['fn:src/x.rs:alpha'],
+	status: 'unknown',
+	docs: 'File level docs.'
+};
+
+describe('HierarchyNode doc tooltip', () => {
+	it('renders data.docs as a title attribute, queryable under SvelteFlow visibility:hidden', async () => {
+		const screen = render(HierarchyNodeHarness, {
+			props: {
+				id: 'fn:src/x.rs:alpha',
+				data: {
+					label: 'alpha',
+					expandable: false,
+					expanded: false,
+					docs: 'Hello docs',
+					onSelect: () => {},
+					onToggle: () => {}
+				}
+			}
+		});
+		expect(await screen.findByTitle('Hello docs')).toBeTruthy();
+	});
+});
+
+describe('Graph.svelte selection sidebar', () => {
+	it('shows an empty hint until a node is selected', async () => {
+		ingest(snapshot([docFile]));
+		const screen = render(Graph);
+		await tick();
+		expect(screen.getByText(/no node selected/i)).toBeTruthy();
+	});
+
+	it('clicking a node select region shows that node docs in the sidebar', async () => {
+		ingest(snapshot([docFile]));
+		const screen = render(Graph);
+		await tick();
+
+		await fireEvent.click(await screen.findByTestId(selectId('file:src/x.rs')));
+		expect(await screen.findByText('File level docs.')).toBeTruthy();
+	});
+
+	it('clicking the expand button does NOT select the node', async () => {
+		ingest(snapshot([docFile]));
+		const screen = render(Graph);
+		await tick();
+
+		// Toggling expansion must not flip selection: the sidebar stays empty.
+		await fireEvent.click(await screen.findByTestId(toggleId('file:src/x.rs')));
+		await tick();
+		expect(screen.getByText(/no node selected/i)).toBeTruthy();
+	});
+
+	it('a node.upsert with updated docs for the selected node updates the sidebar text', async () => {
+		ingest(snapshot([{ ...docFile, docs: 'v1 docs' }]));
+		const screen = render(Graph);
+		await tick();
+
+		await fireEvent.click(await screen.findByTestId(selectId('file:src/x.rs')));
+		expect(await screen.findByText('v1 docs')).toBeTruthy();
+
+		ingest(upsert({ ...docFile, docs: 'v2 docs' }));
+		expect(await screen.findByText('v2 docs')).toBeTruthy();
+		expect(screen.queryByText('v1 docs')).toBeNull();
 	});
 });
