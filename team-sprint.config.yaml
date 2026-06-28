@@ -1,6 +1,6 @@
 # team-sprint configuration for the Lattice build.
 # Stories execute in isolated git worktrees and merge back to `main`.
-plan_path: docs/sprints/phase-3-doc-extraction.md
+plan_path: docs/sprints/phase-4-param-dependency.md
 target_branch: main
 coverage_threshold: 90
 coverage_mode: new
