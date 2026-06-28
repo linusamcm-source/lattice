@@ -18,8 +18,11 @@
 //! from the §A.1 helpers ([`node_id`]/[`edge_id`]) so elements keep their identity
 //! across runs, and every node carries a [`Meta::range`] sourced from the item's
 //! span (`proc-macro2`'s `span-locations` feature is required, else spans report
-//! line/col `0`). Variable bindings are deduplicated by name with the latest
-//! shadowing binding winning, so the contribution holds no duplicate ids or edges.
+//! line/col `0`). Documentation is surfaced via [`extract_docs`]: the `file` node
+//! carries the module-level inner doc (`//!`) and each `function` node its outer
+//! doc comments (`///` / `#[doc = "..."]`) in `docs`, while `variable` nodes carry
+//! none. Variable bindings are deduplicated by name with the latest shadowing
+//! binding winning, so the contribution holds no duplicate ids or edges.
 //!
 //! Per `SPEC.md` §6/§11.1 the parser is **panic-free**: malformed input never
 //! aborts. When `syn::parse_file` rejects the source, the function returns a
@@ -52,12 +55,15 @@ pub struct ParsedFile {
 /// Parses Rust `source` at repo-relative `path` into its structural graph.
 ///
 /// Returns a [`ParsedFile`] with a `file` node (label = the path's basename,
-/// status [`NodeStatus::Unknown`]) and one `function` node per free `fn` and per
-/// `impl`/`trait` method, each parented to the file with a `contains` edge and a
-/// [`Meta::range`] filled from the item's span. For every function with a body,
-/// one `variable` node is emitted per simple `let`-bound identifier (id
+/// status [`NodeStatus::Unknown`], `docs` set to the module-level inner doc
+/// (`//!`) via [`extract_docs`] when present) and one `function` node per free
+/// `fn` and per `impl`/`trait` method, each parented to the file with a `contains`
+/// edge, a [`Meta::range`] filled from the item's span, and `docs` set to the
+/// item's outer doc comments (`///` / `#[doc = "..."]`). For every function with a
+/// body, one `variable` node is emitted per simple `let`-bound identifier (id
 /// `node_id(Variable, path, "<fn>:<name>")`), parented to its function with a
-/// `contains` edge; shadowed bindings dedupe to the latest by name.
+/// `contains` edge; shadowed bindings dedupe to the latest by name. Variable nodes
+/// carry no docs (`let` bindings have no doc comments).
 ///
 /// Recovery (panic-free): if `syn::parse_file` fails, the returned [`ParsedFile`]
 /// contains only the file node with status [`NodeStatus::Error`] and no functions
@@ -81,7 +87,9 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
         }
     };
 
-    let mut nodes = vec![file_node(file_id.clone(), label, NodeStatus::Unknown)];
+    let mut file = file_node(file_id.clone(), label, NodeStatus::Unknown);
+    file.docs = extract_docs(&ast.attrs);
+    let mut nodes = vec![file];
     let mut edges = Vec::new();
 
     for item in &ast.items {
@@ -93,6 +101,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                     &file_id,
                     path,
                     &item_fn.sig.ident,
+                    &item_fn.attrs,
                     Some(item_fn.block.as_ref()),
                 );
             }
@@ -105,6 +114,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &file_id,
                             path,
                             &method.sig.ident,
+                            &method.attrs,
                             Some(&method.block),
                         );
                     }
@@ -119,6 +129,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &file_id,
                             path,
                             &method.sig.ident,
+                            &method.attrs,
                             method.default.as_ref(),
                         );
                     }
@@ -209,18 +220,20 @@ fn file_node(id: String, label: String, status: NodeStatus) -> Node {
 /// then extracts that function's `let`-bound variables when `body` is present.
 ///
 /// The function node id is `node_id(Function, path, name)`, the label is the
-/// function name, the parent is `file_id`, and the range is taken from the
-/// identifier's span (1-based line, 0-based column) via [`span_range`]. When
-/// `body` is `Some` (free fns and `impl`/`trait` methods that have a block) its
-/// simple `let` bindings are lowered to `variable` children via
-/// [`push_variables`]; a trait method declared without a body (`body == None`)
-/// contributes no variables.
+/// function name, the parent is `file_id`, the range is taken from the
+/// identifier's span (1-based line, 0-based column) via [`span_range`], and `docs`
+/// is the item's outer doc comments (`///` / `#[doc = "..."]`) extracted from
+/// `attrs` via [`extract_docs`] (`None` when undocumented). When `body` is `Some`
+/// (free fns and `impl`/`trait` methods that have a block) its simple `let`
+/// bindings are lowered to `variable` children via [`push_variables`]; a trait
+/// method declared without a body (`body == None`) contributes no variables.
 fn push_function(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
     file_id: &str,
     path: &str,
     ident: &syn::Ident,
+    attrs: &[syn::Attribute],
     body: Option<&syn::Block>,
 ) {
     let name = ident.to_string();
@@ -232,7 +245,7 @@ fn push_function(
         parent_id: Some(file_id.to_string()),
         child_ids: Vec::new(),
         status: NodeStatus::Unknown,
-        docs: None,
+        docs: extract_docs(attrs),
         signature: None,
         meta: Some(Meta {
             language: Some("rust".to_string()),
@@ -342,6 +355,40 @@ fn collect_pattern_idents(pat: &syn::Pat, out: &mut Vec<(String, Span)>) {
             collect_pattern_idents(&pat_type.pat, out);
         }
         _ => {}
+    }
+}
+
+/// Extracts the doc-comment text carried by `attrs`, or `None` when there is none.
+///
+/// Collects each `doc` attribute (`syn` lowers both `///`/`//!` line comments and
+/// explicit `#[doc = "..."]` to a [`syn::Meta::NameValue`] whose path is `doc` and
+/// whose value is a string literal) in source order, stripping a single leading
+/// space per line — `rustfmt` renders `///x` as `#[doc = " x"]` — and joins the
+/// lines with `\n`. Works for both outer item docs (`///`) and the inner
+/// module-level doc (`//!`) exposed as `syn::File.attrs`. Non-`doc` attributes are
+/// ignored. Panic-free: malformed `doc` attributes are skipped rather than
+/// unwrapped.
+fn extract_docs(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for attr in attrs {
+        if let syn::Meta::NameValue(name_value) = &attr.meta {
+            if !name_value.path.is_ident("doc") {
+                continue;
+            }
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(text),
+                ..
+            }) = &name_value.value
+            {
+                let line = text.value();
+                lines.push(line.strip_prefix(' ').unwrap_or(&line).to_string());
+            }
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -669,5 +716,60 @@ mod tests {
                 "endLine must be >= startLine: {range:?}"
             );
         }
+    }
+
+    fn function_node<'a>(parsed: &'a ParsedFile, id: &str) -> &'a Node {
+        function_nodes(parsed)
+            .into_iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("missing function node {id}"))
+    }
+
+    #[test]
+    fn outer_doc_comment_populates_function_docs() {
+        let parsed = parse_rust_source("a.rs", "/// Adds two numbers.\nfn add() {}");
+        let func = function_node(&parsed, "fn:a.rs:add");
+        assert_eq!(func.docs.as_deref(), Some("Adds two numbers."));
+    }
+
+    #[test]
+    fn multiline_outer_doc_comments_join_with_newline() {
+        let parsed = parse_rust_source("a.rs", "/// line one\n/// line two\nfn f() {}");
+        let func = function_node(&parsed, "fn:a.rs:f");
+        assert_eq!(func.docs.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn function_without_doc_comment_has_none_docs() {
+        let parsed = parse_rust_source("a.rs", "fn bare() {}");
+        let func = function_node(&parsed, "fn:a.rs:bare");
+        assert_eq!(func.docs, None);
+    }
+
+    #[test]
+    fn module_inner_doc_populates_file_node_docs() {
+        let parsed = parse_rust_source("a.rs", "//! Module docs.\nfn f() {}");
+        let file = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "file:a.rs")
+            .expect("file node");
+        let docs = file.docs.as_deref().expect("file node has docs");
+        assert!(docs.contains("Module docs."), "file docs: {docs:?}");
+    }
+
+    #[test]
+    fn doc_edit_re_derives_function_docs() {
+        let first = parse_rust_source("a.rs", "/// v1\nfn f() {}");
+        assert_eq!(
+            function_node(&first, "fn:a.rs:f").docs.as_deref(),
+            Some("v1")
+        );
+
+        let second = parse_rust_source("a.rs", "/// v2\nfn f() {}");
+        assert_eq!(
+            function_node(&second, "fn:a.rs:f").docs.as_deref(),
+            Some("v2")
+        );
     }
 }
