@@ -4,13 +4,18 @@
 //!
 //! A small [`LanguageConfig`] describes, per language, which parse-tree node
 //! kinds introduce a `function` node and which introduce a local `variable`
-//! binding, plus how to read a binding's name. The shared [`extract`] walk drives
-//! any configured language; [`parse_python`] is the Phase-2 Python entry
-//! (`function_definition` functions, `assignment` locals) and [`parse_typescript`]
-//! the TypeScript entry (`function_declaration` functions, `variable_declarator`
-//! locals). Tree positions are **0-based rows**, so the walk converts `row + 1` to
-//! the CLV [`Range`]'s **1-based** lines (columns stay 0-based), matching the `syn`
-//! path.
+//! binding, how to read a binding's name, and how to read a **function**'s
+//! documentation. The shared [`extract`] walk drives any configured language;
+//! [`parse_python`] is the Phase-2 Python entry (`function_definition` functions,
+//! `assignment` locals) and [`parse_typescript`] the TypeScript entry
+//! (`function_declaration` functions, `variable_declarator` locals). Tree
+//! positions are **0-based rows**, so the walk converts `row + 1` to the CLV
+//! [`Range`]'s **1-based** lines (columns stay 0-based), matching the `syn` path.
+//!
+//! Phase 3 populates each function node's `docs` from its source: a Python
+//! docstring ([`python_doc`]) or a TypeScript JSDoc block ([`typescript_doc`]),
+//! `None` when undocumented. Variable, file, and class docs remain `None`
+//! (deferred per the Phase-3 doc-scope note); ids and structure are unchanged.
 //!
 //! Per the Phase-2 error model (`SPEC.md` §11.1) the extractor is **panic-free**
 //! and recovers partial results: every function/variable it can read from the
@@ -25,8 +30,9 @@ use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, Node
 
 /// Per-language rules driving the generic [`extract`] tree-sitter walk.
 ///
-/// Functions are always named via the grammar's `name` field; only the
-/// local-binding rule ([`LanguageConfig::binding_name`]) is language-specific.
+/// Functions are always named via the grammar's `name` field; the language-specific
+/// rules are the local-binding reader ([`LanguageConfig::binding_name`]) and the
+/// function documentation reader ([`LanguageConfig::doc_for`]).
 struct LanguageConfig {
     /// `meta.language` tag emitted on every function/variable node (e.g. `"python"`).
     language: &'static str,
@@ -40,12 +46,18 @@ struct LanguageConfig {
     /// `None` (e.g. a tuple unpack), in which case the binding is skipped — such
     /// multi-target bindings are out of Phase-2 scope.
     binding_name: fn(&TsNode, &[u8]) -> Option<String>,
+    /// Reads a **function** node's documentation (Python docstring / TypeScript
+    /// JSDoc) from its parse-tree node, or `None` when the function is
+    /// undocumented. Only function nodes consult this rule; variable, file, and
+    /// class nodes keep `docs: None` (deferred per the Phase-3 doc-scope note).
+    doc_for: fn(&TsNode, &[u8]) -> Option<String>,
 }
 
 /// Parses Python `source` at repo-relative `path` into its structural graph.
 ///
 /// Emits a `file` node, one `function` node per `function_definition` (parented
-/// to the file, `meta.language = "python"`), and one `variable` node per simple
+/// to the file, `meta.language = "python"`, `docs` set to the function's docstring
+/// via [`python_doc`] when present), and one `variable` node per simple
 /// single-identifier `assignment` inside a function body (parented to its nearest
 /// enclosing function), each joined by a `contains` edge. Panic-free: malformed
 /// input yields the recovered nodes plus a `file` node with status
@@ -66,7 +78,36 @@ fn python_config() -> LanguageConfig {
         function_kinds: &["function_definition"],
         binding_kinds: &["assignment"],
         binding_name: python_binding_name,
+        doc_for: python_doc,
     }
+}
+
+/// Reads a Python function's docstring: the first body statement when it is an
+/// `expression_statement` wrapping a `string`, returning that string's
+/// `string_content` child text trimmed.
+///
+/// Reading `string_content` (rather than hand-stripping quotes) covers `"`,
+/// `'`, `"""`, `'''`, and `r`/`b`/`f`-prefixed strings uniformly. Returns `None`
+/// when the function has no body, the first statement is not a bare string, or
+/// the string carries no `string_content` (e.g. an empty `""`).
+fn python_doc(node: &TsNode, source: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let first = body.named_child(0)?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let string_node = first.named_child(0)?;
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = string_node.walk();
+    let content = string_node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "string_content")?;
+    content
+        .utf8_text(source)
+        .ok()
+        .map(|text| text.trim().to_string())
 }
 
 /// Reads a Python `assignment` target name when its `left` field is a single
@@ -82,8 +123,10 @@ fn python_binding_name(node: &TsNode, source: &[u8]) -> Option<String> {
 /// Parses TypeScript `source` at repo-relative `path` into its structural graph.
 ///
 /// Emits a `file` node, one `function` node per top-level `function_declaration`
-/// (parented to the file, `meta.language = "typescript"`), and one `variable` node
-/// per single-identifier `variable_declarator` inside a function body (covering
+/// (parented to the file, `meta.language = "typescript"`, `docs` set to the
+/// function's preceding JSDoc block via [`typescript_doc`] when present), and one
+/// `variable` node per single-identifier `variable_declarator` inside a function
+/// body (covering
 /// `const`/`let` via `lexical_declaration`, parented to its nearest enclosing
 /// function), each joined by a `contains` edge. Class methods and arrow functions
 /// are deferred to a later phase. Panic-free: malformed input yields the recovered
@@ -105,6 +148,40 @@ fn typescript_config() -> LanguageConfig {
         function_kinds: &["function_declaration"],
         binding_kinds: &["variable_declarator"],
         binding_name: typescript_binding_name,
+        doc_for: typescript_doc,
+    }
+}
+
+/// Reads a TypeScript function's JSDoc: the `function_declaration`'s
+/// `prev_sibling()` when it is a `comment` whose text begins with `/**`.
+///
+/// Strips the leading `/**`, trailing `*/`, and each line's leading `* ` (or a
+/// bare `*`), then joins the lines with `\n` and trims. Returns `None` when there
+/// is no preceding sibling, it is not a comment, or it is not a `/**` block (a
+/// line `//` or plain `/* */` comment is not JSDoc).
+fn typescript_doc(node: &TsNode, source: &[u8]) -> Option<String> {
+    let prev = node.prev_sibling()?;
+    if prev.kind() != "comment" {
+        return None;
+    }
+    let text = prev.utf8_text(source).ok()?;
+    let inner = text.trim().strip_prefix("/**")?;
+    let inner = inner.strip_suffix("*/").unwrap_or(inner);
+    let joined = inner
+        .lines()
+        .map(strip_jsdoc_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(joined.trim().to_string())
+}
+
+/// Strips a single JSDoc line's leading whitespace and `* `/`*` decoration,
+/// leaving the line's content.
+fn strip_jsdoc_line(line: &str) -> &str {
+    let line = line.trim_start();
+    match line.strip_prefix("* ") {
+        Some(rest) => rest,
+        None => line.strip_prefix('*').unwrap_or(line),
     }
 }
 
@@ -166,11 +243,12 @@ fn extract(path: &str, source: &str, config: &LanguageConfig) -> ParsedFile {
 ///
 /// `current_fn` is the `(id, name)` of the nearest enclosing function, or `None`
 /// at module scope. A `function_kinds` child emits a `function` node (parented to
-/// the file) and recurses with itself as the new `current_fn`, so a binding is
-/// attributed to its **nearest** enclosing function (an inner function's locals
-/// never leak to an outer one). A `binding_kinds` child emits a `variable` node
-/// (parented to `current_fn`) only when it is inside a function and yields a
-/// single-identifier name via [`LanguageConfig::binding_name`].
+/// the file, its `docs` read via [`LanguageConfig::doc_for`]) and recurses with
+/// itself as the new `current_fn`, so a binding is attributed to its **nearest**
+/// enclosing function (an inner function's locals never leak to an outer one). A
+/// `binding_kinds` child emits a `variable` node (parented to `current_fn`, `docs`
+/// always `None`) only when it is inside a function and yields a single-identifier
+/// name via [`LanguageConfig::binding_name`].
 #[allow(clippy::too_many_arguments)]
 fn walk(
     node: TsNode,
@@ -188,6 +266,7 @@ fn walk(
         if config.function_kinds.contains(&kind) {
             if let Some(name) = field_text(&child, "name", source) {
                 let fn_id = node_id(NodeType::Function, path, &name);
+                let docs = (config.doc_for)(&child, source);
                 push_node(
                     nodes,
                     &fn_id,
@@ -197,6 +276,7 @@ fn walk(
                     config,
                     path,
                     &child,
+                    docs,
                 );
                 push_edge(edges, file_id, &fn_id);
                 walk(
@@ -226,6 +306,7 @@ fn walk(
                     config,
                     path,
                     &child,
+                    None,
                 );
                 push_edge(edges, fn_id, &var_id);
             }
@@ -237,6 +318,10 @@ fn walk(
 }
 
 /// Appends a structural node with `meta.language`/`file_path`/`range` filled.
+///
+/// `docs` carries the node's extracted documentation: a function's Python
+/// docstring / TypeScript JSDoc when present, and `None` for variable nodes
+/// (whose doc extraction is deferred per the Phase-3 doc-scope note).
 #[allow(clippy::too_many_arguments)]
 fn push_node(
     nodes: &mut Vec<Node>,
@@ -247,6 +332,7 @@ fn push_node(
     config: &LanguageConfig,
     path: &str,
     src_node: &TsNode,
+    docs: Option<String>,
 ) {
     nodes.push(Node {
         id: id.to_string(),
@@ -255,7 +341,7 @@ fn push_node(
         parent_id: Some(parent_id.to_string()),
         child_ids: Vec::new(),
         status: NodeStatus::Unknown,
-        docs: None,
+        docs,
         signature: None,
         meta: Some(Meta {
             language: Some(config.language.to_string()),
@@ -562,5 +648,61 @@ mod tests {
             "fn:a.py:inner",
             "var:a.py:inner:b"
         ));
+    }
+
+    #[test]
+    fn python_docstring_populates_function_docs() {
+        let parsed = parse_python(
+            "a.py",
+            "def f():\n    \"\"\"Does a thing.\"\"\"\n    pass\n",
+        );
+        let f = function_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "fn:a.py:f")
+            .expect("missing fn:a.py:f");
+        assert_eq!(f.docs.as_deref(), Some("Does a thing."));
+    }
+
+    #[test]
+    fn python_function_without_docstring_has_none_docs() {
+        let parsed = parse_python("a.py", "def g():\n    pass\n");
+        let g = function_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "fn:a.py:g")
+            .expect("missing fn:a.py:g");
+        assert_eq!(g.docs, None);
+    }
+
+    #[test]
+    fn typescript_jsdoc_populates_function_docs() {
+        let parsed = parse_typescript("b.ts", "/** Does a thing. */\nfunction f() {}");
+        let f = function_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "fn:b.ts:f")
+            .expect("missing fn:b.ts:f");
+        assert_eq!(f.docs.as_deref(), Some("Does a thing."));
+    }
+
+    #[test]
+    fn typescript_function_without_jsdoc_has_none_docs() {
+        let parsed = parse_typescript("b.ts", "function g() {}");
+        let g = function_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "fn:b.ts:g")
+            .expect("missing fn:b.ts:g");
+        assert_eq!(g.docs, None);
+    }
+
+    #[test]
+    fn typescript_multiline_jsdoc_strips_per_line_decoration() {
+        let parsed = parse_typescript(
+            "b.ts",
+            "/**\n * Line one\n * Line two\n */\nfunction f() {}",
+        );
+        let f = function_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "fn:b.ts:f")
+            .expect("missing fn:b.ts:f");
+        assert_eq!(f.docs.as_deref(), Some("Line one\nLine two"));
     }
 }
