@@ -21,12 +21,18 @@
 //!   each connecting client the current [`graph::Graph`] `snapshot` and then
 //!   streams broadcast [`wire::EventEnvelope`]s, replying to a client snapshot
 //!   request with a fresh snapshot.
+//! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
+//!   graph → WebSocket so editing a `.rs` file updates a connected client's graph
+//!   live.
 
+pub mod app;
 pub mod graph;
 pub mod parser;
 pub mod watcher;
 pub mod wire;
 pub mod ws;
+
+pub use app::{run, RunHandle};
 
 /// Returns the CLV wire-protocol sentinel this build speaks.
 ///
