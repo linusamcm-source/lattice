@@ -50,6 +50,27 @@ narrow without casts. `src/lib/ws.ts` is the client:
 4. `ingest(envelope)` applies the reducer to the `graphStore`; components consume
    the derived `nodes` / `edges` stores. Auto-reconnect is deferred to Phase 9.
 
+## Lazy expand / collapse flow (P1-3)
+
+Phase 1 makes the client lazy: the initial `snapshot` carries only top-level
+(file) nodes, and a node's children are fetched on demand.
+
+- **Expand.** `requestExpand(socket, nodeId)` sends the frame
+  `{"type":"expand","nodeId":"<id>"}` (mirroring the `{"type":"snapshot"}`
+  resync request). The backend replies with a `subtree` envelope —
+  `payload { parentId, nodes, edges }` — carrying that node's **direct**
+  children and the `contains` edges to them. `applyEvent` handles `subtree` by
+  **merging** those nodes/edges into the store by id (existing entries
+  preserved); it is not a whole-graph replacement. Children are never
+  pre-fetched — only this explicit request loads them.
+- **Collapse.** `collapse(state, nodeId)` is a pure reducer that returns a new
+  `GraphState` with `nodeId`'s **transitive** descendants (everything reachable
+  by following `parentId` down from `nodeId`) discarded, along with any edge
+  whose endpoint was removed. `nodeId` itself and unrelated nodes are kept. This
+  bounds client memory as the user drills in and out of a deep tree.
+
+Reconnect-resync of expanded subtrees is deferred to Phase 9.
+
 ## Two-tier render model (P0-8)
 
 `src/lib/Graph.svelte` renders a flat **two-tier** SvelteFlow canvas from the
