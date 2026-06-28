@@ -13,11 +13,12 @@
 //!   [`wire::Node`]/[`wire::Edge`] graph contribution. [`parser::parse_source`] is
 //!   the entry point, dispatching on file extension: `syn` for Rust
 //!   ([`parser::parse_rust_source`]) and `tree-sitter` for Python and TypeScript;
-//!   any other extension yields a bare `file` node. The Rust path also populates
-//!   each node's `docs` from its doc comments (the file node from the module-level
-//!   `//!`, each function from its `///`) and each `function` node's `signature`
-//!   ([`wire::Signature`]) with its typed parameters and return type. All paths
-//!   recover panic-free from syntax errors.
+//!   any other extension yields a bare `file` node. Every parser populates each
+//!   node's `docs` from its doc comments (the Rust file node from the module-level
+//!   `//!`, each function from its `///`, Python docstrings, TypeScript JSDoc) and
+//!   each `function` node's `signature` ([`wire::Signature`]) with its typed
+//!   parameters and return type (Rust via `syn`, Python and TypeScript via
+//!   `tree-sitter`). All paths recover panic-free from syntax errors.
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into

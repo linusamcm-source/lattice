@@ -17,6 +17,14 @@
 //! `None` when undocumented. Variable, file, and class docs remain `None`
 //! (deferred per the Phase-3 doc-scope note); ids and structure are unchanged.
 //!
+//! Phase 4 populates each function node's `signature` ([`crate::wire::Signature`])
+//! with its typed parameters and return type: [`python_signature`] reads a
+//! `function_definition`'s `parameters`/`return_type` (dropping a leading
+//! `self`/`cls`) and [`typescript_signature`] a `function_declaration`'s
+//! `formal_parameters`/`return_type`. Absent annotations render as empty-string
+//! types (Python/TypeScript are optionally typed). Variable nodes keep
+//! `signature: None`; ids, structure, and docs are unchanged.
+//!
 //! Per the Phase-2 error model (`SPEC.md` §11.1) the extractor is **panic-free**
 //! and recovers partial results: every function/variable it can read from the
 //! (possibly partial) tree is still emitted, and when the parse tree's root
@@ -26,13 +34,16 @@
 use tree_sitter::{Language, Node as TsNode, Parser};
 
 use super::{file_node, ParsedFile};
-use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Range};
+use crate::wire::{
+    edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Param, Range, Signature,
+};
 
 /// Per-language rules driving the generic [`extract`] tree-sitter walk.
 ///
 /// Functions are always named via the grammar's `name` field; the language-specific
-/// rules are the local-binding reader ([`LanguageConfig::binding_name`]) and the
-/// function documentation reader ([`LanguageConfig::doc_for`]).
+/// rules are the local-binding reader ([`LanguageConfig::binding_name`]), the
+/// function documentation reader ([`LanguageConfig::doc_for`]), and the function
+/// signature reader ([`LanguageConfig::signature_of`]).
 struct LanguageConfig {
     /// `meta.language` tag emitted on every function/variable node (e.g. `"python"`).
     language: &'static str,
@@ -51,13 +62,20 @@ struct LanguageConfig {
     /// undocumented. Only function nodes consult this rule; variable, file, and
     /// class nodes keep `docs: None` (deferred per the Phase-3 doc-scope note).
     doc_for: fn(&TsNode, &[u8]) -> Option<String>,
+    /// Reads a **function** node's [`Signature`] (typed params plus return type)
+    /// from its parse-tree node, always `Some` for a function the walk emits.
+    /// Absent type annotations render as empty-string types (Python/TypeScript are
+    /// optionally typed). Only function nodes consult this rule; variable, file,
+    /// and class nodes keep `signature: None`.
+    signature_of: fn(&TsNode, &[u8]) -> Option<Signature>,
 }
 
 /// Parses Python `source` at repo-relative `path` into its structural graph.
 ///
 /// Emits a `file` node, one `function` node per `function_definition` (parented
 /// to the file, `meta.language = "python"`, `docs` set to the function's docstring
-/// via [`python_doc`] when present), and one `variable` node per simple
+/// via [`python_doc`] when present, and `signature` set to its typed params and
+/// return type via [`python_signature`]), and one `variable` node per simple
 /// single-identifier `assignment` inside a function body (parented to its nearest
 /// enclosing function), each joined by a `contains` edge. Panic-free: malformed
 /// input yields the recovered nodes plus a `file` node with status
@@ -79,7 +97,53 @@ fn python_config() -> LanguageConfig {
         binding_kinds: &["assignment"],
         binding_name: python_binding_name,
         doc_for: python_doc,
+        signature_of: python_signature,
     }
+}
+
+/// Reads a Python `function_definition`'s [`Signature`].
+///
+/// Walks the `parameters` child: each `identifier` yields an untyped [`Param`]
+/// (`param_type == ""`), each `typed_parameter` a [`Param`] whose `name` is its
+/// identifier child and whose `param_type` is the `type` field's annotation text
+/// (the text after `:`). A leading `self`/`cls` parameter is dropped — it is the
+/// receiver, not a data parameter. `returns` is the `return_type` field's text
+/// (the annotation after `->`) or `""` when the function has no return annotation.
+/// Always returns `Some`; an undeclared type or return is an empty string, not a
+/// missing signature. Panic-free: unreadable text degrades to an empty string.
+fn python_signature(node: &TsNode, source: &[u8]) -> Option<Signature> {
+    let mut params = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for child in parameters.named_children(&mut cursor) {
+            let param = match child.kind() {
+                "identifier" => Param {
+                    name: node_text(&child, source),
+                    param_type: String::new(),
+                },
+                "typed_parameter" => Param {
+                    name: child
+                        .named_child(0)
+                        .map(|name| node_text(&name, source))
+                        .unwrap_or_default(),
+                    param_type: child
+                        .child_by_field_name("type")
+                        .map(|ty| node_text(&ty, source))
+                        .unwrap_or_default(),
+                },
+                _ => continue,
+            };
+            if params.is_empty() && (param.name == "self" || param.name == "cls") {
+                continue;
+            }
+            params.push(param);
+        }
+    }
+    let returns = node
+        .child_by_field_name("return_type")
+        .map(|ty| node_text(&ty, source))
+        .unwrap_or_default();
+    Some(Signature { params, returns })
 }
 
 /// Reads a Python function's docstring: the first body statement when it is an
@@ -124,7 +188,9 @@ fn python_binding_name(node: &TsNode, source: &[u8]) -> Option<String> {
 ///
 /// Emits a `file` node, one `function` node per top-level `function_declaration`
 /// (parented to the file, `meta.language = "typescript"`, `docs` set to the
-/// function's preceding JSDoc block via [`typescript_doc`] when present), and one
+/// function's preceding JSDoc block via [`typescript_doc`] when present, and
+/// `signature` set to its typed params and return type via [`typescript_signature`]),
+/// and one
 /// `variable` node per single-identifier `variable_declarator` inside a function
 /// body (covering
 /// `const`/`let` via `lexical_declaration`, parented to its nearest enclosing
@@ -149,7 +215,57 @@ fn typescript_config() -> LanguageConfig {
         binding_kinds: &["variable_declarator"],
         binding_name: typescript_binding_name,
         doc_for: typescript_doc,
+        signature_of: typescript_signature,
     }
+}
+
+/// Reads a TypeScript `function_declaration`'s [`Signature`].
+///
+/// Walks the `parameters` child (`formal_parameters`): each `required_parameter`
+/// or `optional_parameter` yields a [`Param`] whose `name` is its `pattern` field
+/// and whose `param_type` is its `type` field's annotation. Because a
+/// `type_annotation` node spans the leading `:` too, the annotation text is read
+/// from the annotation's first named child (the bare type), or `""` when the
+/// parameter is untyped. `returns` is the function's `return_type` annotation read
+/// the same way, or `""` when there is no return annotation. Always returns
+/// `Some`; an undeclared type or return is an empty string, not a missing
+/// signature. Panic-free: unreadable text degrades to an empty string.
+fn typescript_signature(node: &TsNode, source: &[u8]) -> Option<Signature> {
+    let mut params = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for child in parameters.named_children(&mut cursor) {
+            if matches!(child.kind(), "required_parameter" | "optional_parameter") {
+                params.push(Param {
+                    name: child
+                        .child_by_field_name("pattern")
+                        .map(|pat| node_text(&pat, source))
+                        .unwrap_or_default(),
+                    param_type: child
+                        .child_by_field_name("type")
+                        .map(|ann| annotation_type_text(&ann, source))
+                        .unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let returns = node
+        .child_by_field_name("return_type")
+        .map(|ann| annotation_type_text(&ann, source))
+        .unwrap_or_default();
+    Some(Signature { params, returns })
+}
+
+/// Reads the bare type text out of a TypeScript `type_annotation` node.
+///
+/// A `type_annotation` spans the leading `:` plus the type, so the annotated type
+/// is its first named child; this returns that child's text (e.g. `number` for
+/// `: number`), or `""` when the annotation carries no type child.
+fn annotation_type_text(annotation: &TsNode, source: &[u8]) -> String {
+    annotation
+        .named_child(0)
+        .map(|ty| node_text(&ty, source))
+        .unwrap_or_default()
 }
 
 /// Reads a TypeScript function's JSDoc: the `function_declaration`'s
@@ -243,7 +359,8 @@ fn extract(path: &str, source: &str, config: &LanguageConfig) -> ParsedFile {
 ///
 /// `current_fn` is the `(id, name)` of the nearest enclosing function, or `None`
 /// at module scope. A `function_kinds` child emits a `function` node (parented to
-/// the file, its `docs` read via [`LanguageConfig::doc_for`]) and recurses with
+/// the file, its `docs` read via [`LanguageConfig::doc_for`] and its `signature`
+/// via [`LanguageConfig::signature_of`]) and recurses with
 /// itself as the new `current_fn`, so a binding is attributed to its **nearest**
 /// enclosing function (an inner function's locals never leak to an outer one). A
 /// `binding_kinds` child emits a `variable` node (parented to `current_fn`, `docs`
@@ -267,6 +384,7 @@ fn walk(
             if let Some(name) = field_text(&child, "name", source) {
                 let fn_id = node_id(NodeType::Function, path, &name);
                 let docs = (config.doc_for)(&child, source);
+                let signature = (config.signature_of)(&child, source);
                 push_node(
                     nodes,
                     &fn_id,
@@ -277,6 +395,7 @@ fn walk(
                     path,
                     &child,
                     docs,
+                    signature,
                 );
                 push_edge(edges, file_id, &fn_id);
                 walk(
@@ -307,6 +426,7 @@ fn walk(
                     path,
                     &child,
                     None,
+                    None,
                 );
                 push_edge(edges, fn_id, &var_id);
             }
@@ -321,7 +441,9 @@ fn walk(
 ///
 /// `docs` carries the node's extracted documentation: a function's Python
 /// docstring / TypeScript JSDoc when present, and `None` for variable nodes
-/// (whose doc extraction is deferred per the Phase-3 doc-scope note).
+/// (whose doc extraction is deferred per the Phase-3 doc-scope note). `signature`
+/// carries a function's extracted [`Signature`] (typed params plus return type)
+/// and is always `None` for variable nodes.
 #[allow(clippy::too_many_arguments)]
 fn push_node(
     nodes: &mut Vec<Node>,
@@ -333,6 +455,7 @@ fn push_node(
     path: &str,
     src_node: &TsNode,
     docs: Option<String>,
+    signature: Option<Signature>,
 ) {
     nodes.push(Node {
         id: id.to_string(),
@@ -342,7 +465,7 @@ fn push_node(
         child_ids: Vec::new(),
         status: NodeStatus::Unknown,
         docs,
-        signature: None,
+        signature,
         meta: Some(Meta {
             language: Some(config.language.to_string()),
             file_path: Some(path.to_string()),
@@ -368,6 +491,12 @@ fn field_text(node: &TsNode, field: &str, source: &[u8]) -> Option<String> {
         .utf8_text(source)
         .ok()
         .map(str::to_string)
+}
+
+/// Reads `node`'s UTF-8 source text, degrading to an empty string when the span is
+/// not valid UTF-8 (keeps signature extraction panic-free).
+fn node_text(node: &TsNode, source: &[u8]) -> String {
+    node.utf8_text(source).unwrap_or_default().to_string()
 }
 
 /// Converts a tree-sitter node span to a CLV [`Range`] (1-based line via
@@ -704,5 +833,137 @@ mod tests {
             .find(|n| n.id == "fn:b.ts:f")
             .expect("missing fn:b.ts:f");
         assert_eq!(f.docs.as_deref(), Some("Line one\nLine two"));
+    }
+
+    fn signature_of(parsed: &ParsedFile, id: &str) -> crate::wire::Signature {
+        function_nodes(parsed)
+            .into_iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("missing function node {id}"))
+            .signature
+            .clone()
+            .unwrap_or_else(|| panic!("function {id} has no signature"))
+    }
+
+    #[test]
+    fn python_signature_extracts_typed_params_and_return() {
+        let parsed = parse_python(
+            "a.py",
+            "def add(a: int, b: int) -> int:\n    return a + b\n",
+        );
+        let sig = signature_of(&parsed, "fn:a.py:add");
+        assert_eq!(
+            sig.params,
+            vec![
+                crate::wire::Param {
+                    name: "a".to_string(),
+                    param_type: "int".to_string(),
+                },
+                crate::wire::Param {
+                    name: "b".to_string(),
+                    param_type: "int".to_string(),
+                },
+            ]
+        );
+        assert_eq!(sig.returns, "int");
+    }
+
+    #[test]
+    fn python_untyped_params_have_empty_type_and_signature_is_some() {
+        let parsed = parse_python("a.py", "def f(x):\n    pass\n");
+        let sig = signature_of(&parsed, "fn:a.py:f");
+        assert_eq!(
+            sig.params,
+            vec![crate::wire::Param {
+                name: "x".to_string(),
+                param_type: String::new(),
+            }]
+        );
+        assert_eq!(sig.returns, "");
+    }
+
+    #[test]
+    fn python_signature_skips_unsupported_param_kinds() {
+        let parsed = parse_python("a.py", "def f(a, *args, b: int):\n    pass\n");
+        let sig = signature_of(&parsed, "fn:a.py:f");
+        assert_eq!(
+            sig.params,
+            vec![
+                crate::wire::Param {
+                    name: "a".to_string(),
+                    param_type: String::new(),
+                },
+                crate::wire::Param {
+                    name: "b".to_string(),
+                    param_type: "int".to_string(),
+                },
+            ],
+            "*args (list_splat_pattern) must be skipped: {:?}",
+            sig.params
+        );
+    }
+
+    #[test]
+    fn python_method_signature_excludes_leading_self() {
+        let parsed = parse_python(
+            "a.py",
+            "class C:\n    def m(self, a: int) -> bool:\n        return True\n",
+        );
+        let sig = signature_of(&parsed, "fn:a.py:m");
+        assert_eq!(
+            sig.params,
+            vec![crate::wire::Param {
+                name: "a".to_string(),
+                param_type: "int".to_string(),
+            }]
+        );
+        assert_eq!(sig.returns, "bool");
+    }
+
+    #[test]
+    fn typescript_signature_extracts_typed_params_and_return() {
+        let parsed = parse_typescript(
+            "b.ts",
+            "function add(a: number, b: number): number { return a + b; }",
+        );
+        let sig = signature_of(&parsed, "fn:b.ts:add");
+        assert_eq!(
+            sig.params,
+            vec![
+                crate::wire::Param {
+                    name: "a".to_string(),
+                    param_type: "number".to_string(),
+                },
+                crate::wire::Param {
+                    name: "b".to_string(),
+                    param_type: "number".to_string(),
+                },
+            ]
+        );
+        assert_eq!(sig.returns, "number");
+    }
+
+    #[test]
+    fn typescript_untyped_params_have_empty_type_and_signature_is_some() {
+        let parsed = parse_typescript("b.ts", "function g(x) {}");
+        let sig = signature_of(&parsed, "fn:b.ts:g");
+        assert_eq!(
+            sig.params,
+            vec![crate::wire::Param {
+                name: "x".to_string(),
+                param_type: String::new(),
+            }]
+        );
+        assert_eq!(sig.returns, "");
+    }
+
+    #[test]
+    fn variable_nodes_keep_none_signature() {
+        let parsed = parse_python("a.py", "def f():\n    x = 1\n");
+        let var = variable_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "var:a.py:f:x")
+            .expect("missing var:a.py:f:x");
+        assert_eq!(var.signature, None);
     }
 }
