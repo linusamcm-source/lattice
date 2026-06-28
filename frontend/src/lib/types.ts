@@ -119,6 +119,17 @@ export interface EdgeRemovePayload {
 	id: string;
 }
 
+/**
+ * Phase 1 `subtree` payload (the lazy `expand` reply) — `parentId`'s direct
+ * children and the `contains` edges from `parentId` to them. Merged into the
+ * store, never a whole-graph replacement.
+ */
+export interface SubtreePayload {
+	parentId: string;
+	nodes: Node[];
+	edges: Edge[];
+}
+
 /** Fields shared by every {@link EventEnvelope} variant (DATA_MODEL §A.4). */
 export interface EnvelopeBase {
 	v: 1;
@@ -136,7 +147,8 @@ export type EventEnvelope =
 	| (EnvelopeBase & { type: 'node.upsert'; payload: NodeUpsertPayload })
 	| (EnvelopeBase & { type: 'node.remove'; payload: NodeRemovePayload })
 	| (EnvelopeBase & { type: 'edge.upsert'; payload: EdgeUpsertPayload })
-	| (EnvelopeBase & { type: 'edge.remove'; payload: EdgeRemovePayload });
+	| (EnvelopeBase & { type: 'edge.remove'; payload: EdgeRemovePayload })
+	| (EnvelopeBase & { type: 'subtree'; payload: SubtreePayload });
 
 /** The set of envelope `type` discriminants this Phase 0 client understands. */
 export type EventType = EventEnvelope['type'];

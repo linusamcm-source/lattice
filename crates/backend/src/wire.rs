@@ -8,10 +8,12 @@
 //! - §A.4 — [`EventEnvelope`] (`{ v, ts, sessionId, type, payload }`), tagged by
 //!   [`EventType`].
 //!
-//! It also pins the **Phase-0 wire payload contract** as the typed [`Payload`]
-//! variants (`snapshot`, `node.upsert`, `node.remove`, `edge.upsert`,
-//! `edge.remove`). Per `AGENT_PROTOCOL.md` §5 the protocol is identified on the CLV
-//! stdio channel by the `#CLV1` sentinel (see [`crate::protocol_sentinel`]).
+//! It also pins the wire payload contract as the typed [`Payload`] variants: the
+//! Phase-0 `snapshot`/`node.upsert`/`node.remove`/`edge.upsert`/`edge.remove`
+//! diff set, plus the Phase-1 lazy-hierarchy `subtree` reply (the direct children
+//! of an expanded node — see [`Payload::Subtree`]). Per `AGENT_PROTOCOL.md` §5 the
+//! protocol is identified on the CLV stdio channel by the `#CLV1` sentinel (see
+//! [`crate::protocol_sentinel`]).
 //!
 //! All JSON keys are camelCase and every enum serialises to the exact string the
 //! spec mandates, so the Rust backend and the TypeScript client agree byte-for-byte.
@@ -108,9 +110,10 @@ pub enum EdgeKind {
 
 /// Discriminator for an [`EventEnvelope`] (`DATA_MODEL.md` §A.4 `type`).
 ///
-/// Phase 0 only emits the structural-diff subset (`snapshot`, `node.upsert`,
-/// `node.remove`, `edge.upsert`, `edge.remove`); the remaining variants are part
-/// of the full §A.4 vocabulary and exist so the contract is complete.
+/// Phase 0 emits the structural-diff subset (`snapshot`, `node.upsert`,
+/// `node.remove`, `edge.upsert`, `edge.remove`); Phase 1 adds `subtree` (the lazy
+/// reply to an `expand` request). The remaining variants are part of the full
+/// §A.4 vocabulary and exist so the contract is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// Insert-or-update a node (`payload` is [`Payload::NodeUpsert`]).
@@ -140,9 +143,12 @@ pub enum EventType {
     /// The live agent roster (agent layer).
     #[serde(rename = "agent.roster")]
     AgentRoster,
-    /// The full current graph, sent on connect / resync.
+    /// The top-level (root-only) graph, sent on connect / resync.
     #[serde(rename = "snapshot")]
     Snapshot,
+    /// A node's direct children, replying to a client `expand` request (Phase 1).
+    #[serde(rename = "subtree")]
+    Subtree,
     /// An out-of-band error notification.
     #[serde(rename = "error")]
     Error,
@@ -246,22 +252,44 @@ pub struct Edge {
     pub hot: bool,
 }
 
-/// Typed `payload` of an [`EventEnvelope`] — the Phase-0 wire payload contract.
+/// Typed `payload` of an [`EventEnvelope`] — the CLV wire payload contract.
 ///
 /// Serialised untagged: each variant becomes exactly its inner object (e.g.
 /// `{ "node": … }`), because the owning envelope's [`EventType`] is the
-/// authoritative discriminator. Note that `node.remove` and `edge.remove` share
-/// the identical `{ "id": … }` shape — on the wire they are told apart solely by
-/// the envelope `type`, so an untagged decode of a bare `{ "id": … }` resolves to
+/// authoritative discriminator. **Variant order is load-bearing for decode:**
+/// [`Payload::Subtree`] is declared before [`Payload::Snapshot`] so a
+/// `{parentId,nodes,edges}` object resolves to `Subtree` (its `parentId` is
+/// required) while a snapshot falls through; reversing them would mis-decode a
+/// subtree as a snapshot. Likewise `node.remove` and `edge.remove` share the
+/// identical `{ "id": … }` shape — on the wire they are told apart solely by the
+/// envelope `type`, so an untagged decode of a bare `{ "id": … }` resolves to
 /// [`Payload::NodeRemove`]; always read [`EventEnvelope::event_type`] to know which.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
-    /// `snapshot` — the full current graph.
-    Snapshot {
-        /// Every current node.
+    /// `subtree` — a node's **direct** children (Phase-1 lazy `expand` reply).
+    ///
+    /// Declared **before** [`Payload::Snapshot`] on purpose: `parentId` is a
+    /// required field, so untagged decode resolves a `{parentId,nodes,edges}`
+    /// object here, while a genuine snapshot (no `parentId`) fails this variant
+    /// and falls through to [`Payload::Snapshot`]. Declared the other way round,
+    /// a subtree would silently mis-decode as a snapshot (struct variants ignore
+    /// unknown fields). `nodes` are `parentId`'s direct children and `edges` are
+    /// the `contains` edges from `parentId` to them.
+    Subtree {
+        /// Id of the expanded parent node.
+        #[serde(rename = "parentId")]
+        parent_id: String,
+        /// The parent's direct child nodes.
         nodes: Vec<Node>,
-        /// Every current edge.
+        /// The `contains` edges from the parent to each direct child.
+        edges: Vec<Edge>,
+    },
+    /// `snapshot` — the top-level (root-only) graph.
+    Snapshot {
+        /// Every root node (those with no `parentId`).
+        nodes: Vec<Node>,
+        /// Every edge among the root nodes.
         edges: Vec<Edge>,
     },
     /// `node.upsert` — insert-or-update a single node.
@@ -428,6 +456,20 @@ mod tests {
         }
     }
 
+    fn subtree_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.123Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::Subtree,
+            payload: Payload::Subtree {
+                parent_id: node_id(NodeType::File, "src/auth/login.rs", ""),
+                nodes: vec![sample_node()],
+                edges: vec![sample_edge()],
+            },
+        }
+    }
+
     #[test]
     fn node_id_for_function_uses_fn_prefix() {
         assert_eq!(
@@ -559,6 +601,7 @@ mod tests {
             (EventType::HotEdge, "hot_edge"),
             (EventType::AgentRoster, "agent.roster"),
             (EventType::Snapshot, "snapshot"),
+            (EventType::Subtree, "subtree"),
             (EventType::Error, "error"),
         ];
         for (variant, want) in cases {
@@ -596,6 +639,40 @@ mod tests {
         let payload = &value["payload"];
         assert!(payload["nodes"].is_array(), "nodes not an array: {payload}");
         assert!(payload["edges"].is_array(), "edges not an array: {payload}");
+    }
+
+    #[test]
+    fn subtree_envelope_round_trips_and_decodes_as_subtree_not_snapshot() {
+        let env = subtree_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+
+        // Wire shape: the envelope type is "subtree" and the payload carries a
+        // camelCase "parentId" key (not snake_case).
+        assert!(
+            json.contains("\"type\":\"subtree\""),
+            "missing subtree envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"parentId\":"),
+            "missing camelCase parentId in payload: {json}"
+        );
+        assert!(
+            !json.contains("\"parent_id\""),
+            "snake_case parent_id leaked: {json}"
+        );
+
+        // Full round-trip: decoding must reproduce the original envelope.
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+
+        // Decode-order regression guard: a `{parentId,nodes,edges}` object MUST
+        // resolve to Payload::Subtree, NOT silently to Payload::Snapshot.
+        assert_eq!(back.event_type, EventType::Subtree);
+        assert!(
+            matches!(back.payload, Payload::Subtree { .. }),
+            "subtree mis-decoded as {:?}",
+            back.payload
+        );
     }
 
     #[test]

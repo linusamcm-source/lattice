@@ -6,6 +6,8 @@ import {
 	parseEnvelope,
 	ingest,
 	connect,
+	collapse,
+	requestExpand,
 	graphStore,
 	nodes,
 	edges
@@ -208,5 +210,143 @@ describe('connect', () => {
 		expect(get(nodes).length).toBe(0);
 		client.close();
 		vi.unstubAllGlobals();
+	});
+});
+
+// --- P1-3: lazy expand / subtree / collapse fixtures ---
+
+const aFile: Node = {
+	id: 'file:a.rs',
+	type: 'file',
+	label: 'a.rs',
+	parentId: null,
+	childIds: ['fn:a.rs:alpha'],
+	status: 'unknown'
+};
+
+const aFn: Node = {
+	id: 'fn:a.rs:alpha',
+	type: 'function',
+	label: 'alpha',
+	parentId: 'file:a.rs',
+	childIds: ['var:a.rs:alpha:x'],
+	status: 'unknown'
+};
+
+const aVar: Node = {
+	id: 'var:a.rs:alpha:x',
+	type: 'variable',
+	label: 'x',
+	parentId: 'fn:a.rs:alpha',
+	childIds: [],
+	status: 'unknown'
+};
+
+const aFileFnEdge: Edge = {
+	id: 'e:a.rs->alpha',
+	source: aFile.id,
+	target: aFn.id,
+	kind: 'contains',
+	hot: false
+};
+
+const aFnVarEdge: Edge = {
+	id: 'e:alpha->x',
+	source: aFn.id,
+	target: aVar.id,
+	kind: 'contains',
+	hot: false
+};
+
+function subtreeEnv(parentId: string, subNodes: Node[], subEdges: Edge[]): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:05.000Z',
+		sessionId: 'sess-test',
+		type: 'subtree',
+		payload: { parentId, nodes: subNodes, edges: subEdges }
+	};
+}
+
+describe('parseEnvelope (subtree)', () => {
+	it('accepts a valid subtree envelope (non-null)', () => {
+		const env = parseEnvelope(JSON.stringify(subtreeEnv(aFile.id, [aFn], [aFileFnEdge])));
+		expect(env?.type).toBe('subtree');
+	});
+
+	it('returns null for a subtree envelope missing its payload', () => {
+		expect(
+			parseEnvelope(JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'subtree' }))
+		).toBeNull();
+	});
+});
+
+describe('applyEvent (subtree merge)', () => {
+	it('merges children into a store pre-loaded with the parent (both ids present)', () => {
+		const pre = applyEvent(initialState(), upsertEnv(aFile));
+		const state = applyEvent(pre, subtreeEnv(aFile.id, [aFn], [aFileFnEdge]));
+		expect(state.nodes.has(aFile.id)).toBe(true);
+		expect(state.nodes.has(aFn.id)).toBe(true);
+		expect(state.edges.has(aFileFnEdge.id)).toBe(true);
+	});
+
+	it('is pure and does not mutate the input state', () => {
+		const pre = applyEvent(initialState(), upsertEnv(aFile));
+		applyEvent(pre, subtreeEnv(aFile.id, [aFn], [aFileFnEdge]));
+		expect(pre.nodes.size).toBe(1);
+		expect(pre.edges.size).toBe(0);
+	});
+});
+
+describe('collapse', () => {
+	function loadedTree() {
+		let state = applyEvent(initialState(), upsertEnv(aFile));
+		state = applyEvent(state, upsertEnv(aFn));
+		state = applyEvent(state, upsertEnv(aVar));
+		state = applyEvent(state, {
+			v: 1,
+			ts: '',
+			sessionId: '',
+			type: 'edge.upsert',
+			payload: { edge: aFileFnEdge }
+		});
+		state = applyEvent(state, {
+			v: 1,
+			ts: '',
+			sessionId: '',
+			type: 'edge.upsert',
+			payload: { edge: aFnVarEdge }
+		});
+		return state;
+	}
+
+	it('removes transitive descendants (function and variable) but keeps the node', () => {
+		const collapsed = collapse(loadedTree(), 'file:a.rs');
+		expect(collapsed.nodes.has('file:a.rs')).toBe(true);
+		expect(collapsed.nodes.has('fn:a.rs:alpha')).toBe(false);
+		expect(collapsed.nodes.has('var:a.rs:alpha:x')).toBe(false);
+	});
+
+	it('drops edges whose source or target was removed', () => {
+		const collapsed = collapse(loadedTree(), 'file:a.rs');
+		expect(collapsed.edges.has(aFileFnEdge.id)).toBe(false);
+		expect(collapsed.edges.has(aFnVarEdge.id)).toBe(false);
+	});
+
+	it('is pure and does not mutate the input state', () => {
+		const state = loadedTree();
+		collapse(state, 'file:a.rs');
+		expect(state.nodes.size).toBe(3);
+		expect(state.edges.size).toBe(2);
+	});
+});
+
+describe('requestExpand', () => {
+	it('calls socket.send exactly once with the canonical expand frame', () => {
+		const send = vi.fn();
+		const socket = { send } as unknown as WebSocket;
+		requestExpand(socket, 'file:a.rs');
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledWith('{"type":"expand","nodeId":"file:a.rs"}');
 	});
 });

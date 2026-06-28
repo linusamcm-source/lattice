@@ -10,8 +10,10 @@
  * 4. Components subscribe to the derived {@link nodes} / {@link edges} stores.
  *
  * `snapshot` replaces the whole graph; `node.upsert`/`edge.upsert` insert-or-update
- * by id; `node.remove`/`edge.remove` delete by id. Auto-reconnect is deliberately
- * out of scope for Phase 0 (it lands in Phase 9).
+ * by id; `node.remove`/`edge.remove` delete by id; the Phase-1 `subtree` reply
+ * (the lazy `expand` answer) merges a parent's direct children in by id. Subtrees
+ * are fetched only via {@link requestExpand} and discarded via {@link collapse}.
+ * Auto-reconnect is deliberately out of scope for Phase 0 (it lands in Phase 9).
  *
  * @module
  */
@@ -70,6 +72,16 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			nextEdges.delete(envelope.payload.id);
 			return { nodes: state.nodes, edges: nextEdges };
 		}
+		case 'subtree': {
+			// Lazy `expand` reply: merge the parent's direct children into the
+			// existing graph by id (existing entries preserved, children
+			// inserted-or-updated). Never a whole-graph replacement.
+			const nextNodes = new Map(state.nodes);
+			for (const node of envelope.payload.nodes) nextNodes.set(node.id, node);
+			const nextEdges = new Map(state.edges);
+			for (const edge of envelope.payload.edges) nextEdges.set(edge.id, edge);
+			return { nodes: nextNodes, edges: nextEdges };
+		}
 	}
 }
 
@@ -78,7 +90,8 @@ const KNOWN_EVENT_TYPES: ReadonlySet<EventType> = new Set([
 	'node.upsert',
 	'node.remove',
 	'edge.upsert',
-	'edge.remove'
+	'edge.remove',
+	'subtree'
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -155,4 +168,56 @@ export function connect(url: string): WsClient {
 		if (envelope) ingest(envelope);
 	});
 	return { socket, close: () => socket.close() };
+}
+
+/**
+ * Send the Phase-1 lazy-load `expand` request for `nodeId` over `socket`.
+ *
+ * Mirrors the `{"type":"snapshot"}` resync frame: the serialized payload is
+ * exactly `{"type":"expand","nodeId":"<nodeId>"}` (keys `type` then `nodeId`),
+ * which the backend answers with a `subtree` envelope carrying that node's
+ * direct children. Children are fetched only on this explicit request — the
+ * client never pre-fetches a subtree.
+ *
+ * @param socket - the live WebSocket connection.
+ * @param nodeId - the id of the node whose children to load.
+ */
+export function requestExpand(socket: WebSocket, nodeId: string): void {
+	socket.send(JSON.stringify({ type: 'expand', nodeId }));
+}
+
+/**
+ * Pure collapse-discard: return a new {@link GraphState} with `nodeId`'s
+ * **transitive** descendants removed, bounding client memory after a collapse.
+ *
+ * A node is a descendant when it is reachable by following `parentId` edges
+ * down from `nodeId`; every such node is dropped, along with any edge whose
+ * `source` or `target` was dropped. `nodeId` itself and all unrelated nodes are
+ * preserved. The input state is never mutated.
+ *
+ * @param state - the current graph state.
+ * @param nodeId - the node to collapse (kept; its descendants are discarded).
+ * @returns the next graph state without `nodeId`'s descendants.
+ */
+export function collapse(state: GraphState, nodeId: string): GraphState {
+	const removed = new Set<string>();
+	const queue: string[] = [nodeId];
+	while (queue.length > 0) {
+		const parent = queue.shift() as string;
+		for (const node of state.nodes.values()) {
+			if (node.parentId === parent && !removed.has(node.id)) {
+				removed.add(node.id);
+				queue.push(node.id);
+			}
+		}
+	}
+	const nextNodes = new Map<string, Node>();
+	for (const [id, node] of state.nodes) {
+		if (!removed.has(id)) nextNodes.set(id, node);
+	}
+	const nextEdges = new Map<string, Edge>();
+	for (const [id, edge] of state.edges) {
+		if (!removed.has(edge.source) && !removed.has(edge.target)) nextEdges.set(id, edge);
+	}
+	return { nodes: nextNodes, edges: nextEdges };
 }

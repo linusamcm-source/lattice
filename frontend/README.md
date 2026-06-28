@@ -1,9 +1,10 @@
 # Lattice Frontend
 
 SvelteKit + Vite + TypeScript (strict) client for the Lattice live code & agent
-visualiser. The Phase 0 walking skeleton streams CLV envelopes over a WebSocket
-into a reactive store and renders a flat two-tier SvelteFlow canvas (file nodes
-and their direct function children).
+visualiser. It streams CLV envelopes over a WebSocket into a reactive store and
+renders a **lazy hierarchy** SvelteFlow canvas: only top-level (file) nodes load
+on connect, and a node's children are fetched and revealed on demand when the
+user expands it.
 
 ## Stack
 
@@ -50,17 +51,57 @@ narrow without casts. `src/lib/ws.ts` is the client:
 4. `ingest(envelope)` applies the reducer to the `graphStore`; components consume
    the derived `nodes` / `edges` stores. Auto-reconnect is deferred to Phase 9.
 
-## Two-tier render model (P0-8)
+## Lazy expand / collapse flow (P1-3)
 
-`src/lib/Graph.svelte` renders a flat **two-tier** SvelteFlow canvas from the
-`nodes` store. The CLV `Node` carries no coordinates, so `src/lib/layout.ts`
-(`buildTwoTier`) assigns deterministic positions: every `file` node stacks in a
-left column (`x = 0`), and each file's direct `function` children (nodes whose
-`parentId` equals a present file id) sit in a right column (`x = 280`), stepped
-so they never overlap. Labels render through SvelteFlow's default node
-(`data.label`). There is **no expand/collapse** — lazy-load and zoom-gating are
-Phase 1. The canvas mounts only after `onMount`, so SvelteKit prerender/SSR never
-instantiates the browser-only SvelteFlow component.
+Phase 1 makes the client lazy: the initial `snapshot` carries only top-level
+(file) nodes, and a node's children are fetched on demand.
+
+- **Expand.** `requestExpand(socket, nodeId)` sends the frame
+  `{"type":"expand","nodeId":"<id>"}` (mirroring the `{"type":"snapshot"}`
+  resync request). The backend replies with a `subtree` envelope —
+  `payload { parentId, nodes, edges }` — carrying that node's **direct**
+  children and the `contains` edges to them. `applyEvent` handles `subtree` by
+  **merging** those nodes/edges into the store by id (existing entries
+  preserved); it is not a whole-graph replacement. Children are never
+  pre-fetched — only this explicit request loads them.
+- **Collapse.** `collapse(state, nodeId)` is a pure reducer that returns a new
+  `GraphState` with `nodeId`'s **transitive** descendants (everything reachable
+  by following `parentId` down from `nodeId`) discarded, along with any edge
+  whose endpoint was removed. `nodeId` itself and unrelated nodes are kept. This
+  bounds client memory as the user drills in and out of a deep tree.
+
+Reconnect-resync of expanded subtrees is deferred to Phase 9.
+
+## Lazy hierarchy render model (P1-4)
+
+`src/lib/Graph.svelte` renders a **lazy hierarchy** SvelteFlow canvas from the
+`nodes` store. On mount it shows only top-level (root, `parentId` null/absent)
+nodes; a node's children appear only after the user expands it.
+
+- **Expansion state** is an explicit `Set<string>` of expanded node ids held in
+  `Graph.svelte`. It is the render-side **zoom gate**: a node's children are laid
+  out only when its id is in the set, so a function's `variable` children stay off
+  the canvas — even when already present in the store — until the function is
+  drilled into.
+- **Expanding** a node adds its id to the set and invokes the `onExpand` prop
+  (default: `requestExpand(socket, nodeId)` against the injected `socket`, which
+  the index route wires; tests inject a spy). When the `subtree` reply merges the
+  children into the store, the next layout pass reveals them.
+- **Collapsing** a node removes its id from the set and calls `collapse`, which
+  discards the node's transitive descendants from the store (bounding memory) so
+  they leave both the store and the canvas.
+- **Affordance & layout.** Each node is a custom `hierarchy` node
+  (`src/lib/HierarchyNode.svelte`) rendering its label plus an expand/collapse
+  button when it has children. `src/lib/layout.ts` (`buildHierarchy`) walks the
+  visible slice of the tree in a stable pre-order (ids sorted per level) and
+  assigns deterministic positions: one column per depth (roots at `x = 0`, an
+  expanded node's children one column right, their children a further column
+  right) and one row per visible node.
+
+The canvas mounts only after `onMount`, so SvelteKit prerender/SSR never
+instantiates the browser-only SvelteFlow component. The `Graph` component takes a
+`socket?: WebSocket` and an `onExpand?: (nodeId: string) => void` prop; the index
+route opens the live socket and passes it down.
 
 ## Notes
 
