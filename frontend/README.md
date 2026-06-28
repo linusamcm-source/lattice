@@ -103,6 +103,24 @@ instantiates the browser-only SvelteFlow component. The `Graph` component takes 
 `socket?: WebSocket` and an `onExpand?: (nodeId: string) => void` prop; the index
 route opens the live socket and passes it down.
 
+## Doc tooltip & selection sidebar (P3-3)
+
+Phase 3 surfaces each node's extracted documentation (`Node.docs`).
+
+- **Hover tooltip.** `buildHierarchy` copies a node's `docs` into its layout data,
+  and `src/lib/HierarchyNode.svelte` binds it to a `title` attribute on the node's
+  content, so hovering any tier (file/function/variable) shows the description —
+  present at every zoom level.
+- **Selection sidebar.** Each node's label is a select affordance that calls the
+  `onSelect` callback threaded through `buildHierarchy`. `Graph.svelte` holds the
+  selected node id, looks the node up live from the `nodes` store, and renders
+  `src/lib/Sidebar.svelte` alongside the canvas with its `label` and `docs` (or a
+  "No documentation" / "No node selected" empty state). Because the lookup is
+  reactive, a `node.upsert` that changes the selected node's `docs` updates the
+  sidebar immediately — the live "updating the source updates the shown doc" path.
+- **Expand vs select.** The expand/collapse button `stopPropagation`s before
+  toggling, so expanding a node never also selects it.
+
 ## Notes
 
 - Coverage uses the v8 provider and emits `coverage/coverage-final.json`

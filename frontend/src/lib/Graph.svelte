@@ -27,6 +27,7 @@
 	import { nodes, graphStore, requestExpand, collapse } from './ws';
 	import { buildHierarchy } from './layout';
 	import HierarchyNode from './HierarchyNode.svelte';
+	import Sidebar from './Sidebar.svelte';
 
 	/** Public props for the lazy hierarchy canvas. */
 	interface GraphProps {
@@ -53,12 +54,29 @@
 	let mounted = $state(false);
 	/** Ids of nodes whose children are currently revealed (the render-side zoom gate). */
 	let expanded = $state(new Set<string>());
+	/** Id of the node whose details are shown in the sidebar (`undefined` = none). */
+	let selected = $state<string | undefined>(undefined);
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
+
+	// The selected node, looked up live from the store, so a `node.upsert` that
+	// changes its docs flows straight through to the sidebar.
+	let selectedNode = $derived(
+		selected === undefined ? undefined : $nodes.find((node) => node.id === selected)
+	);
 
 	onMount(() => {
 		mounted = true;
 	});
+
+	/**
+	 * Select a node, opening it in the sidebar.
+	 *
+	 * @param nodeId - the id of the node whose content region was activated.
+	 */
+	function select(nodeId: string): void {
+		selected = nodeId;
+	}
 
 	/**
 	 * Toggle a node's expansion. Expanding reveals the node's children and, by
@@ -85,17 +103,26 @@
 	// expansion set changes, injecting the toggle callback into each node's data.
 	// Children only reach the canvas when their parent id is in `expanded`.
 	$effect(() => {
-		flowNodes = buildHierarchy($nodes, expanded).map((node) => ({
+		flowNodes = buildHierarchy($nodes, expanded, select).map((node) => ({
 			...node,
 			data: { ...node.data, onToggle: toggle }
 		}));
 	});
 </script>
 
-<div class="h-full w-full">
-	{#if mounted}
-		<SvelteFlow {nodeTypes} bind:nodes={flowNodes} bind:edges={flowEdges} colorMode="light" fitView>
-			<Background />
-		</SvelteFlow>
-	{/if}
+<div class="flex h-full w-full">
+	<div class="relative h-full flex-1">
+		{#if mounted}
+			<SvelteFlow
+				{nodeTypes}
+				bind:nodes={flowNodes}
+				bind:edges={flowEdges}
+				colorMode="light"
+				fitView
+			>
+				<Background />
+			</SvelteFlow>
+		{/if}
+	</div>
+	<Sidebar selected={selectedNode} />
 </div>
