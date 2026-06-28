@@ -1,4 +1,14 @@
-//! Lowers a single Rust source file to its structural CLV graph contribution.
+//! Lowers a single source file to its structural CLV graph contribution.
+//!
+//! [`parse_source`] is the entry point: it dispatches on the file extension to the
+//! matching language path — `rs` → [`parse_rust_source`] (`syn`), `py` →
+//! [`parse_python`] and `ts` → [`parse_typescript`] (both `tree-sitter`, in the
+//! private [`treesitter`] submodule). Each language path emits the **same** file →
+//! function → variable node/edge model (the `tree-sitter` paths tag
+//! `meta.language = "python"` / `"typescript"`). Any other extension yields a bare
+//! `file` node (status [`NodeStatus::Unknown`], no children) so the file still
+//! appears in the graph without an extracted interior. Every path produces a
+//! [`ParsedFile`] and recovers panic-free from syntax errors.
 //!
 //! [`parse_rust_source`] uses `syn` to parse one file into a [`ParsedFile`]: a
 //! `file` [`Node`] plus one `function` node per free `fn` and per method declared
@@ -21,6 +31,10 @@
 use proc_macro2::Span;
 
 use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Range};
+
+mod treesitter;
+
+use treesitter::{parse_python, parse_typescript};
 
 /// One Rust file's structural contribution to the CLV graph.
 ///
@@ -115,6 +129,38 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
     }
 
     ParsedFile { nodes, edges }
+}
+
+/// Parses `source` into its structural graph, dispatching on `path`'s extension.
+///
+/// Routes by file extension to the matching language path: `rs` →
+/// [`parse_rust_source`] (`syn`), `py` → [`parse_python`] and `ts` →
+/// [`parse_typescript`] (both `tree-sitter`). Any other extension (or none) is a
+/// language Lattice does not parse in Phase 2, so the result is a bare `file` node
+/// (status [`NodeStatus::Unknown`], no function/variable children and no edges) —
+/// the file still appears in the graph, just without an extracted interior.
+/// Panic-free: each delegate recovers from malformed input on its own.
+pub fn parse_source(path: &str, source: &str) -> ParsedFile {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+    {
+        Some("rs") => parse_rust_source(path, source),
+        Some("py") => parse_python(path, source),
+        Some("ts") => parse_typescript(path, source),
+        _ => {
+            let file_id = node_id(NodeType::File, path, "");
+            let label = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path)
+                .to_string();
+            ParsedFile {
+                nodes: vec![file_node(file_id, label, NodeStatus::Unknown)],
+                edges: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Builds a bare `file` node with the given id, label, and status.
@@ -316,6 +362,35 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.source == source && e.target == target && e.kind == EdgeKind::Contains)
+    }
+
+    #[test]
+    fn parse_source_routes_by_extension_to_the_right_language() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            ("x.rs", "fn f() {}", "fn:x.rs:f"),
+            ("x.py", "def f():\n    pass\n", "fn:x.py:f"),
+            ("x.ts", "function f() {}", "fn:x.ts:f"),
+        ];
+        for (path, source, want_fn) in cases {
+            let parsed = parse_source(path, source);
+            assert!(
+                ids(&parsed).contains(&want_fn),
+                "{path}: missing {want_fn}, got {:?}",
+                ids(&parsed)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_source_unknown_extension_yields_only_a_file_node() {
+        let parsed = parse_source("x.md", "# hi");
+        assert_eq!(ids(&parsed), vec!["file:x.md"], "only the file node");
+        assert!(
+            function_nodes(&parsed).is_empty(),
+            "unknown extension must yield no function nodes"
+        );
+        assert_eq!(parsed.nodes[0].status, NodeStatus::Unknown);
+        assert!(parsed.edges.is_empty(), "no edges for a bare file node");
     }
 
     #[test]
