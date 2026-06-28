@@ -2,11 +2,11 @@
 # Stories execute in isolated git worktrees and merge back to `main`.
 plan_path: docs/sprints/phase-0-walking-skeleton.md
 target_branch: main
-coverage_threshold: 80
+coverage_threshold: 90
 coverage_mode: new
-graphify: off          # tiny codebase; repomix text-grep is sufficient recon
+graphify: on          # tiny codebase; repomix text-grep is sufficient recon
 crew: auto             # resolves .claude/crews/<lang>.json (rust + typescript built)
-push_on_merge: false
+push_on_merge: true          # push to remote after merging story branches
 
 commands:
   test: just test
