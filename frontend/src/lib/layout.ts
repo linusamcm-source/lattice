@@ -17,14 +17,35 @@
  * @module
  */
 
-import type { Node as FlowNode } from '@xyflow/svelte';
-import type { Node } from './types';
+import {
+	Position,
+	type Node as FlowNode,
+	type Edge as FlowEdge,
+	type NodeHandle
+} from '@xyflow/svelte';
+import type { Edge, EdgeKind, Node } from './types';
 
 /** Vertical spacing between stacked rows, in pixels. */
 const ROW_HEIGHT = 120;
 
 /** Horizontal offset between adjacent depth columns, in pixels. */
 const COLUMN_WIDTH = 280;
+
+/** Pre-measurement size hint for a hierarchy node, in pixels. */
+const NODE_WIDTH = 200;
+const NODE_HEIGHT = 48;
+
+/**
+ * Deterministic handle anchors for every hierarchy node: a target on the left
+ * edge and a source on the right edge, matching the `<Handle>`s rendered by
+ * `HierarchyNode`. Declaring them on the node lets SvelteFlow route edges on the
+ * first paint instead of waiting for the async measurement pass; once the node
+ * is measured the real handle bounds take over.
+ */
+const NODE_HANDLES: NodeHandle[] = [
+	{ type: 'target', position: Position.Left, x: 0, y: NODE_HEIGHT / 2 },
+	{ type: 'source', position: Position.Right, x: NODE_WIDTH, y: NODE_HEIGHT / 2 }
+];
 
 /**
  * Per-node payload carried in a SvelteFlow node's `data`, consumed by the
@@ -97,6 +118,9 @@ export function buildHierarchy(
 			id: node.id,
 			type: 'hierarchy',
 			position: { x: depth * COLUMN_WIDTH, y: row * ROW_HEIGHT },
+			initialWidth: NODE_WIDTH,
+			initialHeight: NODE_HEIGHT,
+			handles: NODE_HANDLES,
 			data: {
 				label: node.label,
 				expandable: hasChildren(node),
@@ -113,6 +137,111 @@ export function buildHierarchy(
 
 	const roots = graphNodes.filter((n) => n.parentId == null).sort((a, b) => compareId(a.id, b.id));
 	for (const root of roots) walk(root, 0);
+
+	return flow;
+}
+
+/**
+ * The two edge classes the canvas renders, keyed off the CLV {@link EdgeKind}:
+ * `calls` is **control flow**, and `param_source` / `data_flows_from` are
+ * **data flow**. `contains` (and every other kind) is not a flow class and is
+ * never drawn — containment is already conveyed by the column layout.
+ */
+export type EdgeFlowClass = 'control' | 'data';
+
+/**
+ * Independent visibility toggles for the two edge classes. Both default on in
+ * `Graph.svelte`; flipping one to `false` drops that class of edge from the
+ * canvas without touching the other.
+ */
+export interface EdgeFilter {
+	/** When `false`, `calls` (control-flow) edges are excluded. */
+	controlFlow: boolean;
+	/** When `false`, `param_source` / `data_flows_from` (data-flow) edges are excluded. */
+	dataFlow: boolean;
+}
+
+/**
+ * Per-edge payload carried in a SvelteFlow edge's `data`, so the flow class is
+ * inspectable without re-parsing the `class` string (used by tests and any
+ * future custom edge component).
+ */
+export type HierarchyEdgeData = {
+	/** The originating CLV edge kind. */
+	kind: EdgeKind;
+	/** Which toggle class the edge belongs to. */
+	flowClass: EdgeFlowClass;
+};
+
+/** A SvelteFlow edge carrying its {@link HierarchyEdgeData} flow-class marker. */
+export type HierarchyFlowEdge = FlowEdge<HierarchyEdgeData>;
+
+/** Map a CLV edge kind to its flow class, or `null` when the kind is never drawn. */
+function flowClassOf(kind: EdgeKind): EdgeFlowClass | null {
+	switch (kind) {
+		case 'calls':
+			return 'control';
+		case 'param_source':
+		case 'data_flows_from':
+			return 'data';
+		default:
+			// `contains` and any other relationship are conveyed structurally, not drawn.
+			return null;
+	}
+}
+
+/**
+ * Build the visible SvelteFlow edge list from the CLV edge store.
+ *
+ * An edge is rendered only when **all** of the following hold, so the canvas
+ * stays in lockstep with the lazy node hierarchy:
+ *
+ * 1. Its `kind` maps to a flow class via {@link flowClassOf} (`calls` →
+ *    control, `param_source` / `data_flows_from` → data). `contains` and every
+ *    other kind are skipped — containment is shown by the column layout.
+ * 2. That flow class is enabled in `filter` (`controlFlow` / `dataFlow`), which
+ *    the two independent toggles drive.
+ * 3. **Both** `source` and `target` are present in `visibleNodeIds` — the set of
+ *    node ids `buildHierarchy` actually emitted. Collapsing a parent removes its
+ *    descendants from that set, so their edges drop out automatically with no
+ *    special-casing.
+ *
+ * Each rendered edge is colour-/class-keyed by flow class: a semantic `class`
+ * marker (`lattice-edge-control` / `lattice-edge-data`) plus a Tailwind stroke
+ * utility, `animated` for data flow (a non-colour cue), and a typed
+ * {@link HierarchyEdgeData} `data` block.
+ *
+ * @param graphEdges - all current CLV edges from the `edges` store.
+ * @param visibleNodeIds - ids of the nodes currently on the canvas (the zoom gate).
+ * @param filter - the control-/data-flow toggle state.
+ * @returns SvelteFlow edges for exactly the visible, enabled flow edges.
+ */
+export function buildEdges(
+	graphEdges: Edge[],
+	visibleNodeIds: ReadonlySet<string>,
+	filter: EdgeFilter
+): HierarchyFlowEdge[] {
+	const flow: HierarchyFlowEdge[] = [];
+
+	for (const edge of graphEdges) {
+		const flowClass = flowClassOf(edge.kind);
+		if (flowClass === null) continue;
+		if (flowClass === 'control' && !filter.controlFlow) continue;
+		if (flowClass === 'data' && !filter.dataFlow) continue;
+		if (!visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target)) continue;
+
+		flow.push({
+			id: edge.id,
+			source: edge.source,
+			target: edge.target,
+			animated: flowClass === 'data',
+			class:
+				flowClass === 'control'
+					? 'lattice-edge-control [&_path]:stroke-sky-500'
+					: 'lattice-edge-data [&_path]:stroke-amber-500',
+			data: { kind: edge.kind, flowClass }
+		});
+	}
 
 	return flow;
 }

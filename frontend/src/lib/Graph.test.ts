@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/svelte';
+import { render, cleanup, fireEvent, waitFor } from '@testing-library/svelte';
 import { get } from 'svelte/store';
 import { tick } from 'svelte';
 import Graph from './Graph.svelte';
 import HierarchyNodeHarness from './HierarchyNode.harness.svelte';
 import { ingest, graphStore, initialState } from './ws';
-import type { Node, EventEnvelope } from './types';
+import type { Node, Edge, EventEnvelope } from './types';
 
 const fileNode: Node = {
 	id: 'file:src/x.rs',
@@ -237,5 +237,71 @@ describe('Graph.svelte selection sidebar', () => {
 		ingest(upsert({ ...docFile, docs: 'v2 docs' }));
 		expect(await screen.findByText('v2 docs')).toBeTruthy();
 		expect(screen.queryByText('v1 docs')).toBeNull();
+	});
+});
+
+// P4-4: edge rendering + control/data-flow filter.
+const fnA: Node = {
+	id: 'fn:src/x.rs:a',
+	type: 'function',
+	label: 'a',
+	parentId: null,
+	childIds: [],
+	status: 'unknown'
+};
+
+const fnB: Node = {
+	id: 'fn:src/x.rs:b',
+	type: 'function',
+	label: 'b',
+	parentId: null,
+	childIds: [],
+	status: 'unknown'
+};
+
+const callsEdge: Edge = {
+	id: 'e:fn:src/x.rs:b->fn:src/x.rs:a:calls',
+	source: 'fn:src/x.rs:b',
+	target: 'fn:src/x.rs:a',
+	kind: 'calls',
+	hot: false
+};
+
+function snapshotWith(nodes: Node[], edges: Edge[]): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-28T00:00:00.000Z',
+		sessionId: 'sess-test',
+		type: 'snapshot',
+		payload: { nodes, edges }
+	};
+}
+
+describe('Graph.svelte edge rendering + flow filter', () => {
+	it('renders Control flow and Data flow toggles, both on by default', async () => {
+		ingest(snapshotWith([fnA, fnB], [callsEdge]));
+		const screen = render(Graph);
+		await tick();
+
+		const control = screen.getByRole('checkbox', { name: /control flow/i }) as HTMLInputElement;
+		const data = screen.getByRole('checkbox', { name: /data flow/i }) as HTMLInputElement;
+		expect(control.checked).toBe(true);
+		expect(data.checked).toBe(true);
+	});
+
+	it('renders a calls edge between two visible nodes and drops it when Control flow is off', async () => {
+		ingest(snapshotWith([fnA, fnB], [callsEdge]));
+		const { container, getByRole } = render(Graph);
+		await tick();
+
+		// Both function nodes are roots, so both are on the canvas; the calls edge
+		// between them renders once the nodes are laid out.
+		await waitFor(() => expect(container.querySelectorAll('.svelte-flow__edge').length).toBe(1));
+
+		await fireEvent.click(getByRole('checkbox', { name: /control flow/i }));
+		await waitFor(() => expect(container.querySelectorAll('.svelte-flow__edge').length).toBe(0));
+
+		// Data flow stays on, so a data-flow edge would still render.
+		expect((getByRole('checkbox', { name: /data flow/i }) as HTMLInputElement).checked).toBe(true);
 	});
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { buildHierarchy, type HierarchyNodeData } from './layout';
-import type { Node } from './types';
+import { buildHierarchy, buildEdges, type HierarchyNodeData } from './layout';
+import type { Node, Edge, EdgeKind } from './types';
 
 const file: Node = {
 	id: 'file:src/x.rs',
@@ -73,5 +73,86 @@ describe('buildHierarchy', () => {
 		const lonely: Node = { ...file, childIds: [] };
 		const flow = buildHierarchy([lonely], new Set());
 		expect(data(flow[0]).expandable).toBe(false);
+	});
+});
+
+// P4-4: edge rendering + kind colour/class + control/data-flow filter.
+const mkEdge = (id: string, source: string, target: string, kind: EdgeKind): Edge => ({
+	id,
+	source,
+	target,
+	kind,
+	hot: false
+});
+
+const BOTH_ON = { controlFlow: true, dataFlow: true };
+const both = new Set(['fn:a', 'fn:b']);
+const classOf = (edge: { class?: unknown }): string => `${edge.class ?? ''}`;
+
+describe('buildEdges', () => {
+	it('renders a calls edge between visible endpoints as a control-flow edge', () => {
+		const out = buildEdges([mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls')], both, BOTH_ON);
+		expect(out).toHaveLength(1);
+		expect(out[0].id).toBe('e:fn:a->fn:b:calls');
+		expect(out[0].source).toBe('fn:a');
+		expect(out[0].target).toBe('fn:b');
+		expect(out[0].data?.flowClass).toBe('control');
+		expect(classOf(out[0])).toContain('lattice-edge-control');
+	});
+
+	it('renders a param_source edge as a data-flow edge', () => {
+		const out = buildEdges(
+			[mkEdge('e:fn:b->fn:a:param_source', 'fn:b', 'fn:a', 'param_source')],
+			both,
+			BOTH_ON
+		);
+		expect(out).toHaveLength(1);
+		expect(out[0].data?.flowClass).toBe('data');
+		expect(classOf(out[0])).toContain('lattice-edge-data');
+	});
+
+	it('classifies data_flows_from as a data-flow edge', () => {
+		const out = buildEdges(
+			[mkEdge('e:fn:a->fn:b:data_flows_from', 'fn:a', 'fn:b', 'data_flows_from')],
+			both,
+			BOTH_ON
+		);
+		expect(out).toHaveLength(1);
+		expect(out[0].data?.flowClass).toBe('data');
+	});
+
+	it('omits an edge when either endpoint is not in the visible set', () => {
+		const e = mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls');
+		expect(buildEdges([e], new Set(['fn:a']), BOTH_ON)).toEqual([]);
+		expect(buildEdges([e], new Set(['fn:b']), BOTH_ON)).toEqual([]);
+		expect(buildEdges([e], new Set(), BOTH_ON)).toEqual([]);
+	});
+
+	it('never draws a contains edge even when both endpoints are visible', () => {
+		const e = mkEdge('e:file:x->fn:a', 'file:x', 'fn:a', 'contains');
+		expect(buildEdges([e], new Set(['file:x', 'fn:a']), BOTH_ON)).toEqual([]);
+	});
+
+	it('excludes calls when controlFlow is off but keeps data-flow edges', () => {
+		const calls = mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls');
+		const param = mkEdge('e:fn:b->fn:a:param_source', 'fn:b', 'fn:a', 'param_source');
+		const out = buildEdges([calls, param], both, { controlFlow: false, dataFlow: true });
+		expect(out.map((e) => e.id)).toEqual(['e:fn:b->fn:a:param_source']);
+		expect(out[0].data?.flowClass).toBe('data');
+	});
+
+	it('excludes data-flow when dataFlow is off but keeps calls edges', () => {
+		const calls = mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls');
+		const param = mkEdge('e:fn:b->fn:a:param_source', 'fn:b', 'fn:a', 'param_source');
+		const flows = mkEdge('e:fn:a->fn:b:data_flows_from', 'fn:a', 'fn:b', 'data_flows_from');
+		const out = buildEdges([calls, param, flows], both, { controlFlow: true, dataFlow: false });
+		expect(out.map((e) => e.id)).toEqual(['e:fn:a->fn:b:calls']);
+		expect(out[0].data?.flowClass).toBe('control');
+	});
+
+	it('returns nothing when both toggles are off', () => {
+		const calls = mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls');
+		const param = mkEdge('e:fn:b->fn:a:param_source', 'fn:b', 'fn:a', 'param_source');
+		expect(buildEdges([calls, param], both, { controlFlow: false, dataFlow: false })).toEqual([]);
 	});
 });
