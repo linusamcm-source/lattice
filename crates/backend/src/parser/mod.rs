@@ -141,7 +141,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
 /// the file still appears in the graph, just without an extracted interior.
 /// Panic-free: each delegate recovers from malformed input on its own.
 pub fn parse_source(path: &str, source: &str) -> ParsedFile {
-    match std::path::Path::new(path)
+    let mut parsed = match std::path::Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
     {
@@ -159,6 +159,33 @@ pub fn parse_source(path: &str, source: &str) -> ParsedFile {
                 nodes: vec![file_node(file_id, label, NodeStatus::Unknown)],
                 edges: Vec::new(),
             }
+        }
+    };
+    populate_child_ids(&mut parsed);
+    parsed
+}
+
+/// Fills each node's `child_ids` from the file's `contains` edges.
+///
+/// The lazy snapshot ships parent nodes without their child subtrees, but the
+/// client needs to know a node *has* children to render an expand affordance (the
+/// subtree itself is fetched on `expand`). This derives `child_ids` from the
+/// `contains` edges so a `file` node lists its `function` children and a
+/// `function` node lists its `variable` children.
+fn populate_child_ids(parsed: &mut ParsedFile) {
+    use std::collections::HashMap;
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in &parsed.edges {
+        if edge.kind == EdgeKind::Contains {
+            children
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+        }
+    }
+    for node in &mut parsed.nodes {
+        if let Some(ids) = children.get(&node.id) {
+            node.child_ids = ids.clone();
         }
     }
 }
@@ -379,6 +406,31 @@ mod tests {
                 ids(&parsed)
             );
         }
+    }
+
+    #[test]
+    fn parse_source_populates_child_ids_from_contains_edges() {
+        let parsed = parse_source("a.rs", "fn f() { let x = 1; }");
+        let file = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "file:a.rs")
+            .expect("file node");
+        assert!(
+            file.child_ids.contains(&"fn:a.rs:f".to_string()),
+            "file childIds: {:?}",
+            file.child_ids
+        );
+        let func = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "fn:a.rs:f")
+            .expect("function node");
+        assert!(
+            func.child_ids.contains(&"var:a.rs:f:x".to_string()),
+            "function childIds: {:?}",
+            func.child_ids
+        );
     }
 
     #[test]

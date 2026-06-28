@@ -4,8 +4,9 @@
 	import Graph from '$lib/Graph.svelte';
 	import { connect, type WsClient } from '$lib/ws';
 
-	/** Dev WebSocket endpoint (matches the example in `ws.ts`). */
-	const WS_URL = 'ws://localhost:7000';
+	/** Dev WebSocket endpoint. Uses 127.0.0.1 (not `localhost`) to match the
+	 * backend's IPv4 bind — `localhost` can resolve to IPv6 `::1` and fail. */
+	const WS_URL = 'ws://127.0.0.1:7000';
 
 	let client: WsClient | undefined;
 	let socket = $state<WebSocket | undefined>(undefined);
