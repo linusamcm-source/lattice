@@ -21,7 +21,10 @@
 //! line/col `0`). Documentation is surfaced via [`extract_docs`]: the `file` node
 //! carries the module-level inner doc (`//!`) and each `function` node its outer
 //! doc comments (`///` / `#[doc = "..."]`) in `docs`, while `variable` nodes carry
-//! none. Variable bindings are deduplicated by name with the latest shadowing
+//! none. Each `function` node also carries its extracted [`crate::wire::Signature`]
+//! (typed params with `self` receivers excluded, plus the rendered return type)
+//! via [`build_signature`]; `file` and `variable` nodes carry no signature.
+//! Variable bindings are deduplicated by name with the latest shadowing
 //! binding winning, so the contribution holds no duplicate ids or edges.
 //!
 //! Per `SPEC.md` §6/§11.1 the parser is **panic-free**: malformed input never
@@ -32,8 +35,11 @@
 //! (normalisation is a separate concern).
 
 use proc_macro2::Span;
+use quote::ToTokens;
 
-use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Range};
+use crate::wire::{
+    edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Param, Range, Signature,
+};
 
 mod treesitter;
 
@@ -58,8 +64,10 @@ pub struct ParsedFile {
 /// status [`NodeStatus::Unknown`], `docs` set to the module-level inner doc
 /// (`//!`) via [`extract_docs`] when present) and one `function` node per free
 /// `fn` and per `impl`/`trait` method, each parented to the file with a `contains`
-/// edge, a [`Meta::range`] filled from the item's span, and `docs` set to the
-/// item's outer doc comments (`///` / `#[doc = "..."]`). For every function with a
+/// edge, a [`Meta::range`] filled from the item's span, `docs` set to the
+/// item's outer doc comments (`///` / `#[doc = "..."]`), and `signature` set to
+/// the function's extracted [`Signature`] (typed params, `self` excluded, plus the
+/// rendered return type) via [`build_signature`]. For every function with a
 /// body, one `variable` node is emitted per simple `let`-bound identifier (id
 /// `node_id(Variable, path, "<fn>:<name>")`), parented to its function with a
 /// `contains` edge; shadowed bindings dedupe to the latest by name. Variable nodes
@@ -100,7 +108,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                     &mut edges,
                     &file_id,
                     path,
-                    &item_fn.sig.ident,
+                    &item_fn.sig,
                     &item_fn.attrs,
                     Some(item_fn.block.as_ref()),
                 );
@@ -113,7 +121,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &mut edges,
                             &file_id,
                             path,
-                            &method.sig.ident,
+                            &method.sig,
                             &method.attrs,
                             Some(&method.block),
                         );
@@ -128,7 +136,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &mut edges,
                             &file_id,
                             path,
-                            &method.sig.ident,
+                            &method.sig,
                             &method.attrs,
                             method.default.as_ref(),
                         );
@@ -216,26 +224,30 @@ fn file_node(id: String, label: String, status: NodeStatus) -> Node {
     }
 }
 
-/// Appends a `function` node for `ident` plus its `contains` edge from the file,
-/// then extracts that function's `let`-bound variables when `body` is present.
+/// Appends a `function` node for `sig.ident` plus its `contains` edge from the
+/// file, then extracts that function's `let`-bound variables when `body` is present.
 ///
 /// The function node id is `node_id(Function, path, name)`, the label is the
 /// function name, the parent is `file_id`, the range is taken from the
 /// identifier's span (1-based line, 0-based column) via [`span_range`], and `docs`
 /// is the item's outer doc comments (`///` / `#[doc = "..."]`) extracted from
-/// `attrs` via [`extract_docs`] (`None` when undocumented). When `body` is `Some`
-/// (free fns and `impl`/`trait` methods that have a block) its simple `let`
-/// bindings are lowered to `variable` children via [`push_variables`]; a trait
-/// method declared without a body (`body == None`) contributes no variables.
+/// `attrs` via [`extract_docs`] (`None` when undocumented). `signature` is always
+/// `Some`, derived from `sig` via [`build_signature`]: its typed parameters
+/// (`self` receivers excluded) and its rendered return type (`""` for a unit
+/// return). When `body` is `Some` (free fns and `impl`/`trait` methods that have a
+/// block) its simple `let` bindings are lowered to `variable` children via
+/// [`push_variables`]; a trait method declared without a body (`body == None`)
+/// contributes no variables.
 fn push_function(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
     file_id: &str,
     path: &str,
-    ident: &syn::Ident,
+    sig: &syn::Signature,
     attrs: &[syn::Attribute],
     body: Option<&syn::Block>,
 ) {
+    let ident = &sig.ident;
     let name = ident.to_string();
     let fn_id = node_id(NodeType::Function, path, &name);
     nodes.push(Node {
@@ -246,7 +258,7 @@ fn push_function(
         child_ids: Vec::new(),
         status: NodeStatus::Unknown,
         docs: extract_docs(attrs),
-        signature: None,
+        signature: Some(build_signature(sig)),
         meta: Some(Meta {
             language: Some("rust".to_string()),
             file_path: Some(path.to_string()),
@@ -263,6 +275,62 @@ fn push_function(
     if let Some(block) = body {
         push_variables(nodes, edges, &fn_id, &name, path, block);
     }
+}
+
+/// Lowers a `syn` [`syn::Signature`] to the CLV [`Signature`] (params + return).
+///
+/// Each [`syn::FnArg::Typed`] input becomes a [`Param`] whose `name` is the
+/// binding pattern and `param_type` is the declared type, both rendered as clean
+/// source text via [`render_tokens`]. A [`syn::FnArg::Receiver`] (`self` / `&self`)
+/// is skipped — it is not a data parameter. `returns` is the return type rendered
+/// the same way, or the empty string for a default (unit) return. A fn with no
+/// typed params and a unit return yields `Signature { params: vec![], returns:
+/// String::new() }` (the caller still stores it as `Some`).
+fn build_signature(sig: &syn::Signature) -> Signature {
+    let mut params = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            params.push(Param {
+                name: render_tokens(pat_type.pat.as_ref()),
+                param_type: render_tokens(pat_type.ty.as_ref()),
+            });
+        }
+    }
+    let returns = match &sig.output {
+        syn::ReturnType::Default => String::new(),
+        syn::ReturnType::Type(_, ty) => render_tokens(ty.as_ref()),
+    };
+    Signature { params, returns }
+}
+
+/// Renders any token-bearing `syn` node to whitespace-collapsed source text.
+///
+/// `proc-macro2` token printing pads every token with a space, so a type like
+/// `Vec<T>` round-trips through tokens as `Vec < T >`. This rejoins those pieces,
+/// keeping a single space only between two adjacent *word* tokens (so `dyn Trait`
+/// survives) and dropping it around punctuation — yielding clean text such as
+/// `i32`, `Credentials`, or `Vec<T>`. Used for both parameter names/types and
+/// return types in [`build_signature`].
+fn render_tokens<T: ToTokens>(node: &T) -> String {
+    let raw = node.to_token_stream().to_string();
+    let mut out = String::with_capacity(raw.len());
+    for piece in raw.split_whitespace() {
+        if let (Some(prev), Some(next)) = (out.chars().last(), piece.chars().next()) {
+            if is_word_char(prev) && is_word_char(next) {
+                out.push(' ');
+            }
+        }
+        out.push_str(piece);
+    }
+    out
+}
+
+/// Reports whether `c` is an identifier character (alphanumeric or `_`).
+///
+/// Used by [`render_tokens`] to decide when two adjacent token pieces need a
+/// separating space (two word characters) versus none (around punctuation).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Appends a deduplicated `variable` node and `contains` edge for each simple
@@ -771,5 +839,104 @@ mod tests {
             function_node(&second, "fn:a.rs:f").docs.as_deref(),
             Some("v2")
         );
+    }
+
+    #[test]
+    fn function_signature_extracts_typed_params_and_return() {
+        let parsed = parse_rust_source("a.rs", "fn add(a: i32, b: i32) -> i32 { a + b }");
+        let func = function_node(&parsed, "fn:a.rs:add");
+        assert_eq!(
+            func.signature,
+            Some(crate::wire::Signature {
+                params: vec![
+                    crate::wire::Param {
+                        name: "a".to_string(),
+                        param_type: "i32".to_string(),
+                    },
+                    crate::wire::Param {
+                        name: "b".to_string(),
+                        param_type: "i32".to_string(),
+                    },
+                ],
+                returns: "i32".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn function_with_no_params_and_unit_return_has_empty_signature() {
+        let parsed = parse_rust_source("a.rs", "fn noop() {}");
+        let func = function_node(&parsed, "fn:a.rs:noop");
+        assert_eq!(
+            func.signature,
+            Some(crate::wire::Signature {
+                params: vec![],
+                returns: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn method_signature_excludes_self_receiver() {
+        let parsed = parse_rust_source(
+            "a.rs",
+            "struct S; impl S { fn m(&self, x: u8) -> bool { true } }",
+        );
+        let func = function_node(&parsed, "fn:a.rs:m");
+        let sig = func.signature.as_ref().expect("method has a signature");
+        assert_eq!(
+            sig.params,
+            vec![crate::wire::Param {
+                name: "x".to_string(),
+                param_type: "u8".to_string(),
+            }],
+            "the &self receiver must be excluded from params"
+        );
+        assert_eq!(sig.returns, "bool");
+    }
+
+    #[test]
+    fn signature_param_type_is_re_derived_on_edit() {
+        let first = parse_rust_source("a.rs", "fn f(a: i32) {}");
+        assert_eq!(
+            function_node(&first, "fn:a.rs:f")
+                .signature
+                .as_ref()
+                .expect("first signature")
+                .params[0]
+                .param_type,
+            "i32"
+        );
+
+        let second = parse_rust_source("a.rs", "fn f(a: i64) {}");
+        assert_eq!(
+            function_node(&second, "fn:a.rs:f")
+                .signature
+                .as_ref()
+                .expect("second signature")
+                .params[0]
+                .param_type,
+            "i64"
+        );
+    }
+
+    #[test]
+    fn generic_param_type_is_whitespace_collapsed() {
+        let parsed = parse_rust_source("a.rs", "fn f(items: Vec<u8>) {}");
+        let sig = function_node(&parsed, "fn:a.rs:f")
+            .signature
+            .as_ref()
+            .expect("signature");
+        assert_eq!(sig.params[0].param_type, "Vec<u8>");
+    }
+
+    #[test]
+    fn variable_nodes_keep_none_signature() {
+        let parsed = parse_rust_source("a.rs", "fn f() { let x = 1; }");
+        let var = variable_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "var:a.rs:f:x")
+            .expect("variable node");
+        assert_eq!(var.signature, None);
     }
 }
