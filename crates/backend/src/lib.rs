@@ -12,7 +12,8 @@
 //! - [`parser`] — source parsers that lower a single file to the structural
 //!   [`wire::Node`]/[`wire::Edge`] graph contribution: `syn` for Rust
 //!   ([`parser::parse_rust_source`]) and `tree-sitter` for Python
-//!   ([`parser::parse_python`]), both recovering panic-free from syntax errors.
+//!   ([`parser::parse_python`]) and TypeScript ([`parser::parse_typescript`]), all
+//!   recovering panic-free from syntax errors.
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into

@@ -5,9 +5,12 @@
 //! A small [`LanguageConfig`] describes, per language, which parse-tree node
 //! kinds introduce a `function` node and which introduce a local `variable`
 //! binding, plus how to read a binding's name. The shared [`extract`] walk drives
-//! any configured language; [`parse_python`] is the Phase-2 Python entry. Tree
-//! positions are **0-based rows**, so the walk converts `row + 1` to the CLV
-//! [`Range`]'s **1-based** lines (columns stay 0-based), matching the `syn` path.
+//! any configured language; [`parse_python`] is the Phase-2 Python entry
+//! (`function_definition` functions, `assignment` locals) and [`parse_typescript`]
+//! the TypeScript entry (`function_declaration` functions, `variable_declarator`
+//! locals). Tree positions are **0-based rows**, so the walk converts `row + 1` to
+//! the CLV [`Range`]'s **1-based** lines (columns stay 0-based), matching the `syn`
+//! path.
 //!
 //! Per the Phase-2 error model (`SPEC.md` §11.1) the extractor is **panic-free**
 //! and recovers partial results: every function/variable it can read from the
@@ -71,6 +74,42 @@ fn python_binding_name(node: &TsNode, source: &[u8]) -> Option<String> {
         return None;
     }
     left.utf8_text(source).ok().map(str::to_string)
+}
+
+/// Parses TypeScript `source` at repo-relative `path` into its structural graph.
+///
+/// Emits a `file` node, one `function` node per top-level `function_declaration`
+/// (parented to the file, `meta.language = "typescript"`), and one `variable` node
+/// per single-identifier `variable_declarator` inside a function body (covering
+/// `const`/`let` via `lexical_declaration`, parented to its nearest enclosing
+/// function), each joined by a `contains` edge. Class methods and arrow functions
+/// are deferred to a later phase. Panic-free: malformed input yields the recovered
+/// nodes plus a `file` node with status [`NodeStatus::Error`] when the parse tree
+/// reports a syntax error.
+pub fn parse_typescript(path: &str, source: &str) -> ParsedFile {
+    extract(path, source, &typescript_config())
+}
+
+/// Returns the [`LanguageConfig`] for TypeScript (`function_declaration` functions,
+/// single-identifier `variable_declarator` locals).
+fn typescript_config() -> LanguageConfig {
+    LanguageConfig {
+        language: "typescript",
+        grammar: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        function_kinds: &["function_declaration"],
+        binding_kinds: &["variable_declarator"],
+        binding_name: typescript_binding_name,
+    }
+}
+
+/// Reads a TypeScript `variable_declarator` name when its `name` field is a single
+/// `identifier`; returns `None` for array/object destructuring patterns (deferred).
+fn typescript_binding_name(node: &TsNode, source: &[u8]) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    name.utf8_text(source).ok().map(str::to_string)
 }
 
 /// Lowers `source` at `path` to a [`ParsedFile`] using `config`'s rules.
@@ -399,6 +438,94 @@ mod tests {
             vars,
             vec!["var:a.py:f:c"],
             "only single-target c expected: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn ts_two_function_declarations_yield_file_and_exactly_two_function_nodes() {
+        let parsed = parse_typescript("b.ts", "function foo() {}\nfunction bar() {}\n");
+        assert!(ids(&parsed).contains(&"file:b.ts"), "missing file node");
+        let fns = function_nodes(&parsed);
+        assert_eq!(fns.len(), 2, "expected exactly two function nodes: {fns:?}");
+        for id in ["fn:b.ts:foo", "fn:b.ts:bar"] {
+            let node = fns
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap_or_else(|| panic!("missing function node {id}"));
+            assert_eq!(node.parent_id.as_deref(), Some("file:b.ts"));
+            assert!(
+                has_contains_edge(&parsed, "file:b.ts", id),
+                "missing contains edge file:b.ts -> {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_locals_yield_variable_nodes_with_parents_and_edges() {
+        let parsed = parse_typescript("b.ts", "function f() { const x = 1; let y = 2; }");
+        let vars = variable_nodes(&parsed);
+        assert_eq!(
+            vars.len(),
+            2,
+            "expected exactly two variable nodes: {vars:?}"
+        );
+        for (id, label) in [("var:b.ts:f:x", "x"), ("var:b.ts:f:y", "y")] {
+            let node = vars
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap_or_else(|| panic!("missing variable node {id}"));
+            assert_eq!(node.label, label);
+            assert_eq!(node.parent_id.as_deref(), Some("fn:b.ts:f"));
+            assert!(
+                has_contains_edge(&parsed, "fn:b.ts:f", id),
+                "missing contains edge fn:b.ts:f -> {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_nodes_carry_language_and_one_based_range() {
+        let parsed = parse_typescript("b.ts", "function f() { const x = 1; }");
+        let scoped: Vec<&Node> = function_nodes(&parsed)
+            .into_iter()
+            .chain(variable_nodes(&parsed))
+            .collect();
+        assert!(!scoped.is_empty(), "expected function/variable nodes");
+        for node in scoped {
+            let meta = node.meta.as_ref().expect("node has meta");
+            assert_eq!(meta.language.as_deref(), Some("typescript"));
+            let range = meta.range.expect("node has a range");
+            assert!(range.start_line > 0, "startLine must be 1-based: {range:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_typescript_does_not_panic_and_marks_file_error() {
+        let result = std::panic::catch_unwind(|| parse_typescript("b.ts", "function ("));
+        let parsed = result.expect("parse_typescript must not panic on malformed input");
+        let file = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "file:b.ts")
+            .expect("file node present");
+        assert_eq!(file.node_type, NodeType::File);
+        assert_eq!(file.status, NodeStatus::Error);
+    }
+
+    #[test]
+    fn ts_module_level_const_is_not_attributed_to_any_function() {
+        let parsed = parse_typescript("b.ts", "const z = 1;\nfunction f() { const x = 1; }");
+        let vars: Vec<&str> = variable_nodes(&parsed)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(
+            vars.contains(&"var:b.ts:f:x"),
+            "missing fn-local x: {vars:?}"
+        );
+        assert!(
+            !vars.iter().any(|id| id.ends_with(":z")),
+            "module-level z must not be attributed to a function: {vars:?}"
         );
     }
 
