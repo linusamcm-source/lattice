@@ -2,7 +2,9 @@
 //!
 //! This module is the single interop source of truth for the Phase-0 protocol. It
 //! mirrors `docs/orignal_specs/DATA_MODEL.md`:
-//! - §A.1 — deterministic id convention, via [`node_id`] and [`edge_id`].
+//! - §A.1 — deterministic id convention, via [`node_id`], [`edge_id`], and the
+//!   kind-qualified [`typed_edge_id`] (a deliberate §A.1 extension for edges that
+//!   share an ordered pair but differ in `kind`).
 //! - §A.2 — [`Node`] (structural graph vertex).
 //! - §A.3 — [`Edge`] (typed relation between nodes).
 //! - §A.4 — [`EventEnvelope`] (`{ v, ts, sessionId, type, payload }`), tagged by
@@ -240,7 +242,9 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Edge {
-    /// Deterministic id (`e:source->target`), from [`edge_id`].
+    /// Deterministic id: [`edge_id`] (`e:source->target`) for `contains` edges,
+    /// or the kind-qualified [`typed_edge_id`] (`e:source->target:kind`) for the
+    /// `calls` / `param_source` / `data_flows_from` edges that can share a pair.
     pub id: String,
     /// Source node id.
     pub source: String,
@@ -369,6 +373,43 @@ pub fn edge_id(src_symbol: &str, dst_symbol: &str) -> String {
     format!("e:{src_symbol}->{dst_symbol}")
 }
 
+/// Builds a deterministic, **kind-qualified** edge id, unique per
+/// `(source, target, kind)` triple.
+///
+/// Where [`edge_id`] keys only on the endpoint pair (`e:<source>-><target>`),
+/// this appends the edge's serde `kind` string, yielding
+/// `e:<source>-><target>:<kind>` (e.g. `e:fn:x.rs:a->fn:x.rs:b:calls`). It is a
+/// **deliberate extension of `DATA_MODEL.md` §A.1**, whose `e:<source>-><target>`
+/// form contemplates only one edge per ordered pair. The extension exists because
+/// a `calls` edge and a `data_flows_from` edge can legitimately share the same
+/// ordered pair `X→Y`; the graph stores edges in an id-keyed map, so the
+/// unqualified form would let one silently overwrite the other. `contains` edges
+/// keep the unqualified [`edge_id`] form; the call / data-flow edge kinds use
+/// this. The `<kind>` segment is the [`EdgeKind`] serde string (`calls` /
+/// `param_source` / `data_flows_from` / …) and is kept in lock-step with the
+/// `#[serde(rename_all = "snake_case")]` mapping (the `typed_edge_id` tests pin it
+/// against the serde output).
+///
+/// ```
+/// use lattice_backend::wire::{typed_edge_id, EdgeKind};
+/// assert_eq!(
+///     typed_edge_id("fn:x.rs:a", "fn:x.rs:b", EdgeKind::Calls),
+///     "e:fn:x.rs:a->fn:x.rs:b:calls"
+/// );
+/// ```
+pub fn typed_edge_id(src_symbol: &str, dst_symbol: &str, kind: EdgeKind) -> String {
+    let kind_str = match kind {
+        EdgeKind::Calls => "calls",
+        EdgeKind::Imports => "imports",
+        EdgeKind::Contains => "contains",
+        EdgeKind::TestedBy => "tested_by",
+        EdgeKind::AuthoredBy => "authored_by",
+        EdgeKind::ParamSource => "param_source",
+        EdgeKind::DataFlowsFrom => "data_flows_from",
+    };
+    format!("e:{src_symbol}->{dst_symbol}:{kind_str}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +533,44 @@ mod tests {
             edge_id("authenticate", "verify_token"),
             "e:authenticate->verify_token"
         );
+    }
+
+    #[test]
+    fn typed_edge_id_appends_kind_segment() {
+        assert_eq!(
+            typed_edge_id("fn:x.rs:a", "fn:x.rs:b", EdgeKind::Calls),
+            "e:fn:x.rs:a->fn:x.rs:b:calls"
+        );
+    }
+
+    #[test]
+    fn typed_edge_id_distinguishes_kinds_on_the_same_pair() {
+        let calls = typed_edge_id("fn:x.rs:a", "fn:x.rs:b", EdgeKind::Calls);
+        let param = typed_edge_id("fn:x.rs:a", "fn:x.rs:b", EdgeKind::ParamSource);
+        let flow = typed_edge_id("fn:x.rs:a", "fn:x.rs:b", EdgeKind::DataFlowsFrom);
+        assert_ne!(calls, param);
+        assert_ne!(calls, flow);
+        assert_ne!(param, flow);
+    }
+
+    #[test]
+    fn typed_edge_id_kind_segment_matches_serde_string() {
+        let kinds = [
+            EdgeKind::Calls,
+            EdgeKind::Imports,
+            EdgeKind::Contains,
+            EdgeKind::TestedBy,
+            EdgeKind::AuthoredBy,
+            EdgeKind::ParamSource,
+            EdgeKind::DataFlowsFrom,
+        ];
+        for kind in kinds {
+            let serde_str = serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .expect("EdgeKind serialises to a JSON string");
+            assert_eq!(typed_edge_id("a", "b", kind), format!("e:a->b:{serde_str}"));
+        }
     }
 
     #[test]

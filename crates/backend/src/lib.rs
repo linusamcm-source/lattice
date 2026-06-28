@@ -7,7 +7,8 @@
 //! - [`wire`] — the CLV JSON-over-WebSocket contract: serde [`wire::Node`],
 //!   [`wire::Edge`], and [`wire::EventEnvelope`] types, the payload variants
 //!   (Phase-0 diff set plus the Phase-1 `subtree` lazy-expand reply), and the
-//!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`]) that mirror
+//!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`] / the
+//!   kind-qualified [`wire::typed_edge_id`]) that mirror
 //!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
 //! - [`parser`] — source parsers that lower a single file to the structural
 //!   [`wire::Node`]/[`wire::Edge`] graph contribution. [`parser::parse_source`] is
@@ -18,7 +19,9 @@
 //!   `//!`, each function from its `///`, Python docstrings, TypeScript JSDoc) and
 //!   each `function` node's `signature` ([`wire::Signature`]) with its typed
 //!   parameters and return type (Rust via `syn`, Python and TypeScript via
-//!   `tree-sitter`). All paths recover panic-free from syntax errors.
+//!   `tree-sitter`). The Rust path additionally derives intra-file control-flow
+//!   `calls` and data-flow `param_source` / `data_flows_from` edges from function
+//!   bodies. All paths recover panic-free from syntax errors.
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
