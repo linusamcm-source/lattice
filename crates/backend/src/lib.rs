@@ -9,9 +9,10 @@
 //!   (Phase-0 diff set plus the Phase-1 `subtree` lazy-expand reply), and the
 //!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`]) that mirror
 //!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
-//! - [`parser`] — a `syn`-based Rust source parser that lowers a single file to
-//!   the structural [`wire::Node`]/[`wire::Edge`] graph contribution
-//!   ([`parser::parse_rust_source`]), recovering panic-free from syntax errors.
+//! - [`parser`] — source parsers that lower a single file to the structural
+//!   [`wire::Node`]/[`wire::Edge`] graph contribution: `syn` for Rust
+//!   ([`parser::parse_rust_source`]) and `tree-sitter` for Python
+//!   ([`parser::parse_python`]), both recovering panic-free from syntax errors.
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into

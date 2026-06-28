@@ -1,4 +1,10 @@
-//! Lowers a single Rust source file to its structural CLV graph contribution.
+//! Lowers a single source file to its structural CLV graph contribution.
+//!
+//! Rust files go through [`parse_rust_source`] (`syn`); Python files go through
+//! [`parse_python`], a `tree-sitter`-backed path (see the private [`treesitter`]
+//! submodule) that emits the **same** file → function → variable node/edge model
+//! with `meta.language = "python"`. Both produce a [`ParsedFile`] and recover
+//! panic-free from syntax errors.
 //!
 //! [`parse_rust_source`] uses `syn` to parse one file into a [`ParsedFile`]: a
 //! `file` [`Node`] plus one `function` node per free `fn` and per method declared
@@ -21,6 +27,10 @@
 use proc_macro2::Span;
 
 use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Range};
+
+mod treesitter;
+
+pub use treesitter::parse_python;
 
 /// One Rust file's structural contribution to the CLV graph.
 ///
