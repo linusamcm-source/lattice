@@ -1,10 +1,10 @@
 //! Lattice backend binary entry point.
 //!
 //! Parses a repository path from the first CLI argument (default `.`), starts the
-//! backend via [`lattice_backend::run`], prints the bound WebSocket address, and
-//! runs until Ctrl-C.
+//! backend via [`lattice_backend::run`] on a fixed WebSocket address (default
+//! `127.0.0.1:7000`, override with the `LATTICE_ADDR` env var), prints the bound
+//! address, and runs until Ctrl-C.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -14,10 +14,11 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let addr: SocketAddr = match "127.0.0.1:0".parse() {
+    let raw_addr = std::env::var("LATTICE_ADDR").ok();
+    let addr = match lattice_backend::app::resolve_listen_addr(raw_addr.as_deref()) {
         Ok(addr) => addr,
-        Err(error) => {
-            eprintln!("lattice: invalid listen address: {error}");
+        Err(message) => {
+            eprintln!("lattice: {message}");
             return;
         }
     };

@@ -84,6 +84,24 @@ async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec
     graph.lock().await.apply_parsed(parsed)
 }
 
+/// Default WebSocket listen address used when `LATTICE_ADDR` is unset.
+///
+/// A fixed default (rather than an ephemeral `:0`) so the bundled frontend can
+/// connect to a known port without discovery.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:7000";
+
+/// Resolves the server's listen address from an optional `LATTICE_ADDR` override.
+///
+/// `raw` is the env value (`None` when unset → [`DEFAULT_LISTEN_ADDR`]); a present
+/// value is parsed as a [`SocketAddr`]. On a parse failure the offending text is
+/// returned in the `Err` so the binary can print a clear startup error.
+pub fn resolve_listen_addr(raw: Option<&str>) -> Result<SocketAddr, String> {
+    let value = raw.unwrap_or(DEFAULT_LISTEN_ADDR);
+    value
+        .parse()
+        .map_err(|error| format!("invalid listen address '{value}': {error}"))
+}
+
 /// Starts the Lattice backend against `root`, listening on `addr`.
 ///
 /// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
@@ -151,6 +169,21 @@ mod tests {
 
     fn local() -> SocketAddr {
         "127.0.0.1:0".parse().expect("valid loopback addr")
+    }
+
+    #[test]
+    fn resolve_listen_addr_defaults_parses_and_errors() {
+        assert_eq!(
+            resolve_listen_addr(None).expect("default parses"),
+            DEFAULT_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_listen_addr(Some("127.0.0.1:9999"))
+                .expect("override parses")
+                .port(),
+            9999
+        );
+        assert!(resolve_listen_addr(Some("not-an-addr")).is_err());
     }
 
     /// Reads frames until one parses as an [`EventEnvelope`], or times out.
