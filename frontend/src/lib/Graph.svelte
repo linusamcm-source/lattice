@@ -1,10 +1,19 @@
 <!--
-	Graph.svelte — Phase 0 two-tier SvelteFlow canvas.
+	Graph.svelte — P1-4 lazy hierarchy SvelteFlow canvas.
 
-	Subscribes to the `nodes` store and renders a flat two-tier view (file nodes and
-	their direct function children) via the deterministic `buildTwoTier` layout. The
-	SvelteFlow canvas is mounted only after `onMount` so SvelteKit prerender/SSR never
-	instantiates it. No expand/collapse — that is Phase 1.
+	On mount the canvas shows only top-level (root) CLV nodes from the `nodes`
+	store. Each node carries an expand/collapse affordance; expanding a node adds
+	its id to an explicit `expanded` Set<string> and invokes `onExpand` (default:
+	`requestExpand` over the injected `socket`), and once the `subtree` reply has
+	merged the children into the store they render. Collapsing removes the id from
+	the set and calls `collapse`, discarding the node's transitive descendants
+	from the store. `expanded` is the render-side zoom gate: a function's
+	`variable` children render only when the function's id is in the set, even if
+	those variables already live in the store. The canvas mounts only after
+	`onMount` so SvelteKit prerender/SSR never instantiates the browser-only
+	SvelteFlow component.
+
+	@component
 -->
 <script lang="ts">
 	import { onMount } from 'svelte';
@@ -15,10 +24,35 @@
 		type Edge as FlowEdge
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { nodes } from './ws';
-	import { buildTwoTier } from './layout';
+	import { nodes, graphStore, requestExpand, collapse } from './ws';
+	import { buildHierarchy } from './layout';
+	import HierarchyNode from './HierarchyNode.svelte';
+
+	/** Public props for the lazy hierarchy canvas. */
+	interface GraphProps {
+		/**
+		 * Live WebSocket used by the default {@link GraphProps.onExpand} handler to
+		 * request a node's subtree. The index route wires the connected socket;
+		 * tests that inject `onExpand` can omit it.
+		 */
+		socket?: WebSocket;
+		/**
+		 * Expand handler invoked with a node's id when the user expands it. Defaults
+		 * to `requestExpand(socket, nodeId)` against {@link GraphProps.socket} so the
+		 * backend replies with that node's subtree; tests inject a spy. Collapsing is
+		 * always handled internally via `collapse` and never calls this.
+		 */
+		onExpand?: (nodeId: string) => void;
+	}
+
+	let { socket, onExpand }: GraphProps = $props();
+
+	/** Registers the `hierarchy` custom node so labels carry an expand affordance. */
+	const nodeTypes = { hierarchy: HierarchyNode };
 
 	let mounted = $state(false);
+	/** Ids of nodes whose children are currently revealed (the render-side zoom gate). */
+	let expanded = $state(new Set<string>());
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
 
@@ -26,15 +60,41 @@
 		mounted = true;
 	});
 
-	// Recompute the positioned SvelteFlow nodes whenever the CLV node store changes.
+	/**
+	 * Toggle a node's expansion. Expanding reveals the node's children and, by
+	 * default, requests its subtree over the live socket; collapsing hides them and
+	 * discards the node's transitive descendants from the store to bound memory.
+	 *
+	 * @param nodeId - the id of the node whose affordance was activated.
+	 */
+	function toggle(nodeId: string): void {
+		const next = new Set(expanded);
+		if (next.has(nodeId)) {
+			next.delete(nodeId);
+			expanded = next;
+			graphStore.update((state) => collapse(state, nodeId));
+		} else {
+			next.add(nodeId);
+			expanded = next;
+			if (onExpand) onExpand(nodeId);
+			else if (socket) requestExpand(socket, nodeId);
+		}
+	}
+
+	// Recompute the visible, positioned hierarchy whenever the store or the
+	// expansion set changes, injecting the toggle callback into each node's data.
+	// Children only reach the canvas when their parent id is in `expanded`.
 	$effect(() => {
-		flowNodes = buildTwoTier($nodes);
+		flowNodes = buildHierarchy($nodes, expanded).map((node) => ({
+			...node,
+			data: { ...node.data, onToggle: toggle }
+		}));
 	});
 </script>
 
 <div class="h-full w-full">
 	{#if mounted}
-		<SvelteFlow bind:nodes={flowNodes} bind:edges={flowEdges} colorMode="light" fitView>
+		<SvelteFlow {nodeTypes} bind:nodes={flowNodes} bind:edges={flowEdges} colorMode="light" fitView>
 			<Background />
 		</SvelteFlow>
 	{/if}

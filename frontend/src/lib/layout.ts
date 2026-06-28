@@ -1,11 +1,18 @@
 /**
- * Deterministic two-tier layout for the Phase 0 render model.
+ * Deterministic lazy-hierarchy layout for the Phase 1 render model.
  *
  * The CLV {@link Node} carries no coordinates, but SvelteFlow requires a
- * `position` per node. {@link buildTwoTier} projects the flat node list onto a
- * two-column layout: every `file` node in a left column, and each file's direct
- * `function` children offset to the right. Ids are sorted so the layout is stable
- * across re-renders. No expand/collapse — that is Phase 1.
+ * `position` per node. {@link buildHierarchy} projects the visible slice of the
+ * tree — roots, plus the descendants of every currently-expanded node — onto a
+ * column-per-depth layout: roots at `x = 0`, an expanded node's children one
+ * column to the right, their children a further column right, and so on. Nodes
+ * are emitted in a stable pre-order (ids sorted at each level) so the layout is
+ * deterministic across re-renders.
+ *
+ * The `expanded` set is the render-side zoom gate: a node's children are laid
+ * out only when its id is present, so a function's `variable` children stay off
+ * the canvas until the function is drilled into, even when they already live in
+ * the store.
  *
  * @module
  */
@@ -16,54 +23,77 @@ import type { Node } from './types';
 /** Vertical spacing between stacked rows, in pixels. */
 const ROW_HEIGHT = 120;
 
-/** Horizontal offset of the `function` column from the `file` column, in pixels. */
-const CHILD_COLUMN_X = 280;
+/** Horizontal offset between adjacent depth columns, in pixels. */
+const COLUMN_WIDTH = 280;
+
+/**
+ * Per-node payload carried in a SvelteFlow node's `data`, consumed by the
+ * `HierarchyNode` custom node component. `onToggle` is injected by
+ * `Graph.svelte` at render time and is therefore not part of this layout type.
+ */
+export type HierarchyNodeData = {
+	/** Display label (the CLV node's `label`). */
+	label: string;
+	/** Whether the node has children and so carries an expand/collapse affordance. */
+	expandable: boolean;
+	/** Whether the node is currently expanded (its children are revealed). */
+	expanded: boolean;
+};
+
+/** A positioned SvelteFlow node of the custom `hierarchy` type. */
+export type HierarchyFlowNode = FlowNode<HierarchyNodeData, 'hierarchy'>;
 
 function compareId(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /**
- * Build the flat two-tier SvelteFlow node list from the CLV node store.
+ * Build the visible, positioned SvelteFlow node list from the CLV node store.
  *
- * Renders every `file` node plus each of its direct `function` children (a node
- * whose `parentId` equals a present file node's id). Files stack in a column at
- * `x = 0`; a file's functions sit at `x = 280`, stepped down so a file and its
- * children never overlap. The rendered label is carried in `data.label` for the
- * default SvelteFlow node renderer.
+ * Walks the tree in pre-order starting at the roots (`parentId` null/absent),
+ * descending into a node's children only when its id is in `expanded`. Each
+ * visible node gets its own row (`y = row * ROW_HEIGHT`, top-to-bottom in visit
+ * order) and a column by depth (`x = depth * COLUMN_WIDTH`). A node is marked
+ * `expandable` when it has any children — either declared via `childIds` or
+ * already present in the store — so a lazily-loaded parent still offers an
+ * expand affordance before its subtree arrives.
  *
  * @param graphNodes - all current CLV nodes from the `nodes` store.
- * @returns positioned SvelteFlow nodes for the file/function tiers only.
+ * @param expanded - ids of nodes whose children should be revealed (the zoom gate).
+ * @returns positioned SvelteFlow nodes for exactly the visible tiers.
  */
-export function buildTwoTier(graphNodes: Node[]): FlowNode[] {
-	const files = graphNodes.filter((n) => n.type === 'file').sort((a, b) => compareId(a.id, b.id));
+export function buildHierarchy(
+	graphNodes: Node[],
+	expanded: ReadonlySet<string>
+): HierarchyFlowNode[] {
+	const childrenOf = (id: string): Node[] =>
+		graphNodes.filter((n) => n.parentId === id).sort((a, b) => compareId(a.id, b.id));
 
-	const flow: FlowNode[] = [];
-	let cursor = 0;
+	const hasChildren = (node: Node): boolean =>
+		node.childIds.length > 0 || graphNodes.some((n) => n.parentId === node.id);
 
-	for (const file of files) {
+	const flow: HierarchyFlowNode[] = [];
+	let row = 0;
+
+	const walk = (node: Node, depth: number): void => {
 		flow.push({
-			id: file.id,
-			type: 'default',
-			position: { x: 0, y: cursor * ROW_HEIGHT },
-			data: { label: file.label }
+			id: node.id,
+			type: 'hierarchy',
+			position: { x: depth * COLUMN_WIDTH, y: row * ROW_HEIGHT },
+			data: {
+				label: node.label,
+				expandable: hasChildren(node),
+				expanded: expanded.has(node.id)
+			}
 		});
+		row += 1;
+		if (expanded.has(node.id)) {
+			for (const child of childrenOf(node.id)) walk(child, depth + 1);
+		}
+	};
 
-		const children = graphNodes
-			.filter((n) => n.type === 'function' && n.parentId === file.id)
-			.sort((a, b) => compareId(a.id, b.id));
-
-		children.forEach((fn, i) => {
-			flow.push({
-				id: fn.id,
-				type: 'default',
-				position: { x: CHILD_COLUMN_X, y: (cursor + i) * ROW_HEIGHT },
-				data: { label: fn.label }
-			});
-		});
-
-		cursor += Math.max(1, children.length);
-	}
+	const roots = graphNodes.filter((n) => n.parentId == null).sort((a, b) => compareId(a.id, b.id));
+	for (const root of roots) walk(root, 0);
 
 	return flow;
 }
