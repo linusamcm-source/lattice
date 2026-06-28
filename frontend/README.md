@@ -121,6 +121,34 @@ Phase 3 surfaces each node's extracted documentation (`Node.docs`).
 - **Expand vs select.** The expand/collapse button `stopPropagation`s before
   toggling, so expanding a node never also selects it.
 
+## Edge rendering & control/data-flow filter (P4-4)
+
+Phase 4 draws the graph's edges on the canvas (none were drawn before) and lets
+the user filter them by flow class.
+
+- **`buildEdges(graphEdges, visibleNodeIds, filter)`** (`src/lib/layout.ts`)
+  projects the `edges` store onto SvelteFlow edges. An edge is rendered only when
+  **both** its `source` and `target` are in `visibleNodeIds` — the set of node
+  ids `buildHierarchy` emitted — so an edge whose endpoint is off-canvas (e.g.
+  inside a collapsed parent) is never drawn. This keeps edges in lockstep with the
+  lazy node hierarchy: collapsing a parent shrinks the visible set and its edges
+  drop out automatically, with no special-casing.
+- **Flow classes.** The CLV `kind` is mapped to one of two classes: `calls` is
+  **control flow** (sky stroke) and `param_source` / `data_flows_from` are **data
+  flow** (amber stroke, also `animated` as a non-colour cue). `contains` — and any
+  other kind — is **never drawn**; containment is already shown by the column
+  layout. Each edge carries a typed `data: { kind, flowClass }` marker plus a
+  semantic `class` (`lattice-edge-control` / `lattice-edge-data`) whose Tailwind
+  stroke utility colours the path from theme tokens (no hard-coded colours).
+- **Toggles.** `Graph.svelte` renders two independent checkboxes — **Control
+  flow** and **Data flow** — over the canvas, both default on. Each drives the
+  matching `filter` flag passed to `buildEdges`, so turning one off removes that
+  edge class while leaving the other untouched.
+- **Edge routing.** `buildHierarchy` declares each node's left/right `handles` and
+  an `initialWidth`/`initialHeight` hint so edges route on the first paint instead
+  of after the async measurement pass; the real handle bounds take over once a node
+  is measured.
+
 ## Notes
 
 - Coverage uses the v8 provider and emits `coverage/coverage-final.json`

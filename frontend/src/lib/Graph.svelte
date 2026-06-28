@@ -13,6 +13,12 @@
 	`onMount` so SvelteKit prerender/SSR never instantiates the browser-only
 	SvelteFlow component.
 
+	P4-4 draws the graph's edges (`buildEdges`): an edge is rendered only when both
+	its endpoints are currently visible (in the `buildHierarchy` output), so an
+	edge drops automatically when a parent collapses. Two independent toggles —
+	**Control flow** (`calls`) and **Data flow** (`param_source`/`data_flows_from`),
+	both default on — include/exclude each edge class; `contains` is never drawn.
+
 	@component
 -->
 <script lang="ts">
@@ -24,8 +30,8 @@
 		type Edge as FlowEdge
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { nodes, graphStore, requestExpand, collapse } from './ws';
-	import { buildHierarchy } from './layout';
+	import { nodes, edges, graphStore, requestExpand, collapse } from './ws';
+	import { buildHierarchy, buildEdges } from './layout';
 	import HierarchyNode from './HierarchyNode.svelte';
 	import Sidebar from './Sidebar.svelte';
 
@@ -56,6 +62,10 @@
 	let expanded = $state(new Set<string>());
 	/** Id of the node whose details are shown in the sidebar (`undefined` = none). */
 	let selected = $state<string | undefined>(undefined);
+	/** Whether `calls` (control-flow) edges are drawn. Toggled by the user; default on. */
+	let controlFlow = $state(true);
+	/** Whether `param_source`/`data_flows_from` (data-flow) edges are drawn. Default on. */
+	let dataFlow = $state(true);
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
 
@@ -108,6 +118,18 @@
 			data: { ...node.data, onToggle: toggle }
 		}));
 	});
+
+	// The set of node ids actually on the canvas — exactly the nodes
+	// `buildHierarchy` emitted. Collapsing a parent shrinks this set, so its
+	// edges drop out of `buildEdges` automatically (lazy discipline).
+	let visibleNodeIds = $derived(new Set(flowNodes.map((node) => node.id)));
+
+	// Recompute the visible edges whenever the edge store, the visible-node set,
+	// or either flow-class toggle changes. An edge is drawn only when both its
+	// endpoints are visible and its flow class is enabled.
+	$effect(() => {
+		flowEdges = buildEdges($edges, visibleNodeIds, { controlFlow, dataFlow });
+	});
 </script>
 
 <div class="flex h-full w-full">
@@ -122,6 +144,21 @@
 			>
 				<Background />
 			</SvelteFlow>
+			<fieldset
+				class="absolute left-3 top-3 z-10 flex flex-col gap-1 rounded-md border border-neutral-300 bg-white/90 p-2 text-xs text-neutral-900 shadow-sm backdrop-blur dark:border-neutral-700 dark:bg-neutral-900/90 dark:text-neutral-100"
+			>
+				<legend class="px-1 text-[0.65rem] font-medium uppercase tracking-wide text-neutral-500">
+					Edges
+				</legend>
+				<label class="flex items-center gap-2">
+					<input type="checkbox" class="accent-sky-500" bind:checked={controlFlow} />
+					Control flow
+				</label>
+				<label class="flex items-center gap-2">
+					<input type="checkbox" class="accent-amber-500" bind:checked={dataFlow} />
+					Data flow
+				</label>
+			</fieldset>
 		{/if}
 	</div>
 	<Sidebar selected={selectedNode} />

@@ -14,14 +14,24 @@
 //! `file` [`Node`] plus one `function` node per free `fn` and per method declared
 //! in an `impl`/`trait` block, and — for each function with a body — one
 //! `variable` node per simple `let`-bound identifier in that body. Nodes are
-//! joined by `contains` [`Edge`]s (file → function, function → variable). Ids come
+//! joined by `contains` [`Edge`]s (file → function, function → variable). Each
+//! Rust function body additionally derives **non-`contains`** edges
+//! ([`push_call_and_dataflow_edges`]): a control-flow `calls` edge per callee
+//! that resolves intra-file by bare name to a same-file `function` node, plus the
+//! data-flow dual `data_flows_from` / `param_source` for the nested-call
+//! `outer(inner())` and single `let`-binding `let v = inner(); outer(v)` patterns.
+//! These use the kind-qualified [`crate::wire::typed_edge_id`] so they never
+//! collide with a `calls` edge on the same ordered pair. Ids come
 //! from the §A.1 helpers ([`node_id`]/[`edge_id`]) so elements keep their identity
 //! across runs, and every node carries a [`Meta::range`] sourced from the item's
 //! span (`proc-macro2`'s `span-locations` feature is required, else spans report
 //! line/col `0`). Documentation is surfaced via [`extract_docs`]: the `file` node
 //! carries the module-level inner doc (`//!`) and each `function` node its outer
 //! doc comments (`///` / `#[doc = "..."]`) in `docs`, while `variable` nodes carry
-//! none. Variable bindings are deduplicated by name with the latest shadowing
+//! none. Each `function` node also carries its extracted [`crate::wire::Signature`]
+//! (typed params with `self` receivers excluded, plus the rendered return type)
+//! via [`build_signature`]; `file` and `variable` nodes carry no signature.
+//! Variable bindings are deduplicated by name with the latest shadowing
 //! binding winning, so the contribution holds no duplicate ids or edges.
 //!
 //! Per `SPEC.md` §6/§11.1 the parser is **panic-free**: malformed input never
@@ -31,9 +41,16 @@
 //! contribution. The caller supplies an already repo-relative `path`
 //! (normalisation is a separate concern).
 
-use proc_macro2::Span;
+use std::collections::{HashMap, HashSet};
 
-use crate::wire::{edge_id, node_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Range};
+use proc_macro2::Span;
+use quote::ToTokens;
+use syn::visit::Visit;
+
+use crate::wire::{
+    edge_id, node_id, typed_edge_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Param,
+    Range, Signature,
+};
 
 mod treesitter;
 
@@ -42,13 +59,16 @@ use treesitter::{parse_python, parse_typescript};
 /// One Rust file's structural contribution to the CLV graph.
 ///
 /// Holds the [`Node`]s (one `file` node, its `function` children, and each
-/// function's `variable` children) and the `contains` [`Edge`]s linking them
-/// (file → function, function → variable), as produced by [`parse_rust_source`].
+/// function's `variable` children) and the [`Edge`]s among them, as produced by
+/// [`parse_rust_source`]: the structural `contains` edges (file → function,
+/// function → variable) plus the derived `calls` / `param_source` /
+/// `data_flows_from` edges between same-file functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFile {
     /// The file node, its function children, and each function's variable children.
     pub nodes: Vec<Node>,
-    /// `contains` edges: file → function and function → variable.
+    /// `contains` edges (file → function, function → variable) plus the derived
+    /// `calls` / `param_source` / `data_flows_from` edges between functions.
     pub edges: Vec<Edge>,
 }
 
@@ -58,12 +78,17 @@ pub struct ParsedFile {
 /// status [`NodeStatus::Unknown`], `docs` set to the module-level inner doc
 /// (`//!`) via [`extract_docs`] when present) and one `function` node per free
 /// `fn` and per `impl`/`trait` method, each parented to the file with a `contains`
-/// edge, a [`Meta::range`] filled from the item's span, and `docs` set to the
-/// item's outer doc comments (`///` / `#[doc = "..."]`). For every function with a
+/// edge, a [`Meta::range`] filled from the item's span, `docs` set to the
+/// item's outer doc comments (`///` / `#[doc = "..."]`), and `signature` set to
+/// the function's extracted [`Signature`] (typed params, `self` excluded, plus the
+/// rendered return type) via [`build_signature`]. For every function with a
 /// body, one `variable` node is emitted per simple `let`-bound identifier (id
 /// `node_id(Variable, path, "<fn>:<name>")`), parented to its function with a
 /// `contains` edge; shadowed bindings dedupe to the latest by name. Variable nodes
-/// carry no docs (`let` bindings have no doc comments).
+/// carry no docs (`let` bindings have no doc comments). Finally
+/// [`push_call_and_dataflow_edges`] appends the file's `calls` and data-flow
+/// (`param_source` / `data_flows_from`) edges derived from the function bodies;
+/// the node set and `contains` edges are unchanged by this step.
 ///
 /// Recovery (panic-free): if `syn::parse_file` fails, the returned [`ParsedFile`]
 /// contains only the file node with status [`NodeStatus::Error`] and no functions
@@ -100,7 +125,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                     &mut edges,
                     &file_id,
                     path,
-                    &item_fn.sig.ident,
+                    &item_fn.sig,
                     &item_fn.attrs,
                     Some(item_fn.block.as_ref()),
                 );
@@ -113,7 +138,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &mut edges,
                             &file_id,
                             path,
-                            &method.sig.ident,
+                            &method.sig,
                             &method.attrs,
                             Some(&method.block),
                         );
@@ -128,7 +153,7 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
                             &mut edges,
                             &file_id,
                             path,
-                            &method.sig.ident,
+                            &method.sig,
                             &method.attrs,
                             method.default.as_ref(),
                         );
@@ -138,6 +163,12 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
             _ => {}
         }
     }
+
+    // Phase 4: derive the file's non-`contains` edges from each function body —
+    // control-flow `calls` plus data-flow `param_source` / `data_flows_from` —
+    // resolving callees intra-file by bare name. Appended after the structural
+    // pass so the node set and `contains` edges stay byte-identical.
+    push_call_and_dataflow_edges(&mut edges, path, &ast.items);
 
     ParsedFile { nodes, edges }
 }
@@ -184,7 +215,6 @@ pub fn parse_source(path: &str, source: &str) -> ParsedFile {
 /// `contains` edges so a `file` node lists its `function` children and a
 /// `function` node lists its `variable` children.
 fn populate_child_ids(parsed: &mut ParsedFile) {
-    use std::collections::HashMap;
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     for edge in &parsed.edges {
         if edge.kind == EdgeKind::Contains {
@@ -216,26 +246,30 @@ fn file_node(id: String, label: String, status: NodeStatus) -> Node {
     }
 }
 
-/// Appends a `function` node for `ident` plus its `contains` edge from the file,
-/// then extracts that function's `let`-bound variables when `body` is present.
+/// Appends a `function` node for `sig.ident` plus its `contains` edge from the
+/// file, then extracts that function's `let`-bound variables when `body` is present.
 ///
 /// The function node id is `node_id(Function, path, name)`, the label is the
 /// function name, the parent is `file_id`, the range is taken from the
 /// identifier's span (1-based line, 0-based column) via [`span_range`], and `docs`
 /// is the item's outer doc comments (`///` / `#[doc = "..."]`) extracted from
-/// `attrs` via [`extract_docs`] (`None` when undocumented). When `body` is `Some`
-/// (free fns and `impl`/`trait` methods that have a block) its simple `let`
-/// bindings are lowered to `variable` children via [`push_variables`]; a trait
-/// method declared without a body (`body == None`) contributes no variables.
+/// `attrs` via [`extract_docs`] (`None` when undocumented). `signature` is always
+/// `Some`, derived from `sig` via [`build_signature`]: its typed parameters
+/// (`self` receivers excluded) and its rendered return type (`""` for a unit
+/// return). When `body` is `Some` (free fns and `impl`/`trait` methods that have a
+/// block) its simple `let` bindings are lowered to `variable` children via
+/// [`push_variables`]; a trait method declared without a body (`body == None`)
+/// contributes no variables.
 fn push_function(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
     file_id: &str,
     path: &str,
-    ident: &syn::Ident,
+    sig: &syn::Signature,
     attrs: &[syn::Attribute],
     body: Option<&syn::Block>,
 ) {
+    let ident = &sig.ident;
     let name = ident.to_string();
     let fn_id = node_id(NodeType::Function, path, &name);
     nodes.push(Node {
@@ -246,7 +280,7 @@ fn push_function(
         child_ids: Vec::new(),
         status: NodeStatus::Unknown,
         docs: extract_docs(attrs),
-        signature: None,
+        signature: Some(build_signature(sig)),
         meta: Some(Meta {
             language: Some("rust".to_string()),
             file_path: Some(path.to_string()),
@@ -263,6 +297,355 @@ fn push_function(
     if let Some(block) = body {
         push_variables(nodes, edges, &fn_id, &name, path, block);
     }
+}
+
+/// Derives the file's non-`contains` edges from every Rust function body.
+///
+/// Resolution is deliberately **intra-file, same-language, by bare callee name**:
+/// a callee resolves only when it is a single-segment path naming a `function`
+/// node declared in the same file (collected up-front by
+/// [`collect_function_names`] so a call to a function defined later still
+/// resolves). There is no cross-file, import, type, or trait resolution; method
+/// calls (`x.foo()`) and qualified paths (`T::foo()`) never resolve. Unresolved
+/// callees (external / std / imported) are skipped silently. For each function
+/// body (free `fn`, `impl` method, or `trait` method with a default body) a
+/// [`BodyEdgeVisitor`] emits, deduplicated:
+/// - a `calls` edge `caller --calls--> callee` per resolved callee;
+/// - the dual data-flow pair `inner --data_flows_from--> outer` and
+///   `outer --param_source--> inner` for the two static patterns nested call
+///   `outer(inner())` and single `let`-binding indirection
+///   `let v = inner(); outer(v)`.
+///
+/// All edges use [`typed_edge_id`] so a `calls` and a `data_flows_from` edge on
+/// the same ordered pair keep distinct ids. Out of scope (not derived, never a
+/// panic): method-call chains, aliasing / reassignment, multi-hop bindings, and
+/// tuple destructuring.
+fn push_call_and_dataflow_edges(edges: &mut Vec<Edge>, path: &str, items: &[syn::Item]) {
+    let fn_names = collect_function_names(items);
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                push_body_edges(
+                    edges,
+                    path,
+                    &item_fn.sig.ident.to_string(),
+                    &item_fn.block,
+                    &fn_names,
+                );
+            }
+            syn::Item::Impl(item_impl) => {
+                for impl_item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = impl_item {
+                        push_body_edges(
+                            edges,
+                            path,
+                            &method.sig.ident.to_string(),
+                            &method.block,
+                            &fn_names,
+                        );
+                    }
+                }
+            }
+            syn::Item::Trait(item_trait) => {
+                for trait_item in &item_trait.items {
+                    if let syn::TraitItem::Fn(method) = trait_item {
+                        if let Some(block) = &method.default {
+                            push_body_edges(
+                                edges,
+                                path,
+                                &method.sig.ident.to_string(),
+                                block,
+                                &fn_names,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collects the names of every `function` node the file declares.
+///
+/// Mirrors the item walk in [`parse_rust_source`] (free `fn`s, `impl` methods,
+/// `trait` methods) so the returned set is exactly the bare names a callee can
+/// resolve against in [`push_call_and_dataflow_edges`]. Names are deduplicated by
+/// the `HashSet`; same-named methods across `impl` blocks collapse to one entry,
+/// matching the existing name-based `function` node id scheme.
+fn collect_function_names(items: &[syn::Item]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                names.insert(item_fn.sig.ident.to_string());
+            }
+            syn::Item::Impl(item_impl) => {
+                for impl_item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = impl_item {
+                        names.insert(method.sig.ident.to_string());
+                    }
+                }
+            }
+            syn::Item::Trait(item_trait) => {
+                for trait_item in &item_trait.items {
+                    if let syn::TraitItem::Fn(method) = trait_item {
+                        names.insert(method.sig.ident.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Walks one function `block` and appends its derived call / data-flow edges.
+///
+/// Drives a [`BodyEdgeVisitor`] over the block via `syn`'s [`Visit`] traversal so
+/// every (possibly nested) call expression and `let` binding is visited
+/// panic-free; the visitor owns the per-body dedup state and resolves callees
+/// against `fn_names`. `caller_name` is the owning function's bare name (its
+/// `function` node is `node_id(Function, path, caller_name)`).
+fn push_body_edges(
+    edges: &mut Vec<Edge>,
+    path: &str,
+    caller_name: &str,
+    block: &syn::Block,
+    fn_names: &HashSet<String>,
+) {
+    let mut visitor = BodyEdgeVisitor {
+        path,
+        caller_id: node_id(NodeType::Function, path, caller_name),
+        fn_names,
+        bindings: HashMap::new(),
+        calls_seen: HashSet::new(),
+        dataflow_seen: HashSet::new(),
+        edges,
+    };
+    syn::visit::visit_block(&mut visitor, block);
+}
+
+/// Accumulates one function body's derived `calls` / `param_source` /
+/// `data_flows_from` edges during a `syn` [`Visit`] walk.
+///
+/// Created per function body by [`push_body_edges`]; it resolves bare callee
+/// names against `fn_names`, tracks `let v = inner()` bindings, and deduplicates
+/// both the `calls` edges (per callee) and the data-flow dependencies (per
+/// `(inner, outer)` pair) so a body produces each edge at most once.
+struct BodyEdgeVisitor<'a> {
+    /// Repo-relative path of the file being lowered (for callee node ids).
+    path: &'a str,
+    /// `function` node id of the body's owning function (every edge's source/target base).
+    caller_id: String,
+    /// Bare names of same-file functions a callee may resolve to.
+    fn_names: &'a HashSet<String>,
+    /// `let`-bound variable name → the same-file callee it was initialised from.
+    bindings: HashMap<String, String>,
+    /// Callee names already emitted as a `calls` edge from this body.
+    calls_seen: HashSet<String>,
+    /// `(inner, outer)` dependencies already emitted as a data-flow dual.
+    dataflow_seen: HashSet<(String, String)>,
+    /// The file's edge accumulator, appended to in place.
+    edges: &'a mut Vec<Edge>,
+}
+
+impl BodyEdgeVisitor<'_> {
+    /// Resolves a call's callee to a same-file function's bare name.
+    ///
+    /// Returns the name only when `func` is a single-segment, unqualified path
+    /// that is present in `fn_names`; qualified paths, method receivers, and
+    /// external / std names yield `None` (skipped silently).
+    fn resolve_callee(&self, func: &syn::Expr) -> Option<String> {
+        let name = path_single_ident(func)?;
+        self.fn_names.contains(&name).then_some(name)
+    }
+
+    /// Appends a deduplicated `caller --calls--> callee` edge for `callee`.
+    fn push_call(&mut self, callee: &str) {
+        if !self.calls_seen.insert(callee.to_string()) {
+            return;
+        }
+        let target = node_id(NodeType::Function, self.path, callee);
+        self.edges.push(Edge {
+            id: typed_edge_id(&self.caller_id, &target, EdgeKind::Calls),
+            source: self.caller_id.clone(),
+            target,
+            kind: EdgeKind::Calls,
+            hot: false,
+        });
+    }
+
+    /// Appends the deduplicated dual data-flow edges for `inner`'s return value
+    /// flowing into `outer`'s parameter.
+    ///
+    /// Emits both `inner --data_flows_from--> outer` and
+    /// `outer --param_source--> inner` (`DATA_MODEL.md` §A.3), at most once per
+    /// `(inner, outer)` pair per body.
+    fn push_data_flow(&mut self, inner: &str, outer: &str) {
+        if !self
+            .dataflow_seen
+            .insert((inner.to_string(), outer.to_string()))
+        {
+            return;
+        }
+        let inner_id = node_id(NodeType::Function, self.path, inner);
+        let outer_id = node_id(NodeType::Function, self.path, outer);
+        self.edges.push(Edge {
+            id: typed_edge_id(&inner_id, &outer_id, EdgeKind::DataFlowsFrom),
+            source: inner_id.clone(),
+            target: outer_id.clone(),
+            kind: EdgeKind::DataFlowsFrom,
+            hot: false,
+        });
+        self.edges.push(Edge {
+            id: typed_edge_id(&outer_id, &inner_id, EdgeKind::ParamSource),
+            source: outer_id,
+            target: inner_id,
+            kind: EdgeKind::ParamSource,
+            hot: false,
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for BodyEdgeVisitor<'_> {
+    /// Records a `let v = inner();` binding (`v` → `inner`) when the initialiser
+    /// is a call resolving to a same-file function, then continues the walk so
+    /// the initialiser's own call still yields its `calls` edge.
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let Some(var) = pat_binding_ident(&local.pat) {
+            // Resolve the initialiser to a same-file callee, if it is one.
+            let resolved = local.init.as_ref().and_then(|init| {
+                if let syn::Expr::Call(call) = init.expr.as_ref() {
+                    self.resolve_callee(&call.func)
+                } else {
+                    None
+                }
+            });
+            // A `let` always supersedes a prior binding of the same name: insert
+            // when the initialiser resolves to a call, otherwise clear any stale
+            // mapping so a shadow (`let t = inner(); let t = other(); outer(t);`)
+            // cannot emit a spurious data-flow edge from the shadowed call.
+            match resolved {
+                Some(callee) => {
+                    self.bindings.insert(var, callee);
+                }
+                None => {
+                    self.bindings.remove(&var);
+                }
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+
+    /// Emits the `calls` edge for a resolved callee and any nested-call or
+    /// `let`-binding data-flow dependency carried by its arguments, then recurses
+    /// so nested calls (e.g. the `inner()` in `outer(inner())`) are also visited.
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Some(outer) = self.resolve_callee(&call.func) {
+            self.push_call(&outer);
+            for arg in &call.args {
+                if let syn::Expr::Call(inner_call) = arg {
+                    // Nested call: `outer(inner())`.
+                    if let Some(inner) = self.resolve_callee(&inner_call.func) {
+                        self.push_data_flow(&inner, &outer);
+                    }
+                } else if let Some(var) = path_single_ident(arg) {
+                    // Let-binding indirection: `let v = inner(); outer(v)`.
+                    if let Some(inner) = self.bindings.get(&var).cloned() {
+                        self.push_data_flow(&inner, &outer);
+                    }
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Returns the identifier of a single-segment, unqualified path expression.
+///
+/// Yields `Some(name)` for a bare path like `foo` or `v` (used both for callee
+/// names and for plain variable arguments) and `None` for qualified paths
+/// (`T::foo`), paths with a `qself`, or any non-path expression.
+fn path_single_ident(expr: &syn::Expr) -> Option<String> {
+    if let syn::Expr::Path(expr_path) = expr {
+        if expr_path.qself.is_none() && expr_path.path.segments.len() == 1 {
+            return Some(expr_path.path.segments[0].ident.to_string());
+        }
+    }
+    None
+}
+
+/// Returns the bound identifier of a simple (optionally type-ascribed) `let`
+/// pattern, or `None` for destructuring / wildcard patterns.
+///
+/// Handles `let v = ..` ([`syn::Pat::Ident`] without a sub-pattern) and
+/// `let v: T = ..` ([`syn::Pat::Type`]); tuple / struct destructuring and `_`
+/// wildcards yield `None`, so they are not tracked as data-flow bindings.
+fn pat_binding_ident(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+            Some(pat_ident.ident.to_string())
+        }
+        syn::Pat::Type(pat_type) => pat_binding_ident(&pat_type.pat),
+        _ => None,
+    }
+}
+
+/// Lowers a `syn` [`syn::Signature`] to the CLV [`Signature`] (params + return).
+///
+/// Each [`syn::FnArg::Typed`] input becomes a [`Param`] whose `name` is the
+/// binding pattern and `param_type` is the declared type, both rendered as clean
+/// source text via [`render_tokens`]. A [`syn::FnArg::Receiver`] (`self` / `&self`)
+/// is skipped — it is not a data parameter. `returns` is the return type rendered
+/// the same way, or the empty string for a default (unit) return. A fn with no
+/// typed params and a unit return yields `Signature { params: vec![], returns:
+/// String::new() }` (the caller still stores it as `Some`).
+fn build_signature(sig: &syn::Signature) -> Signature {
+    let mut params = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            params.push(Param {
+                name: render_tokens(pat_type.pat.as_ref()),
+                param_type: render_tokens(pat_type.ty.as_ref()),
+            });
+        }
+    }
+    let returns = match &sig.output {
+        syn::ReturnType::Default => String::new(),
+        syn::ReturnType::Type(_, ty) => render_tokens(ty.as_ref()),
+    };
+    Signature { params, returns }
+}
+
+/// Renders any token-bearing `syn` node to whitespace-collapsed source text.
+///
+/// `proc-macro2` token printing pads every token with a space, so a type like
+/// `Vec<T>` round-trips through tokens as `Vec < T >`. This rejoins those pieces,
+/// keeping a single space only between two adjacent *word* tokens (so `dyn Trait`
+/// survives) and dropping it around punctuation — yielding clean text such as
+/// `i32`, `Credentials`, or `Vec<T>`. Used for both parameter names/types and
+/// return types in [`build_signature`].
+fn render_tokens<T: ToTokens>(node: &T) -> String {
+    let raw = node.to_token_stream().to_string();
+    let mut out = String::with_capacity(raw.len());
+    for piece in raw.split_whitespace() {
+        if let (Some(prev), Some(next)) = (out.chars().last(), piece.chars().next()) {
+            if is_word_char(prev) && is_word_char(next) {
+                out.push(' ');
+            }
+        }
+        out.push_str(piece);
+    }
+    out
+}
+
+/// Reports whether `c` is an identifier character (alphanumeric or `_`).
+///
+/// Used by [`render_tokens`] to decide when two adjacent token pieces need a
+/// separating space (two word characters) versus none (around punctuation).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Appends a deduplicated `variable` node and `contains` edge for each simple
@@ -770,6 +1153,366 @@ mod tests {
         assert_eq!(
             function_node(&second, "fn:a.rs:f").docs.as_deref(),
             Some("v2")
+        );
+    }
+
+    #[test]
+    fn function_signature_extracts_typed_params_and_return() {
+        let parsed = parse_rust_source("a.rs", "fn add(a: i32, b: i32) -> i32 { a + b }");
+        let func = function_node(&parsed, "fn:a.rs:add");
+        assert_eq!(
+            func.signature,
+            Some(crate::wire::Signature {
+                params: vec![
+                    crate::wire::Param {
+                        name: "a".to_string(),
+                        param_type: "i32".to_string(),
+                    },
+                    crate::wire::Param {
+                        name: "b".to_string(),
+                        param_type: "i32".to_string(),
+                    },
+                ],
+                returns: "i32".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn function_with_no_params_and_unit_return_has_empty_signature() {
+        let parsed = parse_rust_source("a.rs", "fn noop() {}");
+        let func = function_node(&parsed, "fn:a.rs:noop");
+        assert_eq!(
+            func.signature,
+            Some(crate::wire::Signature {
+                params: vec![],
+                returns: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn method_signature_excludes_self_receiver() {
+        let parsed = parse_rust_source(
+            "a.rs",
+            "struct S; impl S { fn m(&self, x: u8) -> bool { true } }",
+        );
+        let func = function_node(&parsed, "fn:a.rs:m");
+        let sig = func.signature.as_ref().expect("method has a signature");
+        assert_eq!(
+            sig.params,
+            vec![crate::wire::Param {
+                name: "x".to_string(),
+                param_type: "u8".to_string(),
+            }],
+            "the &self receiver must be excluded from params"
+        );
+        assert_eq!(sig.returns, "bool");
+    }
+
+    #[test]
+    fn signature_param_type_is_re_derived_on_edit() {
+        let first = parse_rust_source("a.rs", "fn f(a: i32) {}");
+        assert_eq!(
+            function_node(&first, "fn:a.rs:f")
+                .signature
+                .as_ref()
+                .expect("first signature")
+                .params[0]
+                .param_type,
+            "i32"
+        );
+
+        let second = parse_rust_source("a.rs", "fn f(a: i64) {}");
+        assert_eq!(
+            function_node(&second, "fn:a.rs:f")
+                .signature
+                .as_ref()
+                .expect("second signature")
+                .params[0]
+                .param_type,
+            "i64"
+        );
+    }
+
+    #[test]
+    fn generic_param_type_is_whitespace_collapsed() {
+        let parsed = parse_rust_source("a.rs", "fn f(items: Vec<u8>) {}");
+        let sig = function_node(&parsed, "fn:a.rs:f")
+            .signature
+            .as_ref()
+            .expect("signature");
+        assert_eq!(sig.params[0].param_type, "Vec<u8>");
+    }
+
+    #[test]
+    fn variable_nodes_keep_none_signature() {
+        let parsed = parse_rust_source("a.rs", "fn f() { let x = 1; }");
+        let var = variable_nodes(&parsed)
+            .into_iter()
+            .find(|n| n.id == "var:a.rs:f:x")
+            .expect("variable node");
+        assert_eq!(var.signature, None);
+    }
+
+    fn typed_edge<'a>(
+        parsed: &'a ParsedFile,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+    ) -> Option<&'a Edge> {
+        parsed
+            .edges
+            .iter()
+            .find(|e| e.source == source && e.target == target && e.kind == kind)
+    }
+
+    fn kind_count(parsed: &ParsedFile, kind: EdgeKind) -> usize {
+        parsed.edges.iter().filter(|e| e.kind == kind).count()
+    }
+
+    #[test]
+    fn call_expression_yields_calls_edge_and_no_data_flow() {
+        let parsed = parse_rust_source("x.rs", "fn a() {}\nfn b() { a(); }");
+        let edge = typed_edge(&parsed, "fn:x.rs:b", "fn:x.rs:a", EdgeKind::Calls)
+            .expect("expected calls edge b -> a");
+        assert_eq!(edge.kind, EdgeKind::Calls);
+        assert_eq!(
+            kind_count(&parsed, EdgeKind::DataFlowsFrom),
+            0,
+            "a bare call consumes no value: no data-flow edge"
+        );
+        assert_eq!(kind_count(&parsed, EdgeKind::ParamSource), 0);
+    }
+
+    #[test]
+    fn same_pair_calls_and_data_flow_have_distinct_ids() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn y(v: i32) -> i32 { v }\nfn x() -> i32 { y(3) }\nfn m() { y(x()); }",
+        );
+        let calls = typed_edge(&parsed, "fn:x.rs:x", "fn:x.rs:y", EdgeKind::Calls)
+            .expect("expected calls edge x -> y (from x's body)");
+        let flow = typed_edge(&parsed, "fn:x.rs:x", "fn:x.rs:y", EdgeKind::DataFlowsFrom)
+            .expect("expected data_flows_from edge x -> y (from m's body)");
+        assert_ne!(calls.id, flow.id, "kind-qualified ids must differ");
+        assert!(calls.id.ends_with(":calls"), "calls id: {}", calls.id);
+        assert!(
+            flow.id.ends_with(":data_flows_from"),
+            "data-flow id: {}",
+            flow.id
+        );
+    }
+
+    #[test]
+    fn nested_call_derives_dual_data_flow_and_calls() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn inner() -> i32 { 1 }\nfn outer(v: i32) {}\nfn f() { outer(inner()); }",
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:inner",
+                "fn:x.rs:outer",
+                EdgeKind::DataFlowsFrom
+            )
+            .is_some(),
+            "missing inner --data_flows_from--> outer"
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:outer",
+                "fn:x.rs:inner",
+                EdgeKind::ParamSource
+            )
+            .is_some(),
+            "missing outer --param_source--> inner"
+        );
+        assert!(
+            typed_edge(&parsed, "fn:x.rs:f", "fn:x.rs:outer", EdgeKind::Calls).is_some(),
+            "missing f --calls--> outer"
+        );
+        assert!(
+            typed_edge(&parsed, "fn:x.rs:f", "fn:x.rs:inner", EdgeKind::Calls).is_some(),
+            "missing f --calls--> inner"
+        );
+    }
+
+    #[test]
+    fn let_binding_indirection_derives_dual_data_flow() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn inner() -> i32 { 1 }\nfn outer(v: i32) {}\nfn f() { let t = inner(); outer(t); }",
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:inner",
+                "fn:x.rs:outer",
+                EdgeKind::DataFlowsFrom
+            )
+            .is_some(),
+            "missing inner --data_flows_from--> outer"
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:outer",
+                "fn:x.rs:inner",
+                EdgeKind::ParamSource
+            )
+            .is_some(),
+            "missing outer --param_source--> inner"
+        );
+    }
+
+    #[test]
+    fn typed_let_binding_indirection_still_derives_data_flow() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn inner() -> i32 { 1 }\nfn outer(v: i32) {}\nfn f() { let t: i32 = inner(); outer(t); }",
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:inner",
+                "fn:x.rs:outer",
+                EdgeKind::DataFlowsFrom
+            )
+            .is_some(),
+            "type-ascribed binding must still resolve the data-flow"
+        );
+    }
+
+    #[test]
+    fn shadowed_binding_does_not_emit_stale_data_flow_edge() {
+        // `t` is rebound to an unresolved (external) call before being passed to
+        // `outer`, so the stale `t -> inner` mapping must be cleared: no spurious
+        // inner --data_flows_from--> outer (or the param_source dual) edge.
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn inner() -> i32 { 1 }\nfn outer(v: i32) {}\nfn f() { let t = inner(); let t = external(); outer(t); }",
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:inner",
+                "fn:x.rs:outer",
+                EdgeKind::DataFlowsFrom
+            )
+            .is_none(),
+            "shadowed binding must not emit a stale data-flow edge"
+        );
+        assert!(
+            typed_edge(
+                &parsed,
+                "fn:x.rs:outer",
+                "fn:x.rs:inner",
+                EdgeKind::ParamSource
+            )
+            .is_none(),
+            "shadowed binding must not emit a stale param_source edge"
+        );
+    }
+
+    #[test]
+    fn unresolved_external_callee_yields_no_call_or_data_flow_edges() {
+        let parsed = parse_rust_source("x.rs", "fn b() { external_lib(); }");
+        assert_eq!(
+            kind_count(&parsed, EdgeKind::Calls),
+            0,
+            "external callee skipped"
+        );
+        assert_eq!(kind_count(&parsed, EdgeKind::DataFlowsFrom), 0);
+        assert_eq!(kind_count(&parsed, EdgeKind::ParamSource), 0);
+    }
+
+    #[test]
+    fn malformed_body_recovers_without_derived_edges() {
+        let result = std::panic::catch_unwind(|| parse_rust_source("x.rs", "fn b( { a("));
+        let parsed = result.expect("parse_rust_source must not panic on malformed input");
+        assert_eq!(parsed.nodes.len(), 1, "only the file node on parse error");
+        assert_eq!(parsed.nodes[0].node_type, NodeType::File);
+        assert_eq!(parsed.nodes[0].status, NodeStatus::Error);
+        assert!(
+            parsed.edges.is_empty(),
+            "no derived edges on malformed input"
+        );
+    }
+
+    #[test]
+    fn repeated_call_to_same_callee_dedupes_to_one_calls_edge() {
+        let parsed = parse_rust_source("x.rs", "fn a() {}\nfn b() { a(); a(); }");
+        assert_eq!(
+            kind_count(&parsed, EdgeKind::Calls),
+            1,
+            "duplicate calls to the same callee must dedupe to one edge"
+        );
+    }
+
+    #[test]
+    fn repeated_data_flow_dependency_dedupes() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn inner() -> i32 { 1 }\nfn outer(v: i32) {}\nfn f() { outer(inner()); outer(inner()); }",
+        );
+        assert_eq!(
+            kind_count(&parsed, EdgeKind::DataFlowsFrom),
+            1,
+            "data-flow dedupes"
+        );
+        assert_eq!(kind_count(&parsed, EdgeKind::ParamSource), 1);
+    }
+
+    #[test]
+    fn method_calls_and_qualified_paths_are_not_derived() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn a() {}\nfn b() { let (p, q) = (1, 2); let s = String::new(); s.len(); }",
+        );
+        // `String::new` (two-segment path), `s.len()` (method call), and the tuple
+        // destructuring `let (p, q)` resolve to no same-file function, so no
+        // call / data-flow edges are derived.
+        assert_eq!(kind_count(&parsed, EdgeKind::Calls), 0);
+        assert_eq!(kind_count(&parsed, EdgeKind::DataFlowsFrom), 0);
+        assert_eq!(kind_count(&parsed, EdgeKind::ParamSource), 0);
+    }
+
+    #[test]
+    fn impl_method_call_resolves_to_same_file_function() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn helper() {}\nstruct S;\nimpl S { fn run(&self) { helper(); } }",
+        );
+        assert!(
+            typed_edge(&parsed, "fn:x.rs:run", "fn:x.rs:helper", EdgeKind::Calls).is_some(),
+            "an impl method body must derive calls edges too"
+        );
+    }
+
+    #[test]
+    fn trait_default_method_body_derives_calls() {
+        let parsed = parse_rust_source(
+            "x.rs",
+            "fn helper() {}\ntrait T { fn run(&self) { helper(); } }",
+        );
+        assert!(
+            typed_edge(&parsed, "fn:x.rs:run", "fn:x.rs:helper", EdgeKind::Calls).is_some(),
+            "a trait default-method body must derive calls edges too"
+        );
+    }
+
+    #[test]
+    fn contains_edges_unchanged_when_calls_present() {
+        let parsed = parse_rust_source("x.rs", "fn a() {}\nfn b() { a(); }");
+        assert!(has_contains_edge(&parsed, "file:x.rs", "fn:x.rs:a"));
+        assert!(has_contains_edge(&parsed, "file:x.rs", "fn:x.rs:b"));
+        assert_eq!(
+            kind_count(&parsed, EdgeKind::Contains),
+            2,
+            "exactly the two file->function contains edges, unaffected by calls"
         );
     }
 }

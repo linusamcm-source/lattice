@@ -286,6 +286,7 @@ dependencies = [
  "futures-util",
  "notify",
  "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "syn",
