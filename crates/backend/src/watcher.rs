@@ -1,14 +1,14 @@
 //! Debounced filesystem watcher (`docs/orignal_specs/SPEC.md` §5.2 "Watcher").
 //!
 //! Wraps `notify` to observe a repository tree and forward the paths of changed
-//! **Rust** files to an async consumer. A burst of rapid events for the same path
-//! is coalesced into a single emission via a [`DEBOUNCE`] quiet-period window, so a
-//! save that the editor reports as several events re-parses the file only once
-//! (`SPEC.md` §11.2). The watcher never panics on a `notify` error — it logs to
-//! stderr and keeps running (`SPEC.md` §11.1).
+//! **source** files (Rust, Python, or TypeScript) to an async consumer. A burst of
+//! rapid events for the same path is coalesced into a single emission via a
+//! [`DEBOUNCE`] quiet-period window, so a save that the editor reports as several
+//! events re-parses the file only once (`SPEC.md` §11.2). The watcher never panics
+//! on a `notify` error — it logs to stderr and keeps running (`SPEC.md` §11.1).
 //!
 //! The OS-callback glue is deliberately thin; the testable logic lives in
-//! [`is_rust_file`] (the extension filter) and [`debounce_loop`] (the coalescer),
+//! [`is_source_file`] (the extension filter) and [`debounce_loop`] (the coalescer),
 //! both exercised directly so coverage does not depend on filesystem-event timing.
 
 use std::collections::HashSet;
@@ -26,17 +26,22 @@ use tokio::time::timeout;
 /// save without adding perceptible latency to the live graph.
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Returns `true` when `path` names a Rust source file (`.rs` extension).
+/// Returns `true` when `path` names a source file Lattice parses (`.rs`, `.py`,
+/// or `.ts` extension).
 ///
-/// This is the watcher's sole content filter for Phase 0: non-Rust changes are
-/// dropped before they ever reach the debounce stage.
-pub fn is_rust_file(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+/// This is the watcher's sole content filter: changes to any other file type are
+/// dropped before they ever reach the debounce stage. The accepted extension set
+/// mirrors the language paths behind [`crate::parser::parse_source`].
+pub fn is_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("rs") | Some("py") | Some("ts")
+    )
 }
 
 /// Coalesces a stream of raw changed paths into debounced emissions.
 ///
-/// Reads raw paths from `rx` (already `.rs`-filtered), groups every path seen
+/// Reads raw paths from `rx` (already source-file-filtered), groups every path seen
 /// within a [`DEBOUNCE`] quiet window into a deduplicated set, and forwards each
 /// distinct path once on `tx` after the window settles. Returns when `rx` closes
 /// (all senders dropped) or `tx`'s receiver is gone.
@@ -67,7 +72,7 @@ async fn debounce_loop(mut rx: UnboundedReceiver<PathBuf>, tx: Sender<PathBuf>) 
     }
 }
 
-/// Watches `root` recursively and forwards debounced `.rs` change paths on `tx`.
+/// Watches `root` recursively and forwards debounced source-file change paths on `tx`.
 ///
 /// Runs until the task is cancelled or `tx`'s receiver is dropped. Any `notify`
 /// setup or runtime error is logged to stderr and — for runtime errors — skipped;
@@ -81,7 +86,7 @@ pub async fn watch(root: PathBuf, tx: Sender<PathBuf>) {
         match notify::recommended_watcher(move |res: notify::Result<Event>| match res {
             Ok(event) => {
                 for path in event.paths {
-                    if is_rust_file(&path) {
+                    if is_source_file(&path) {
                         // Receiver lives as long as `watch`; ignore send errors
                         // that occur only during shutdown.
                         let _ = raw_tx.send(path);
@@ -116,12 +121,16 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     #[test]
-    fn is_rust_file_accepts_rs_and_rejects_others() {
-        assert!(is_rust_file(Path::new("/x/a.rs")));
-        assert!(is_rust_file(Path::new("a.rs")));
-        assert!(!is_rust_file(Path::new("/x/notes.txt")));
-        assert!(!is_rust_file(Path::new("/x/Makefile")));
-        assert!(!is_rust_file(Path::new("/x/a.rs.bak")));
+    fn is_source_file_accepts_source_exts_and_rejects_others() {
+        assert!(is_source_file(Path::new("/x/a.rs")));
+        assert!(is_source_file(Path::new("a.rs")));
+        assert!(is_source_file(Path::new("/x/a.py")));
+        assert!(is_source_file(Path::new("a.py")));
+        assert!(is_source_file(Path::new("/x/a.ts")));
+        assert!(is_source_file(Path::new("a.ts")));
+        assert!(!is_source_file(Path::new("/x/notes.txt")));
+        assert!(!is_source_file(Path::new("/x/Makefile")));
+        assert!(!is_source_file(Path::new("/x/a.rs.bak")));
     }
 
     #[tokio::test]

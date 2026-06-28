@@ -3,8 +3,9 @@
 //! [`run`] is the Phase-0 backend entry point used by the binary and by the
 //! integration tests. It does the initial parse of a repository tree into a
 //! [`Graph`], starts the [`ws`](crate::ws) server, and spawns a watcher pump that
-//! re-parses each changed `.rs` file and broadcasts the resulting patch
-//! [`EventEnvelope`]s — so editing a file updates the live graph a connected
+//! re-parses each changed source file (Rust, Python, or TypeScript — see
+//! [`parse_source`](crate::parser::parse_source)) and broadcasts the resulting
+//! patch [`EventEnvelope`]s — so editing a file updates the live graph a connected
 //! client renders (the Phase-0 headline behaviour, `BUILD_PLAN.md` Phase 0).
 //!
 //! File paths are normalised to repo-relative form (matching `DATA_MODEL.md` §A.1
@@ -21,8 +22,8 @@ use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
 use crate::graph::Graph;
-use crate::parser::parse_rust_source;
-use crate::watcher::watch;
+use crate::parser::parse_source;
+use crate::watcher::{is_source_file, watch};
 use crate::wire::EventEnvelope;
 use crate::ws::{serve, BoundServer};
 
@@ -62,10 +63,12 @@ fn repo_relative(root: &Path, path: &Path) -> Option<String> {
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// Reads, parses, and applies one `.rs` file into `graph`, returning patch events.
+/// Reads, parses, and applies one changed source file into `graph`, returning patch events.
 ///
-/// Returns an empty vector (logging the cause) when the file is outside `root` or
-/// cannot be read; never panics.
+/// The repo-relative path is lowered through [`parse_source`], which dispatches on
+/// the file extension (Rust/Python/TypeScript, else a bare `file` node). Returns an
+/// empty vector (logging the cause) when the file is outside `root` or cannot be
+/// read; never panics.
 async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec<EventEnvelope> {
     let Some(rel) = repo_relative(root, path) else {
         return Vec::new();
@@ -77,14 +80,15 @@ async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec
             return Vec::new();
         }
     };
-    let parsed = parse_rust_source(&rel, &source);
+    let parsed = parse_source(&rel, &source);
     graph.lock().await.apply_parsed(parsed)
 }
 
 /// Starts the Lattice backend against `root`, listening on `addr`.
 ///
-/// Canonicalises `root`, does an initial parse of every `.rs` file into a fresh
-/// [`Graph`], starts the WebSocket [`serve`]r, and spawns a watcher pump that
+/// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
+/// or TypeScript) into a fresh [`Graph`], starts the WebSocket [`serve`]r, and
+/// spawns a watcher pump that
 /// re-parses changed files and broadcasts their patch events. Pass `127.0.0.1:0`
 /// for an ephemeral port and read [`RunHandle::addr`] back.
 ///
@@ -99,7 +103,7 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
     // Initial parse: fill the graph so the first snapshot reflects the repo.
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        if is_source_file(path) {
             let _ = ingest_file(&graph, &root, path).await;
         }
     }
@@ -210,6 +214,110 @@ mod tests {
                 assert!(
                     nodes.iter().any(|n| n.id == "fn:a.rs:alpha"),
                     "expand must reveal the function child: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected subtree, got {other:?}"),
+        }
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn python_initial_snapshot_is_root_only_then_expand_yields_the_function() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("m.py"), "def alpha():\n    pass\n").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+
+        // Lazy snapshot: the Python file node, but not its function child.
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Snapshot);
+        match env.payload {
+            Payload::Snapshot { nodes, .. } => {
+                assert!(
+                    nodes.iter().any(|n| n.id == "file:m.py"),
+                    "snapshot must carry the Python file node: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+                assert!(
+                    !nodes.iter().any(|n| n.id == "fn:m.py:alpha"),
+                    "lazy snapshot must NOT carry the child function: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        ws.send(Message::text(
+            "{\"type\":\"expand\",\"nodeId\":\"file:m.py\"}",
+        ))
+        .await
+        .expect("send expand");
+        let subtree = next_envelope(&mut ws).await;
+        assert_eq!(subtree.event_type, EventType::Subtree);
+        match subtree.payload {
+            Payload::Subtree {
+                parent_id, nodes, ..
+            } => {
+                assert_eq!(parent_id, "file:m.py");
+                assert!(
+                    nodes.iter().any(|n| n.id == "fn:m.py:alpha"),
+                    "expand must reveal the Python function child: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected subtree, got {other:?}"),
+        }
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typescript_initial_snapshot_is_root_only_then_expand_yields_the_function() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("t.ts"), "function alpha() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+
+        // Lazy snapshot: the TypeScript file node, but not its function child.
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Snapshot);
+        match env.payload {
+            Payload::Snapshot { nodes, .. } => {
+                assert!(
+                    nodes.iter().any(|n| n.id == "file:t.ts"),
+                    "snapshot must carry the TypeScript file node: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+                assert!(
+                    !nodes.iter().any(|n| n.id == "fn:t.ts:alpha"),
+                    "lazy snapshot must NOT carry the child function: {:?}",
+                    nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        ws.send(Message::text(
+            "{\"type\":\"expand\",\"nodeId\":\"file:t.ts\"}",
+        ))
+        .await
+        .expect("send expand");
+        let subtree = next_envelope(&mut ws).await;
+        assert_eq!(subtree.event_type, EventType::Subtree);
+        match subtree.payload {
+            Payload::Subtree {
+                parent_id, nodes, ..
+            } => {
+                assert_eq!(parent_id, "file:t.ts");
+                assert!(
+                    nodes.iter().any(|n| n.id == "fn:t.ts:alpha"),
+                    "expand must reveal the TypeScript function child: {:?}",
                     nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
                 );
             }

@@ -50,7 +50,10 @@ struct LanguageConfig {
 /// enclosing function), each joined by a `contains` edge. Panic-free: malformed
 /// input yields the recovered nodes plus a `file` node with status
 /// [`NodeStatus::Error`] when the parse tree reports a syntax error.
-pub fn parse_python(path: &str, source: &str) -> ParsedFile {
+///
+/// Crate-private: callers reach the Python path through the extension-dispatching
+/// [`super::parse_source`].
+pub(crate) fn parse_python(path: &str, source: &str) -> ParsedFile {
     extract(path, source, &python_config())
 }
 
@@ -86,7 +89,10 @@ fn python_binding_name(node: &TsNode, source: &[u8]) -> Option<String> {
 /// are deferred to a later phase. Panic-free: malformed input yields the recovered
 /// nodes plus a `file` node with status [`NodeStatus::Error`] when the parse tree
 /// reports a syntax error.
-pub fn parse_typescript(path: &str, source: &str) -> ParsedFile {
+///
+/// Crate-private: callers reach the TypeScript path through the
+/// extension-dispatching [`super::parse_source`].
+pub(crate) fn parse_typescript(path: &str, source: &str) -> ParsedFile {
     extract(path, source, &typescript_config())
 }
 

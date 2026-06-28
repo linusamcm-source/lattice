@@ -10,25 +10,27 @@
 //!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`]) that mirror
 //!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
 //! - [`parser`] — source parsers that lower a single file to the structural
-//!   [`wire::Node`]/[`wire::Edge`] graph contribution: `syn` for Rust
-//!   ([`parser::parse_rust_source`]) and `tree-sitter` for Python
-//!   ([`parser::parse_python`]) and TypeScript ([`parser::parse_typescript`]), all
-//!   recovering panic-free from syntax errors.
+//!   [`wire::Node`]/[`wire::Edge`] graph contribution. [`parser::parse_source`] is
+//!   the entry point, dispatching on file extension: `syn` for Rust
+//!   ([`parser::parse_rust_source`]) and `tree-sitter` for Python and TypeScript;
+//!   any other extension yields a bare `file` node. All paths recover panic-free
+//!   from syntax errors.
 //! - [`graph`] — the in-memory [`graph::Graph`] holding the current nodes/edges,
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
 //!   `node.*`/`edge.*` patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
 //! - [`watcher`] — a debounced `notify` filesystem watcher
-//!   ([`watcher::watch`]) that forwards changed `.rs` file paths, coalescing
-//!   rapid bursts within [`watcher::DEBOUNCE`].
+//!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
+//!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
+//!   within [`watcher::DEBOUNCE`].
 //! - [`ws`] — a `tokio-tungstenite` WebSocket server ([`ws::serve`]) that sends
 //!   each connecting client the current [`graph::Graph`] root-only `snapshot` and
 //!   then streams broadcast [`wire::EventEnvelope`]s, replying to a client
 //!   snapshot request with a fresh snapshot and to an `expand` request with the
 //!   node's `subtree`.
 //! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
-//!   graph → WebSocket so editing a `.rs` file updates a connected client's graph
-//!   live.
+//!   graph → WebSocket so editing a source file (Rust, Python, or TypeScript)
+//!   updates a connected client's graph live.
 
 pub mod app;
 pub mod graph;
