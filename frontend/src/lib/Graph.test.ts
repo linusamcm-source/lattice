@@ -376,3 +376,51 @@ describe('Graph.svelte live status recolour', () => {
 		expect(statusEl(container, 'unknown')).toBeNull();
 	});
 });
+
+// P6-4: render hot edges. A data-flow edge between two visible roots renders with
+// the `animated` dash cue; a `hot_edge` enter folds `hot: true` onto it (P6-1's
+// reducer) and the canvas gains the dedicated `hot-edge` overlay, reverting on
+// `exit` — all without disturbing the `animated` cue.
+const dataEdge: Edge = {
+	id: 'e:fn:src/x.rs:a->fn:src/x.rs:b:data_flows_from',
+	source: 'fn:src/x.rs:a',
+	target: 'fn:src/x.rs:b',
+	kind: 'data_flows_from',
+	hot: false
+};
+
+function hotEdge(edgeId: string, state: 'enter' | 'exit'): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-29T00:00:00.000Z',
+		sessionId: 'sess-test',
+		type: 'hot_edge',
+		payload: { edgeId, state, sessionId: 'sess-test', ts: '2026-06-29T00:00:00.000Z' }
+	};
+}
+
+describe('Graph.svelte hot edge rendering', () => {
+	it('adds the hot overlay on a hot_edge enter, removes it on exit, leaving animated unchanged', async () => {
+		ingest(snapshotWith([fnA, fnB], [dataEdge]));
+		const { container } = render(Graph);
+		await tick();
+
+		// The data-flow edge renders cold: animated dash present, no hot overlay.
+		await waitFor(() =>
+			expect(container.querySelectorAll('.svelte-flow__edge.animated').length).toBe(1)
+		);
+		expect(container.querySelector('.svelte-flow__edge.hot-edge')).toBeNull();
+
+		// hot_edge enter → the edge gains the dedicated hot overlay; animated untouched.
+		ingest(hotEdge(dataEdge.id, 'enter'));
+		await waitFor(() =>
+			expect(container.querySelector('.svelte-flow__edge.hot-edge')).toBeTruthy()
+		);
+		expect(container.querySelectorAll('.svelte-flow__edge.animated').length).toBe(1);
+
+		// hot_edge exit → overlay reverts; the animated cue is still unchanged.
+		ingest(hotEdge(dataEdge.id, 'exit'));
+		await waitFor(() => expect(container.querySelector('.svelte-flow__edge.hot-edge')).toBeNull());
+		expect(container.querySelectorAll('.svelte-flow__edge.animated').length).toBe(1);
+	});
+});

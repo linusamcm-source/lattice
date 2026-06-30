@@ -83,7 +83,8 @@ pub enum ClvEvent {
         outcome: TestOutcome,
     },
     /// `hotedge` — call-path enter/exit (§2.2), usually machine-emitted by the
-    /// runtime tracer. Parsed into the vocabulary but not acted on until Phase 6.
+    /// runtime tracer. [`Graph::apply_clv`](crate::graph::Graph::apply_clv) toggles
+    /// the target edge's `hot` flag from this event (enter → hot, exit → cold).
     HotEdge {
         /// Originating run id (§2.3 `session`).
         session: String,

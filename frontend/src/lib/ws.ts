@@ -11,8 +11,10 @@
  *
  * `snapshot` replaces the whole graph; `node.upsert`/`edge.upsert` insert-or-update
  * by id; `node.remove`/`edge.remove` delete by id; the Phase-1 `subtree` reply
- * (the lazy `expand` answer) merges a parent's direct children in by id. Subtrees
- * are fetched only via {@link requestExpand} and discarded via {@link collapse}.
+ * (the lazy `expand` answer) merges a parent's direct children in by id;
+ * `test.result`/`status.update` recolour a node; the Phase-6 `hot_edge` event
+ * toggles an edge's `hot` flag. Subtrees are fetched only via
+ * {@link requestExpand} and discarded via {@link collapse}.
  * Auto-reconnect is deliberately out of scope for Phase 0 (it lands in Phase 9).
  *
  * @module
@@ -49,8 +51,10 @@ const TEST_OUTCOME_STATUS: Record<TestOutcome, NodeStatus> = {
 
 /**
  * Pure reducer: fold one {@link EventEnvelope} into the graph state, returning a
- * new {@link GraphState}. The input is never mutated. Unknown event types (which
- * the typed union already excludes) leave the state unchanged.
+ * new {@link GraphState}. The input is never mutated. Node-targeted
+ * (`test.result`/`status.update`) and edge-targeted (`hot_edge`) events whose
+ * target id is absent are no-ops that return the same state. Unknown event types
+ * (which the typed union already excludes) leave the state unchanged.
  *
  * @param state - the current graph state.
  * @param envelope - a validated CLV envelope.
@@ -110,6 +114,15 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			nextNodes.set(node.id, { ...node, status: envelope.payload.status });
 			return { nodes: nextNodes, edges: state.edges };
 		}
+		case 'hot_edge': {
+			// Toggle the target edge's `hot` flag (`enter`->true, `exit`->false); an
+			// absent edge id is a no-op (no phantom edge, immutable state preserved).
+			const edge = state.edges.get(envelope.payload.edgeId);
+			if (!edge) return state;
+			const nextEdges = new Map(state.edges);
+			nextEdges.set(edge.id, { ...edge, hot: envelope.payload.state === 'enter' });
+			return { nodes: state.nodes, edges: nextEdges };
+		}
 	}
 }
 
@@ -121,7 +134,8 @@ const KNOWN_EVENT_TYPES: ReadonlySet<EventType> = new Set([
 	'edge.remove',
 	'subtree',
 	'test.result',
-	'status.update'
+	'status.update',
+	'hot_edge'
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,9 +143,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Shape-check the payload for the node-targeted event types. `test.result` and
+ * Shape-check the payload for the targeted event types. `test.result` and
  * `status.update` must carry a string `nodeId` (plus a string `outcome`/`status`
- * respectively); all other types are accepted as-is. Never widens to `any`.
+ * respectively); `hot_edge` must carry a string `edgeId` and an `enter`/`exit`
+ * `state`; all other types are accepted as-is. Never widens to `any`.
  */
 function isValidPayload(type: EventType, payload: Record<string, unknown>): boolean {
 	switch (type) {
@@ -139,6 +154,11 @@ function isValidPayload(type: EventType, payload: Record<string, unknown>): bool
 			return typeof payload.nodeId === 'string' && typeof payload.outcome === 'string';
 		case 'status.update':
 			return typeof payload.nodeId === 'string' && typeof payload.status === 'string';
+		case 'hot_edge':
+			return (
+				typeof payload.edgeId === 'string' &&
+				(payload.state === 'enter' || payload.state === 'exit')
+			);
 		default:
 			return true;
 	}

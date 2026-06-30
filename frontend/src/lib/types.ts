@@ -1,6 +1,7 @@
 /**
  * CLV wire schema — TypeScript mirror of `docs/orignal_specs/DATA_MODEL.md` §A.2–A.5
- * plus the Phase 0 wire payload contract and the Phase 5 `test.result`/`status.update` event payloads.
+ * plus the Phase 0 wire payload contract, the Phase 5 `test.result`/`status.update`
+ * event payloads, and the Phase 6 `hot_edge` runtime-call-path payload.
  *
  * This is the single, `any`-free source of truth the WebSocket boundary parses into.
  * JSON keys are camelCase exactly as they arrive on the wire (`parentId`, `childIds`,
@@ -158,6 +159,21 @@ export interface StatusUpdatePayload {
 	processId?: number;
 }
 
+/**
+ * Phase 6 `hot_edge` payload (DATA_MODEL §A.5) — a runtime call-path event for one
+ * edge. `state` `enter` sets the edge's `hot` flag, `exit` clears it. Field
+ * spelling mirrors the Rust wire exactly. Optional fields are absent when not
+ * attributed.
+ */
+export interface HotEdgePayload {
+	edgeId: string;
+	state: 'enter' | 'exit';
+	processId?: number;
+	sessionId: string;
+	agentId?: string;
+	ts: string;
+}
+
 /** Fields shared by every {@link EventEnvelope} variant (DATA_MODEL §A.4). */
 export interface EnvelopeBase {
 	v: 1;
@@ -178,7 +194,8 @@ export type EventEnvelope =
 	| (EnvelopeBase & { type: 'edge.remove'; payload: EdgeRemovePayload })
 	| (EnvelopeBase & { type: 'subtree'; payload: SubtreePayload })
 	| (EnvelopeBase & { type: 'test.result'; payload: TestResultPayload })
-	| (EnvelopeBase & { type: 'status.update'; payload: StatusUpdatePayload });
+	| (EnvelopeBase & { type: 'status.update'; payload: StatusUpdatePayload })
+	| (EnvelopeBase & { type: 'hot_edge'; payload: HotEdgePayload });
 
 /** The set of envelope `type` discriminants this Phase 0 client understands. */
 export type EventType = EventEnvelope['type'];

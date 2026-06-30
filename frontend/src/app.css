@@ -16,3 +16,52 @@
 		transparent 7px
 	);
 }
+
+/*
+ * Hot-edge overlay (P6-4). An edge whose CLV `hot` flag is true — a live runtime
+ * call path on the stack — gains the `hot-edge` class (appended by `buildEdges`
+ * in `layout.ts`) ON TOP OF its kind-based colour class. This rule repaints the
+ * edge path with a warm red accent and runs a pulsing glow so a hot edge reads as
+ * "firing now". It is a DEDICATED cue, independent of the data-flow `animated`
+ * dash: we never touch `stroke-dasharray`, so a hot data-flow edge KEEPS ITS
+ * DASHES. The selector `.svelte-flow__edge.hot-edge` has specificity (0,3,0), so it
+ * out-specifies the kind stroke utility (0,1,1) and SvelteFlow's `.animated` rule
+ * (0,2,1): it overrides the stroke AND the `animation`, so on a hot data-flow edge
+ * the dash *motion* (dashdraw) yields to the pulse while the static dashes remain —
+ * an intentional trade-off (one path runs one cascaded `animation`). It reverts the
+ * instant `hot` goes false and the class is dropped. Non-colour cues (3px width,
+ * pulse, glow) mean "hot" reads without relying on colour. Colours use the Tailwind
+ * red theme tokens (no hard-coded hex); the canvas is `colorMode="light"` and the
+ * red-500/600 stroke clears WCAG 1.4.11 (>=3:1) against it. The pulse is dropped
+ * under `prefers-reduced-motion` (block below), keeping the static red + width + glow.
+ */
+.svelte-flow__edge.hot-edge .svelte-flow__edge-path {
+	stroke: var(--color-red-500);
+	stroke-width: 3;
+	animation: lattice-hot-edge-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes lattice-hot-edge-pulse {
+	0%,
+	100% {
+		stroke: var(--color-red-500);
+		filter: drop-shadow(0 0 1px var(--color-red-500));
+	}
+	50% {
+		stroke: var(--color-red-600);
+		filter: drop-shadow(0 0 5px var(--color-red-400));
+	}
+}
+
+/*
+ * Respect `prefers-reduced-motion` (WCAG 2.2.2): drop the perpetual pulse but keep
+ * the static red stroke, 3px width and a soft glow, so a hot edge stays
+ * distinguishable without motion — and without relying on colour alone.
+ */
+@media (prefers-reduced-motion: reduce) {
+	.svelte-flow__edge.hot-edge .svelte-flow__edge-path {
+		animation: none;
+		stroke: var(--color-red-500);
+		filter: drop-shadow(0 0 2px var(--color-red-500));
+	}
+}

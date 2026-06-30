@@ -168,3 +168,77 @@ describe('buildEdges', () => {
 		expect(buildEdges([calls, param], both, { controlFlow: false, dataFlow: false })).toEqual([]);
 	});
 });
+
+// P6-4: hot edges get a DEDICATED `hot-edge` marker (class + data.hot), entirely
+// independent of the data-flow `animated` cue and of the visibility/toggle gates.
+const hot = (edge: Edge): Edge => ({ ...edge, hot: true });
+
+describe('buildEdges hot-edge rendering', () => {
+	it('marks a hot data-flow edge with the hot marker while keeping animated true', () => {
+		const out = buildEdges(
+			[hot(mkEdge('e:fn:a->fn:b:data_flows_from', 'fn:a', 'fn:b', 'data_flows_from'))],
+			both,
+			BOTH_ON
+		);
+		expect(out).toHaveLength(1);
+		expect(out[0].data?.hot).toBe(true);
+		expect(classOf(out[0])).toContain('hot-edge');
+		// hot is a dedicated cue: a data-flow edge stays animated regardless of hot.
+		expect(out[0].animated).toBe(true);
+		// the kind colour is preserved alongside the hot overlay.
+		expect(classOf(out[0])).toContain('lattice-edge-data');
+	});
+
+	it('marks a hot control-flow edge with the hot marker while keeping animated false', () => {
+		const out = buildEdges(
+			[hot(mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls'))],
+			both,
+			BOTH_ON
+		);
+		expect(out).toHaveLength(1);
+		expect(out[0].data?.hot).toBe(true);
+		expect(classOf(out[0])).toContain('hot-edge');
+		expect(out[0].animated).toBe(false);
+		expect(classOf(out[0])).toContain('lattice-edge-control');
+	});
+
+	it('leaves a cold data-flow edge animated with no hot marker', () => {
+		const out = buildEdges(
+			[mkEdge('e:fn:a->fn:b:data_flows_from', 'fn:a', 'fn:b', 'data_flows_from')],
+			both,
+			BOTH_ON
+		);
+		expect(out[0].data?.hot).toBe(false);
+		expect(classOf(out[0])).not.toContain('hot-edge');
+		expect(out[0].animated).toBe(true);
+	});
+
+	it('leaves a cold control-flow edge un-animated with no hot marker', () => {
+		const out = buildEdges([mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls')], both, BOTH_ON);
+		expect(out[0].data?.hot).toBe(false);
+		expect(classOf(out[0])).not.toContain('hot-edge');
+		expect(out[0].animated).toBe(false);
+	});
+
+	it('does not let the hot flag change the animated cue (cold and hot agree)', () => {
+		const dataEdge = mkEdge('e:fn:a->fn:b:data_flows_from', 'fn:a', 'fn:b', 'data_flows_from');
+		expect(buildEdges([hot(dataEdge)], both, BOTH_ON)[0].animated).toBe(
+			buildEdges([dataEdge], both, BOTH_ON)[0].animated
+		);
+
+		const callsEdge = mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls');
+		expect(buildEdges([hot(callsEdge)], both, BOTH_ON)[0].animated).toBe(
+			buildEdges([callsEdge], both, BOTH_ON)[0].animated
+		);
+	});
+
+	it('does not let a hot edge bypass the visibility filter', () => {
+		const e = hot(mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls'));
+		expect(buildEdges([e], new Set(['fn:a']), BOTH_ON)).toEqual([]);
+	});
+
+	it('does not let a hot edge bypass a disabled flow-class toggle', () => {
+		const e = hot(mkEdge('e:fn:a->fn:b:calls', 'fn:a', 'fn:b', 'calls'));
+		expect(buildEdges([e], both, { controlFlow: false, dataFlow: true })).toEqual([]);
+	});
+});

@@ -12,11 +12,14 @@
 //! [`ParsedFile`](crate::parser::ParsedFile) and emits `node.upsert`/`edge.upsert`
 //! for added-or-changed elements and `node.remove`/`edge.remove` for elements that
 //! vanished from that file, so re-applying an identical parse is a no-op.
-//! [`Graph::apply_clv`] (Phase 5) is the colour path: it maps a correlated
+//! [`Graph::apply_clv`] is the live-overlay path: it maps a correlated
 //! [`ClvEvent`](crate::clv::ClvEvent) `test`/`status` event onto the target node's
 //! [`NodeStatus`](crate::wire::NodeStatus) and emits the matching
-//! `test.result`/`status.update` envelope (an unknown node id, or an `activity`/
-//! `hotedge` event, is a no-op).
+//! `test.result`/`status.update` envelope (Phase 5), and a `hotedge` `enter`/`exit`
+//! event onto the target [`Edge::hot`](crate::wire::Edge) flag, emitting a
+//! transition-coalesced `hot_edge` envelope (Phase 6). An unknown node/edge id, an
+//! unparsable `hotedge` state, a no-change heat transition, or an `activity` event
+//! is a no-op.
 //!
 //! Reads are lazy (Phase 1). [`Graph::snapshot`] renders only the **root** tier
 //! (file nodes and the edges among them) for a freshly connected client; deeper
@@ -32,7 +35,8 @@ use std::collections::{HashMap, HashSet};
 use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
 use crate::wire::{
-    Edge, EdgeKind, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload, TestOutcome,
+    Edge, EdgeKind, EventEnvelope, EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload,
+    TestOutcome,
 };
 
 /// CLV protocol version stamped on every envelope this graph emits.
@@ -231,10 +235,9 @@ impl Graph {
         events
     }
 
-    /// Applies one correlated CLV event onto a node's colour and emits its patch.
+    /// Applies one correlated CLV event onto a node's colour or an edge's heat.
     ///
-    /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live
-    /// [`NodeStatus`](crate::wire::NodeStatus) of the node it targets:
+    /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live graph:
     /// - [`ClvEvent::Test`] / [`ClvEvent::Status`]: when the event's `node` id is a
     ///   known node, its stored [`Node::status`] is set from the event `outcome`
     ///   ([`TestOutcome::Fail`]→`Failing`, [`TestOutcome::Pass`]→`Passing`,
@@ -243,17 +246,26 @@ impl Graph {
     ///   returns `Some` of a `test.result` / `status.update` [`EventEnvelope`]
     ///   (stamped via [`Graph::envelope`], exactly like [`Graph::apply_parsed`]) for
     ///   the WebSocket layer to broadcast.
-    /// - **Absent node:** a `Test`/`Status` event whose `node` id is *not* in the
-    ///   graph returns [`None`] and mutates nothing (the emitter-↔-graph node-id
-    ///   contract; an out-of-graph id is ignored, never an error).
-    /// - [`ClvEvent::Activity`] / [`ClvEvent::HotEdge`]: return [`None`] and change no
-    ///   colour — `activity` attribution is the Phase-8 agent layer (no `NodeStatus`
-    ///   "touched" state) and `hotedge` is the Phase-6 runtime tracer, so both are
-    ///   parsed and correlated but are no-ops for node colour here.
+    /// - [`ClvEvent::HotEdge`] (Phase 6): when the event's `edge` id is a known edge
+    ///   and the `state` word parses (`enter`→hot, `exit`→cold; any other string is a
+    ///   no-op), the stored [`Edge::hot`] flag is toggled and the method returns
+    ///   `Some` of a `hot_edge` [`EventEnvelope`] carrying the matching
+    ///   [`HotEdgeState`](crate::wire::HotEdgeState). **Transition-coalescing:** if the
+    ///   edge is already in the target heat the call returns [`None`] and emits
+    ///   nothing, so a hot loop re-entering an already-hot edge cannot flood clients.
+    ///   A hot-edge event never touches any [`Node::status`].
+    /// - **Absent target:** a `Test`/`Status` event whose `node` id — or a `HotEdge`
+    ///   event whose `edge` id — is *not* in the graph returns [`None`] and mutates
+    ///   nothing (the emitter-↔-graph id contract; an out-of-graph id is ignored,
+    ///   never an error).
+    /// - [`ClvEvent::Activity`]: returns [`None`] and changes nothing — `activity`
+    ///   attribution is the Phase-8 agent layer (no `NodeStatus` "touched" state), so
+    ///   it is parsed and correlated but a no-op here.
     ///
-    /// Only [`Node::status`] is touched; the file-contribution bookkeeping
-    /// ([`Graph::apply_parsed`] relies on) is left intact, so colouring a node then
-    /// re-parsing its source keeps the structural diff correct. Panic-free.
+    /// Only [`Node::status`] and [`Edge::hot`] are touched; the file-contribution
+    /// bookkeeping ([`Graph::apply_parsed`] relies on) is left intact, so colouring a
+    /// node or heating an edge then re-parsing its source keeps the structural diff
+    /// correct. Panic-free.
     pub fn apply_clv(&mut self, event: &ClvEvent) -> Option<EventEnvelope> {
         match event {
             ClvEvent::Test {
@@ -302,15 +314,65 @@ impl Graph {
                     },
                 ))
             }
-            ClvEvent::Activity { .. } | ClvEvent::HotEdge { .. } => None,
+            ClvEvent::Activity { .. } => None,
+            ClvEvent::HotEdge {
+                edge,
+                state,
+                session,
+                pid,
+                agent,
+                ..
+            } => {
+                // Parse the free-string transition; any word but enter/exit is a
+                // panic-free no-op.
+                let (target, target_hot) = match state.as_str() {
+                    "enter" => (HotEdgeState::Enter, true),
+                    "exit" => (HotEdgeState::Exit, false),
+                    _ => return None,
+                };
+                // Absent edge id is ignored (mirrors the absent-node contract).
+                let stored = self.edges.get_mut(edge)?;
+                // Transition-coalescing: a no-change transition emits nothing, so a
+                // hot loop re-entering an already-hot edge does not flood clients.
+                if stored.hot == target_hot {
+                    return None;
+                }
+                stored.hot = target_hot;
+                // The mutable edge borrow ends here; build the envelope from the
+                // event's own fields so `&self` can be borrowed afresh. Mint the
+                // timestamp once and share it between the payload and the envelope
+                // so a transition takes a single clock reading inside the Mutex.
+                let ts = rfc3339_now();
+                Some(self.envelope_at(
+                    ts.clone(),
+                    EventType::HotEdge,
+                    Payload::HotEdge {
+                        edge_id: edge.clone(),
+                        state: target,
+                        process_id: *pid,
+                        session_id: session.clone(),
+                        agent_id: agent.clone(),
+                        ts,
+                    },
+                ))
+            }
         }
     }
 
-    /// Wraps `payload` in an [`EventEnvelope`] stamped with this graph's session.
+    /// Wraps `payload` in an [`EventEnvelope`] stamped now with this graph's session.
     fn envelope(&self, event_type: EventType, payload: Payload) -> EventEnvelope {
+        self.envelope_at(rfc3339_now(), event_type, payload)
+    }
+
+    /// Wraps `payload` in an [`EventEnvelope`] stamped with the supplied `ts` and
+    /// this graph's session. Lets a caller that has already minted a timestamp —
+    /// e.g. the hot-edge arm, whose `Payload::HotEdge` carries its own `ts` — reuse
+    /// it instead of taking a second clock reading inside the collector's critical
+    /// section.
+    fn envelope_at(&self, ts: String, event_type: EventType, payload: Payload) -> EventEnvelope {
         EventEnvelope {
             v: PROTOCOL_VERSION,
-            ts: rfc3339_now(),
+            ts,
             session_id: self.session_id.clone(),
             event_type,
             payload,
@@ -368,8 +430,8 @@ mod tests {
     use crate::clv::ClvEvent;
     use crate::parser::parse_rust_source;
     use crate::wire::{
-        edge_id, node_id, Edge, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload,
-        TestOutcome,
+        edge_id, node_id, Edge, EdgeKind, EventEnvelope, EventType, HotEdgeState, Node, NodeStatus,
+        NodeType, Payload, TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -696,21 +758,144 @@ mod tests {
         assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Unknown));
     }
 
+    /// Builds a cold `calls` edge (`hot: false`) with the given id so the hot-edge
+    /// tests have a target already in the graph.
+    fn cold_edge(id: &str) -> Edge {
+        Edge {
+            id: id.to_string(),
+            source: "fn:a.rs:f".to_string(),
+            target: "fn:a.rs:g".to_string(),
+            kind: EdgeKind::Calls,
+            hot: false,
+        }
+    }
+
+    /// Builds a `hotedge` CLV event echoing a fixed session/pid/agent so payload
+    /// pass-through can be asserted.
+    fn hotedge_event(edge: &str, state: &str) -> ClvEvent {
+        ClvEvent::HotEdge {
+            session: "s1".to_string(),
+            pid: Some(42),
+            agent: Some("agent-x".to_string()),
+            msg: None,
+            edge: edge.to_string(),
+            state: state.to_string(),
+        }
+    }
+
+    /// Reads the stored `hot` flag of an edge by id via the graph's private map.
+    fn edge_hot(graph: &Graph, id: &str) -> Option<bool> {
+        graph.edges.get(id).map(|e| e.hot)
+    }
+
     #[test]
-    fn apply_clv_hotedge_is_a_noop_for_colour() {
+    fn apply_clv_hotedge_enter_toggles_edge_hot_and_emits_envelope() {
         let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+
+        let env = graph
+            .apply_clv(&hotedge_event("e:test", "enter"))
+            .expect("enter on an existing cold edge returns an envelope");
+
+        assert_eq!(env.event_type, EventType::HotEdge);
+        match &env.payload {
+            Payload::HotEdge {
+                edge_id,
+                state,
+                session_id,
+                process_id,
+                agent_id,
+                ..
+            } => {
+                assert_eq!(edge_id, "e:test");
+                assert_eq!(*state, HotEdgeState::Enter);
+                assert_eq!(session_id, "s1");
+                assert_eq!(*process_id, Some(42));
+                assert_eq!(agent_id.as_deref(), Some("agent-x"));
+            }
+            other => panic!("expected HotEdge payload, got {other:?}"),
+        }
+        assert_eq!(edge_hot(&graph, "e:test"), Some(true), "edge is now hot");
+    }
+
+    #[test]
+    fn apply_clv_hotedge_re_enter_on_hot_edge_coalesces_to_none() {
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+        let _ = graph
+            .apply_clv(&hotedge_event("e:test", "enter"))
+            .expect("first enter returns an envelope");
+
+        // Transition-coalescing: a second enter on an already-hot edge emits nothing.
+        let result = graph.apply_clv(&hotedge_event("e:test", "enter"));
+        assert!(result.is_none(), "re-entering a hot edge must yield None");
+        assert_eq!(edge_hot(&graph, "e:test"), Some(true), "edge stays hot");
+    }
+
+    #[test]
+    fn apply_clv_hotedge_exit_clears_hot_then_re_exit_coalesces() {
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+        let _ = graph
+            .apply_clv(&hotedge_event("e:test", "enter"))
+            .expect("enter returns an envelope");
+
+        let env = graph
+            .apply_clv(&hotedge_event("e:test", "exit"))
+            .expect("exit on a hot edge returns an envelope");
+        assert_eq!(env.event_type, EventType::HotEdge);
+        match &env.payload {
+            Payload::HotEdge { state, .. } => assert_eq!(*state, HotEdgeState::Exit),
+            other => panic!("expected HotEdge payload, got {other:?}"),
+        }
+        assert_eq!(edge_hot(&graph, "e:test"), Some(false), "edge is now cold");
+
+        // A second exit on the already-cold edge coalesces to None.
+        let result = graph.apply_clv(&hotedge_event("e:test", "exit"));
+        assert!(result.is_none(), "re-exiting a cold edge must yield None");
+        assert_eq!(edge_hot(&graph, "e:test"), Some(false), "edge stays cold");
+    }
+
+    #[test]
+    fn apply_clv_hotedge_unknown_edge_returns_none_and_mutates_nothing() {
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+        let before = graph.edges.clone();
+
+        let result = graph.apply_clv(&hotedge_event("e:absent", "enter"));
+        assert!(result.is_none(), "unknown edge id must yield None");
+        assert_eq!(
+            graph.edges, before,
+            "no edge may be mutated for an absent id"
+        );
+    }
+
+    #[test]
+    fn apply_clv_hotedge_unknown_state_returns_none_and_mutates_nothing() {
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+        let before = graph.edges.clone();
+
+        // Any state word other than enter/exit is ignored panic-free.
+        let result = graph.apply_clv(&hotedge_event("e:test", "wat"));
+        assert!(result.is_none(), "garbage state must yield None");
+        assert_eq!(graph.edges, before, "garbage state must not toggle hot");
+    }
+
+    #[test]
+    fn apply_clv_hotedge_never_changes_node_status() {
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
         let before = graph.nodes.clone();
 
-        let result = graph.apply_clv(&ClvEvent::HotEdge {
-            session: "s1".to_string(),
-            pid: None,
-            agent: None,
-            msg: None,
-            edge: "e:a->b".to_string(),
-            state: "enter".to_string(),
-        });
-        assert!(result.is_none(), "hotedge must yield None");
-        assert_eq!(graph.nodes, before, "hotedge must not change node colour");
+        let _ = graph.apply_clv(&hotedge_event("e:test", "enter"));
+        let _ = graph.apply_clv(&hotedge_event("e:test", "exit"));
+        let _ = graph.apply_clv(&hotedge_event("e:absent", "enter"));
+
+        assert_eq!(
+            graph.nodes, before,
+            "hotedge touches only edges, never nodes"
+        );
     }
 
     #[test]
