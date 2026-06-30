@@ -13,15 +13,26 @@
  * by id; `node.remove`/`edge.remove` delete by id; the Phase-1 `subtree` reply
  * (the lazy `expand` answer) merges a parent's direct children in by id;
  * `test.result`/`status.update` recolour a node; the Phase-6 `hot_edge` event
- * toggles an edge's `hot` flag. Subtrees are fetched only via
- * {@link requestExpand} and discarded via {@link collapse}.
+ * toggles an edge's `hot` flag. The Phase-8 agent layer rides the same store: an
+ * `agent.roster` rebuilds the {@link GraphState.agents} roster (keyed by
+ * `processId`) while agent structure (`agent` nodes, `authored_by` edges) folds
+ * through the existing `node.upsert`/`edge.upsert` channels. Subtrees are fetched
+ * only via {@link requestExpand} and discarded via {@link collapse}.
  * Auto-reconnect is deliberately out of scope for Phase 0 (it lands in Phase 9).
  *
  * @module
  */
 
 import { writable, derived, type Readable, type Writable } from 'svelte/store';
-import type { Node, Edge, EventEnvelope, EventType, NodeStatus, TestOutcome } from './types';
+import type {
+	Node,
+	Edge,
+	AgentInfo,
+	EventEnvelope,
+	EventType,
+	NodeStatus,
+	TestOutcome
+} from './types';
 
 /**
  * The reducer state: the current graph indexed by id for O(1) upsert/remove.
@@ -31,11 +42,13 @@ import type { Node, Edge, EventEnvelope, EventType, NodeStatus, TestOutcome } fr
 export interface GraphState {
 	nodes: Map<string, Node>;
 	edges: Map<string, Edge>;
+	/** The Phase-8 agent roster, keyed by stringified `processId`. */
+	agents: Map<string, AgentInfo>;
 }
 
 /** Construct an empty {@link GraphState}. */
 export function initialState(): GraphState {
-	return { nodes: new Map(), edges: new Map() };
+	return { nodes: new Map(), edges: new Map(), agents: new Map() };
 }
 
 /**
@@ -53,8 +66,10 @@ const TEST_OUTCOME_STATUS: Record<TestOutcome, NodeStatus> = {
  * Pure reducer: fold one {@link EventEnvelope} into the graph state, returning a
  * new {@link GraphState}. The input is never mutated. Node-targeted
  * (`test.result`/`status.update`) and edge-targeted (`hot_edge`) events whose
- * target id is absent are no-ops that return the same state. Unknown event types
- * (which the typed union already excludes) leave the state unchanged.
+ * target id is absent are no-ops that return the same state. `agent.roster`
+ * replaces the `agents` roster (keyed by `processId`); `agent.activity` carries no
+ * graph delta and is a no-op. Unknown event types (which the typed union already
+ * excludes) leave the state unchanged.
  *
  * @param state - the current graph state.
  * @param envelope - a validated CLV envelope.
@@ -65,27 +80,27 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 		case 'snapshot': {
 			const nextNodes = new Map(envelope.payload.nodes.map((n) => [n.id, n]));
 			const nextEdges = new Map(envelope.payload.edges.map((e) => [e.id, e]));
-			return { nodes: nextNodes, edges: nextEdges };
+			return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
 		}
 		case 'node.upsert': {
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(envelope.payload.node.id, envelope.payload.node);
-			return { nodes: nextNodes, edges: state.edges };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
 		}
 		case 'node.remove': {
 			const nextNodes = new Map(state.nodes);
 			nextNodes.delete(envelope.payload.id);
-			return { nodes: nextNodes, edges: state.edges };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
 		}
 		case 'edge.upsert': {
 			const nextEdges = new Map(state.edges);
 			nextEdges.set(envelope.payload.edge.id, envelope.payload.edge);
-			return { nodes: state.nodes, edges: nextEdges };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
 		}
 		case 'edge.remove': {
 			const nextEdges = new Map(state.edges);
 			nextEdges.delete(envelope.payload.id);
-			return { nodes: state.nodes, edges: nextEdges };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
 		}
 		case 'subtree': {
 			// Lazy `expand` reply: merge the parent's direct children into the
@@ -95,7 +110,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			for (const node of envelope.payload.nodes) nextNodes.set(node.id, node);
 			const nextEdges = new Map(state.edges);
 			for (const edge of envelope.payload.edges) nextEdges.set(edge.id, edge);
-			return { nodes: nextNodes, edges: nextEdges };
+			return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
 		}
 		case 'test.result': {
 			// Fold a test outcome onto the target node's colour; an absent node id is a
@@ -104,7 +119,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!node) return state;
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(node.id, { ...node, status: TEST_OUTCOME_STATUS[envelope.payload.outcome] });
-			return { nodes: nextNodes, edges: state.edges };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
 		}
 		case 'status.update': {
 			// Apply an explicit status to the target node; an absent id is a no-op.
@@ -112,7 +127,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!node) return state;
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(node.id, { ...node, status: envelope.payload.status });
-			return { nodes: nextNodes, edges: state.edges };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
 		}
 		case 'hot_edge': {
 			// Toggle the target edge's `hot` flag (`enter`->true, `exit`->false); an
@@ -121,8 +136,35 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!edge) return state;
 			const nextEdges = new Map(state.edges);
 			nextEdges.set(edge.id, { ...edge, hot: envelope.payload.state === 'enter' });
-			return { nodes: state.nodes, edges: nextEdges };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
 		}
+		case 'agent.roster': {
+			// Rebuild the agent roster from the payload, keyed by stringified
+			// `processId`. Returns a fresh map and never mutates the input roster, so
+			// the reducer stays pure. Node/edge maps pass through untouched — agent
+			// structure rides the `node.upsert`/`edge.upsert` channels instead. Each
+			// row is rebuilt from only the known fields so no extra untrusted
+			// own-property from the wire reaches reactive state.
+			const nextAgents = new Map<string, AgentInfo>();
+			for (const agent of envelope.payload.agents) {
+				const info: AgentInfo = {
+					processId: agent.processId,
+					agentId: agent.agentId,
+					agentType: agent.agentType,
+					color: agent.color,
+					status: agent.status
+				};
+				if (agent.protocolVersion !== undefined) info.protocolVersion = agent.protocolVersion;
+				nextAgents.set(String(agent.processId), info);
+			}
+			return { nodes: state.nodes, edges: state.edges, agents: nextAgents };
+		}
+		case 'agent.activity':
+			// An activity carries no roster delta (node attribution rides the
+			// structural `node.upsert`/`edge.upsert`/`agent.roster` channels), so the
+			// graph is unchanged — a no-op that returns the same state, matching the
+			// other no-op branches.
+			return state;
 	}
 }
 
@@ -135,7 +177,9 @@ const KNOWN_EVENT_TYPES: ReadonlySet<EventType> = new Set([
 	'subtree',
 	'test.result',
 	'status.update',
-	'hot_edge'
+	'hot_edge',
+	'agent.roster',
+	'agent.activity'
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -143,10 +187,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Shape-check a single {@link AgentInfo} roster row: every required key must be
+ * present with its wire type (camelCase, mirroring the Rust `AgentInfo` struct).
+ */
+function isAgentInfo(value: unknown): value is AgentInfo {
+	return (
+		isRecord(value) &&
+		typeof value.processId === 'number' &&
+		typeof value.agentId === 'string' &&
+		typeof value.agentType === 'string' &&
+		typeof value.color === 'string' &&
+		typeof value.status === 'string'
+	);
+}
+
+/**
  * Shape-check the payload for the targeted event types. `test.result` and
  * `status.update` must carry a string `nodeId` (plus a string `outcome`/`status`
  * respectively); `hot_edge` must carry a string `edgeId` and an `enter`/`exit`
- * `state`; all other types are accepted as-is. Never widens to `any`.
+ * `state`; `agent.roster` must carry an `agents` array of well-formed
+ * {@link AgentInfo} rows; `agent.activity` must carry string `agentId`/`action`/
+ * `nodeId`; all other types are accepted as-is. Never widens to `any`.
  */
 function isValidPayload(type: EventType, payload: Record<string, unknown>): boolean {
 	switch (type) {
@@ -158,6 +219,14 @@ function isValidPayload(type: EventType, payload: Record<string, unknown>): bool
 			return (
 				typeof payload.edgeId === 'string' &&
 				(payload.state === 'enter' || payload.state === 'exit')
+			);
+		case 'agent.roster':
+			return Array.isArray(payload.agents) && payload.agents.every(isAgentInfo);
+		case 'agent.activity':
+			return (
+				typeof payload.agentId === 'string' &&
+				typeof payload.action === 'string' &&
+				typeof payload.nodeId === 'string'
 			);
 		default:
 			return true;
@@ -202,6 +271,11 @@ export const nodes: Readable<Node[]> = derived(graphStore, ($g) => Array.from($g
 
 /** Derived list of all current edges. */
 export const edges: Readable<Edge[]> = derived(graphStore, ($g) => Array.from($g.edges.values()));
+
+/** Derived list of the current Phase-8 agent roster (insertion order). */
+export const agents: Readable<AgentInfo[]> = derived(graphStore, ($g) =>
+	Array.from($g.agents.values())
+);
 
 /**
  * Fold a validated envelope into {@link graphStore} via {@link applyEvent}.
@@ -286,5 +360,5 @@ export function collapse(state: GraphState, nodeId: string): GraphState {
 	for (const [id, edge] of state.edges) {
 		if (!removed.has(edge.source) && !removed.has(edge.target)) nextEdges.set(id, edge);
 	}
-	return { nodes: nextNodes, edges: nextEdges };
+	return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
 }

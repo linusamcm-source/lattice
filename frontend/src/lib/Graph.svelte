@@ -27,6 +27,15 @@
 	`animated` dash cue and of the control/data-flow toggles: a filtered-out edge
 	stays hidden even when hot, and the overlay reverts the moment it goes cold.
 
+	P8-6 adds the agent layer behind an **Agent layer** toggle (default off). When on,
+	`buildHierarchy` includes `agent` nodes and `buildEdges` draws `authored_by`
+	(violet) edges, and a `RosterPanel` lists one entry per distinct agentId beside
+	the selection sidebar. Drill-down is bidirectional: clicking a roster entry sets
+	`selectedAgentId` and the canvas `selected`-flags the nodes that agent authored
+	(`nodesAuthoredBy`); clicking a node surfaces its authoring agent in the roster
+	(`agentsForNode`), or clears the highlight when the node has no author. The
+	highlight is also dropped when the agent layer is toggled off.
+
 	@component
 -->
 <script lang="ts">
@@ -38,10 +47,11 @@
 		type Edge as FlowEdge
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { nodes, edges, graphStore, requestExpand, collapse } from './ws';
-	import { buildHierarchy, buildEdges } from './layout';
+	import { nodes, edges, agents, graphStore, requestExpand, collapse } from './ws';
+	import { buildHierarchy, buildEdges, nodesAuthoredBy, agentsForNode } from './layout';
 	import HierarchyNode from './HierarchyNode.svelte';
 	import Sidebar from './Sidebar.svelte';
+	import RosterPanel from './RosterPanel.svelte';
 
 	/** Public props for the lazy hierarchy canvas. */
 	interface GraphProps {
@@ -70,10 +80,14 @@
 	let expanded = $state(new Set<string>());
 	/** Id of the node whose details are shown in the sidebar (`undefined` = none). */
 	let selected = $state<string | undefined>(undefined);
+	/** Drilled-in agentId for the agent↔code highlight (`undefined` = none). */
+	let selectedAgentId = $state<string | undefined>(undefined);
 	/** Whether `calls` (control-flow) edges are drawn. Toggled by the user; default on. */
 	let controlFlow = $state(true);
 	/** Whether `param_source`/`data_flows_from` (data-flow) edges are drawn. Default on. */
 	let dataFlow = $state(true);
+	/** Whether the Phase-8 agent layer (agent nodes + `authored_by` edges) is shown. Default off. */
+	let showAgents = $state(false);
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
 
@@ -88,13 +102,39 @@
 	});
 
 	/**
-	 * Select a node, opening it in the sidebar.
+	 * Select a node, opening it in the sidebar. As the code → agent drill-down, the
+	 * node's authoring agent is surfaced in the roster via `selectedAgentId` — assigned
+	 * **unconditionally**, so clicking an unauthored node (no author → `undefined`)
+	 * clears any prior agent highlight rather than leaving it stale.
 	 *
 	 * @param nodeId - the id of the node whose content region was activated.
 	 */
 	function select(nodeId: string): void {
 		selected = nodeId;
+		const [author] = agentsForNode($edges, nodeId);
+		selectedAgentId = author;
 	}
+
+	/**
+	 * Drill into an agent from the roster, highlighting the code it authored.
+	 *
+	 * @param agentId - the bare agentId reported by `RosterPanel`.
+	 */
+	function selectAgent(agentId: string): void {
+		selectedAgentId = agentId;
+	}
+
+	// Drop any agent → code highlight when the agent layer is switched off, so a
+	// stale selection never lingers behind a hidden roster.
+	$effect(() => {
+		if (!showAgents) selectedAgentId = undefined;
+	});
+
+	// The code nodes the drilled-in agent authored (agent → code drill-down); empty
+	// when no agent is selected. SvelteFlow `selected` flags these on the canvas.
+	let authoredNodeIds = $derived(
+		selectedAgentId === undefined ? new Set<string>() : nodesAuthoredBy($edges, selectedAgentId)
+	);
 
 	/**
 	 * Toggle a node's expansion. Expanding reveals the node's children and, by
@@ -121,8 +161,10 @@
 	// expansion set changes, injecting the toggle callback into each node's data.
 	// Children only reach the canvas when their parent id is in `expanded`.
 	$effect(() => {
-		flowNodes = buildHierarchy($nodes, expanded, select).map((node) => ({
+		flowNodes = buildHierarchy($nodes, expanded, select, showAgents).map((node) => ({
 			...node,
+			// Agent → code drill-down highlight: flag the selected agent's authored nodes.
+			selected: authoredNodeIds.has(node.id),
 			data: { ...node.data, onToggle: toggle }
 		}));
 	});
@@ -136,7 +178,7 @@
 	// or either flow-class toggle changes. An edge is drawn only when both its
 	// endpoints are visible and its flow class is enabled.
 	$effect(() => {
-		flowEdges = buildEdges($edges, visibleNodeIds, { controlFlow, dataFlow });
+		flowEdges = buildEdges($edges, visibleNodeIds, { controlFlow, dataFlow, agent: showAgents });
 	});
 </script>
 
@@ -166,8 +208,20 @@
 					<input type="checkbox" class="accent-amber-500" bind:checked={dataFlow} />
 					Data flow
 				</label>
+				<label class="flex items-center gap-2">
+					<input type="checkbox" class="accent-violet-500" bind:checked={showAgents} />
+					Agent layer
+				</label>
 			</fieldset>
 		{/if}
 	</div>
+	{#if showAgents}
+		<RosterPanel
+			agents={$agents}
+			{selectedAgentId}
+			authoredCount={authoredNodeIds.size}
+			onSelect={selectAgent}
+		/>
+	{/if}
 	<Sidebar selected={selectedNode} />
 </div>

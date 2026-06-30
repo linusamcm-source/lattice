@@ -12,14 +12,26 @@
 //! [`ParsedFile`](crate::parser::ParsedFile) and emits `node.upsert`/`edge.upsert`
 //! for added-or-changed elements and `node.remove`/`edge.remove` for elements that
 //! vanished from that file, so re-applying an identical parse is a no-op.
-//! [`Graph::apply_clv`] is the live-overlay path: it maps a correlated
+//! [`Graph::apply_clv`] is the live-overlay path and returns a `Vec` of the patch
+//! envelopes one event produces: it maps a correlated
 //! [`ClvEvent`](crate::clv::ClvEvent) `test`/`status` event onto the target node's
 //! [`NodeStatus`](crate::wire::NodeStatus) and emits the matching
 //! `test.result`/`status.update` envelope (Phase 5), and a `hotedge` `enter`/`exit`
 //! event onto the target [`Edge::hot`](crate::wire::Edge) flag, emitting a
-//! transition-coalesced `hot_edge` envelope (Phase 6). An unknown node/edge id, an
-//! unparsable `hotedge` state, a no-change heat transition, or an `activity` event
-//! is a no-op.
+//! transition-coalesced `hot_edge` envelope (Phase 6). An `activity` event carrying
+//! an `agent` id and `pid` drives the **Phase-8 agent layer**: it upserts a root
+//! `agent` vertex and an `authored_by` edge from the touched code node, updates the
+//! per-process [`AgentInfo`](crate::wire::AgentInfo) roster, and emits
+//! `node.upsert`/`edge.upsert`/`agent.activity`/`agent.roster` — though the
+//! `agent.roster` is coalesced away on a no-change repeat (same pid, same identity).
+//! Because there is no process-exit signal, a process's `status` lifecycle is closed
+//! by an **idle timeout**: each activity stamps the process's `last_seen` (via
+//! [`Graph::apply_clv_at`]), and [`Graph::expire_idle`] flips any process quiet for
+//! longer than [`ROSTER_IDLE_MS`] to `inactive`, re-broadcasting one `agent.roster`
+//! only when a row changed.
+//! An unknown node/edge id, an unparsable `hotedge` state, a no-change heat
+//! transition, or an `activity` event missing its `agent`/`pid` yields an empty
+//! `Vec` (a no-op).
 //!
 //! Reads are lazy (Phase 1). [`Graph::snapshot`] renders only the **root** tier
 //! (file nodes and the edges among them) for a freshly connected client; deeper
@@ -35,8 +47,8 @@ use std::collections::{HashMap, HashSet};
 use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
 use crate::wire::{
-    Edge, EdgeKind, EventEnvelope, EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload,
-    TestOutcome,
+    agent_node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
+    HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
 };
 
 /// CLV protocol version stamped on every envelope this graph emits.
@@ -44,6 +56,17 @@ const PROTOCOL_VERSION: u32 = 1;
 
 /// Session id used when a [`Graph`] is created without an explicit one.
 const DEFAULT_SESSION_ID: &str = "sess-local";
+
+/// Idle window, in milliseconds, after which a quiet process is timed out.
+///
+/// The collector has no process-exit signal, so a roster row's `"inactive"`
+/// state is an **idle timeout**: [`Graph::expire_idle`] flips any still-`"active"`
+/// process whose most recent activity is *strictly older* than this window to
+/// `"inactive"`. A process touched exactly `ROSTER_IDLE_MS` ago is still live (the
+/// comparison is strict); one touched a millisecond longer ago is timed out. The
+/// `now`/`last_seen` clock is the monotonic millisecond domain of
+/// [`monotonic_now_ms`].
+pub const ROSTER_IDLE_MS: u64 = 5_000;
 
 /// The in-memory structural graph and the diff that emits CLV patch events.
 ///
@@ -63,6 +86,22 @@ pub struct Graph {
     file_nodes: HashMap<String, Vec<String>>,
     /// Edge ids each file last contributed, keyed by the file node id.
     file_edges: HashMap<String, Vec<String>>,
+    /// Live agent roster (Phase 8), keyed by OS **process id**.
+    ///
+    /// Each [`AgentInfo`] row records one tracked process's identity (agent id,
+    /// type, colour) and live `status`. Keyed by `process_id` because one agent id
+    /// may run as several concurrent processes, each a distinct roster row. An
+    /// `activity` event upserts the row for its pid, and [`Graph::apply_clv`]
+    /// snapshots every row into the emitted `agent.roster` envelope.
+    roster: HashMap<u32, AgentInfo>,
+    /// Last-seen monotonic timestamp (ms) per tracked **process id** (Phase 8).
+    ///
+    /// [`Graph::apply_clv_at`] records `now_ms` here on every `activity` carrying a
+    /// pid, so [`Graph::expire_idle`] can time out a process that has gone quiet:
+    /// a roster row whose `last_seen` is strictly older than [`ROSTER_IDLE_MS`] is
+    /// flipped to `"inactive"`. Same monotonic-millisecond domain as
+    /// [`monotonic_now_ms`].
+    last_seen: HashMap<u32, u64>,
 }
 
 impl Default for Graph {
@@ -85,6 +124,8 @@ impl Graph {
             edges: HashMap::new(),
             file_nodes: HashMap::new(),
             file_edges: HashMap::new(),
+            roster: HashMap::new(),
+            last_seen: HashMap::new(),
         }
     }
 
@@ -235,38 +276,89 @@ impl Graph {
         events
     }
 
-    /// Applies one correlated CLV event onto a node's colour or an edge's heat.
+    /// Applies one correlated CLV event and returns every patch it produces.
     ///
-    /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live graph:
+    /// The live-overlay entry point: delegates to [`Graph::apply_clv_at`] with a
+    /// fresh [`monotonic_now_ms`] reading, so an `activity` touch stamps its
+    /// process's `last_seen` on the same monotonic clock [`Graph::expire_idle`]
+    /// later reads. See [`Graph::apply_clv_at`] for the full event-folding contract;
+    /// this thin wrapper exists only so the production tail takes the real clock
+    /// while tests inject `now_ms`. Panic-free.
+    pub fn apply_clv(&mut self, event: &ClvEvent) -> Vec<EventEnvelope> {
+        self.apply_clv_at(event, monotonic_now_ms())
+    }
+
+    /// Applies one correlated CLV event with the supplied monotonic clock reading.
+    ///
+    /// The timestamped seam behind [`Graph::apply_clv`]: identical event-folding
+    /// behaviour, but `now_ms` (a [`monotonic_now_ms`]-domain millisecond reading) is
+    /// injectable so the roster idle timer is deterministically testable. Before the
+    /// event is folded, an [`ClvEvent::Activity`] carrying a `pid` records
+    /// `last_seen[pid] = now_ms`, the liveness stamp [`Graph::expire_idle`] later
+    /// compares against [`ROSTER_IDLE_MS`].
+    ///
+    /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live graph,
+    /// returning a [`Vec`] of [`EventEnvelope`]s for the WebSocket layer to broadcast.
+    /// A `Test`/`Status`/`HotEdge` event yields a **one-element** vector (or an empty
+    /// one — see below); an `activity` event yields **several** envelopes (the
+    /// Phase-8 agent layer), which is why the return widened from a single
+    /// `Option<EventEnvelope>` to a vector.
     /// - [`ClvEvent::Test`] / [`ClvEvent::Status`]: when the event's `node` id is a
     ///   known node, its stored [`Node::status`] is set from the event `outcome`
     ///   ([`TestOutcome::Fail`]→`Failing`, [`TestOutcome::Pass`]→`Passing`,
     ///   [`TestOutcome::Skip`]→`Stale`, [`TestOutcome::Running`]→`Running`) so a later
     ///   [`Graph::snapshot`]/[`Graph::subtree`] reflects the colour, and the method
-    ///   returns `Some` of a `test.result` / `status.update` [`EventEnvelope`]
-    ///   (stamped via [`Graph::envelope`], exactly like [`Graph::apply_parsed`]) for
-    ///   the WebSocket layer to broadcast.
+    ///   returns a one-element vector holding a `test.result` / `status.update`
+    ///   [`EventEnvelope`] (stamped via [`Graph::envelope`], exactly like
+    ///   [`Graph::apply_parsed`]).
     /// - [`ClvEvent::HotEdge`] (Phase 6): when the event's `edge` id is a known edge
     ///   and the `state` word parses (`enter`→hot, `exit`→cold; any other string is a
-    ///   no-op), the stored [`Edge::hot`] flag is toggled and the method returns
-    ///   `Some` of a `hot_edge` [`EventEnvelope`] carrying the matching
-    ///   [`HotEdgeState`](crate::wire::HotEdgeState). **Transition-coalescing:** if the
-    ///   edge is already in the target heat the call returns [`None`] and emits
-    ///   nothing, so a hot loop re-entering an already-hot edge cannot flood clients.
-    ///   A hot-edge event never touches any [`Node::status`].
+    ///   no-op), the stored [`Edge::hot`] flag is toggled and the method returns a
+    ///   one-element vector holding a `hot_edge` [`EventEnvelope`] carrying the
+    ///   matching [`HotEdgeState`](crate::wire::HotEdgeState). **Transition-coalescing:**
+    ///   if the edge is already in the target heat the call returns an empty vector and
+    ///   emits nothing, so a hot loop re-entering an already-hot edge cannot flood
+    ///   clients. A hot-edge event never touches any [`Node::status`].
+    /// - [`ClvEvent::Activity`] (Phase 8 agent layer): when the event carries **both**
+    ///   an `agent` id and a `pid`, it attributes the touch to that agent — see
+    ///   [`Graph::apply_activity`] — upserting a root [`NodeType::Agent`] vertex
+    ///   (id via [`agent_node_id`], reused on repeat so there is no duplicate), an
+    ///   [`EdgeKind::AuthoredBy`] [`Edge`] from the touched code node to that vertex
+    ///   (deterministic, kind-qualified id via [`typed_edge_id`]), and the per-pid
+    ///   [`AgentInfo`] roster row (`status: "active"`). It returns up to four
+    ///   envelopes: `node.upsert` (agent), `edge.upsert` (authored_by),
+    ///   `agent.activity`, and `agent.roster`. **Roster-coalescing** (SPEC §11.2):
+    ///   the `agent.roster` is emitted only when this pid's row was newly inserted or
+    ///   actually changed, so a steady-state re-touch (same pid, same identity) skips
+    ///   the roster rebuild/broadcast and emits only `edge.upsert` + `agent.activity`.
+    ///   An `activity` event missing its `agent` id or `pid` cannot be attributed and
+    ///   is a no-op (empty vector); a code node's colour is never changed by an
+    ///   activity.
     /// - **Absent target:** a `Test`/`Status` event whose `node` id — or a `HotEdge`
-    ///   event whose `edge` id — is *not* in the graph returns [`None`] and mutates
-    ///   nothing (the emitter-↔-graph id contract; an out-of-graph id is ignored,
-    ///   never an error).
-    /// - [`ClvEvent::Activity`]: returns [`None`] and changes nothing — `activity`
-    ///   attribution is the Phase-8 agent layer (no `NodeStatus` "touched" state), so
-    ///   it is parsed and correlated but a no-op here.
+    ///   event whose `edge` id — is *not* in the graph returns an empty vector and
+    ///   mutates nothing (the emitter-↔-graph id contract; an out-of-graph id is
+    ///   ignored, never an error).
     ///
-    /// Only [`Node::status`] and [`Edge::hot`] are touched; the file-contribution
-    /// bookkeeping ([`Graph::apply_parsed`] relies on) is left intact, so colouring a
-    /// node or heating an edge then re-parsing its source keeps the structural diff
-    /// correct. Panic-free.
-    pub fn apply_clv(&mut self, event: &ClvEvent) -> Option<EventEnvelope> {
+    /// [`Node::status`], [`Edge::hot`], the agent vertex/edge, and the [`Graph`]'s
+    /// `roster` are the only state touched; the file-contribution bookkeeping
+    /// ([`Graph::apply_parsed`] relies on) is left intact, so colouring a node,
+    /// heating an edge, or attributing an activity then re-parsing its source keeps
+    /// the structural diff correct. Panic-free.
+    pub fn apply_clv_at(&mut self, event: &ClvEvent, now_ms: u64) -> Vec<EventEnvelope> {
+        // Stamp process liveness before folding, so a quiet process can later be
+        // timed out by `expire_idle`. Only an *attributed* (agent + pid) activity is
+        // tracked — the same condition under which `apply_activity` rosters the
+        // process — so an agent-less or pid-less line never leaves an orphan
+        // last-seen entry that no roster row reads. Other events do not refresh the
+        // last-seen clock.
+        if let ClvEvent::Activity {
+            pid: Some(pid),
+            agent: Some(_),
+            ..
+        } = event
+        {
+            self.last_seen.insert(*pid, now_ms);
+        }
         match event {
             ClvEvent::Test {
                 node,
@@ -278,8 +370,12 @@ impl Graph {
                 duration_ms,
             } => {
                 let status = status_from_outcome(*outcome);
-                self.nodes.get_mut(node)?.status = status;
-                Some(self.envelope(
+                // Absent node id is ignored (the emitter-↔-graph id contract).
+                match self.nodes.get_mut(node) {
+                    Some(target) => target.status = status,
+                    None => return Vec::new(),
+                }
+                vec![self.envelope(
                     EventType::TestResult,
                     Payload::TestResult {
                         node_id: node.clone(),
@@ -291,7 +387,7 @@ impl Graph {
                         process_id: *pid,
                         message: msg.clone(),
                     },
-                ))
+                )]
             }
             ClvEvent::Status {
                 node,
@@ -302,8 +398,11 @@ impl Graph {
                 ..
             } => {
                 let status = status_from_outcome(*outcome);
-                self.nodes.get_mut(node)?.status = status;
-                Some(self.envelope(
+                match self.nodes.get_mut(node) {
+                    Some(target) => target.status = status,
+                    None => return Vec::new(),
+                }
+                vec![self.envelope(
                     EventType::StatusUpdate,
                     Payload::StatusUpdate {
                         node_id: node.clone(),
@@ -312,9 +411,23 @@ impl Graph {
                         agent_id: agent.clone(),
                         process_id: *pid,
                     },
-                ))
+                )]
             }
-            ClvEvent::Activity { .. } => None,
+            ClvEvent::Activity {
+                session,
+                pid,
+                agent,
+                msg,
+                node,
+                action,
+            } => self.apply_activity(
+                session,
+                *pid,
+                agent.as_deref(),
+                msg.as_deref(),
+                node,
+                action,
+            ),
             ClvEvent::HotEdge {
                 edge,
                 state,
@@ -328,14 +441,17 @@ impl Graph {
                 let (target, target_hot) = match state.as_str() {
                     "enter" => (HotEdgeState::Enter, true),
                     "exit" => (HotEdgeState::Exit, false),
-                    _ => return None,
+                    _ => return Vec::new(),
                 };
                 // Absent edge id is ignored (mirrors the absent-node contract).
-                let stored = self.edges.get_mut(edge)?;
+                let stored = match self.edges.get_mut(edge) {
+                    Some(stored) => stored,
+                    None => return Vec::new(),
+                };
                 // Transition-coalescing: a no-change transition emits nothing, so a
                 // hot loop re-entering an already-hot edge does not flood clients.
                 if stored.hot == target_hot {
-                    return None;
+                    return Vec::new();
                 }
                 stored.hot = target_hot;
                 // The mutable edge borrow ends here; build the envelope from the
@@ -343,7 +459,7 @@ impl Graph {
                 // timestamp once and share it between the payload and the envelope
                 // so a transition takes a single clock reading inside the Mutex.
                 let ts = rfc3339_now();
-                Some(self.envelope_at(
+                vec![self.envelope_at(
                     ts.clone(),
                     EventType::HotEdge,
                     Payload::HotEdge {
@@ -354,9 +470,177 @@ impl Graph {
                         agent_id: agent.clone(),
                         ts,
                     },
-                ))
+                )]
             }
         }
+    }
+
+    /// Attributes one `activity` touch to its agent, returning the four patches.
+    ///
+    /// The Phase-8 agent-layer body of [`Graph::apply_clv`]'s [`ClvEvent::Activity`]
+    /// arm. Attribution needs both an `agent` id (the vertex identity) and a `pid`
+    /// (the roster key); if either is absent the touch cannot be attributed, so the
+    /// method mutates nothing and returns an empty vector. Otherwise it:
+    /// 1. upserts a root [`NodeType::Agent`] vertex (id [`agent_node_id`], label the
+    ///    agent id, `parent_id` `None`), reusing the id on repeat so there is no
+    ///    duplicate node and a `node.upsert` is emitted only the first time;
+    /// 2. upserts an [`EdgeKind::AuthoredBy`] [`Edge`] from the touched code `node` to
+    ///    the agent vertex, with the deterministic, kind-qualified [`typed_edge_id`]
+    ///    so re-touches keep one stable edge id;
+    /// 3. records/refreshes the per-pid [`AgentInfo`] roster row as `"active"`,
+    ///    deriving a stable `color` and `agent_type` from the agent id — but
+    ///    **coalesces** the high-frequency case (SPEC §11.2): when this pid is already
+    ///    rostered with an identical row, the roster is left untouched and neither the
+    ///    `color`/`agent_type` derivation nor the O(N) roster clone+sort runs; and
+    /// 4. returns `node.upsert`, `edge.upsert`, `agent.activity`, and `agent.roster`
+    ///    envelopes. The `node.upsert` is omitted when the agent vertex already
+    ///    existed, and the `agent.roster` is omitted on a no-change roster repeat
+    ///    (same pid, same identity), so a steady-state re-touch emits only the
+    ///    `edge.upsert` and `agent.activity`.
+    ///
+    /// The touched code node's [`Node::status`] is never changed. Panic-free.
+    fn apply_activity(
+        &mut self,
+        session: &str,
+        pid: Option<u32>,
+        agent: Option<&str>,
+        msg: Option<&str>,
+        node: &str,
+        action: &str,
+    ) -> Vec<EventEnvelope> {
+        let (agent_id, pid) = match (agent, pid) {
+            (Some(agent_id), Some(pid)) => (agent_id, pid),
+            _ => return Vec::new(),
+        };
+        let agent_vertex = agent_node_id(agent_id);
+        let mut events = Vec::new();
+
+        // (1) Upsert the agent vertex once; reuse its id on repeat.
+        if !self.nodes.contains_key(&agent_vertex) {
+            let agent_node = Node {
+                id: agent_vertex.clone(),
+                node_type: NodeType::Agent,
+                label: agent_id.to_string(),
+                parent_id: None,
+                child_ids: Vec::new(),
+                status: NodeStatus::Unknown,
+                docs: None,
+                signature: None,
+                meta: None,
+            };
+            self.nodes.insert(agent_vertex.clone(), agent_node.clone());
+            events.push(self.envelope(
+                EventType::NodeUpsert,
+                Payload::NodeUpsert { node: agent_node },
+            ));
+        }
+
+        // (2) Upsert the authored_by edge (touched code node → agent vertex) with the
+        // kind-qualified id (the house convention for non-`contains` edge kinds).
+        let edge = Edge {
+            id: typed_edge_id(node, &agent_vertex, EdgeKind::AuthoredBy),
+            source: node.to_string(),
+            target: agent_vertex,
+            kind: EdgeKind::AuthoredBy,
+            hot: false,
+        };
+        self.edges.insert(edge.id.clone(), edge.clone());
+        events.push(self.envelope(EventType::EdgeUpsert, Payload::EdgeUpsert { edge }));
+
+        // (3) Record/refresh this process's roster row as active, coalescing the
+        // high-frequency case (SPEC §11.2): if this pid is already rostered with an
+        // identical row — same agent identity, still "active" — skip the row rebuild,
+        // the O(N) roster clone+sort, and the extra broadcast, mirroring the hot-edge
+        // no-change early return above. `agent_type`/`color` derive purely from the
+        // agent id, so an unchanged `agent_id` (with the same status/protocol) means
+        // the whole row is unchanged and need not be recomputed.
+        let roster_unchanged = matches!(
+            self.roster.get(&pid),
+            Some(existing)
+                if existing.agent_id == agent_id
+                    && existing.status == "active"
+                    && existing.protocol_version.is_none()
+        );
+        if !roster_unchanged {
+            self.roster.insert(
+                pid,
+                AgentInfo {
+                    process_id: pid,
+                    agent_id: agent_id.to_string(),
+                    agent_type: agent_type_for(agent_id),
+                    color: agent_color_for(agent_id),
+                    status: "active".to_string(),
+                    protocol_version: None,
+                },
+            );
+        }
+
+        // (4) Emit the agent.activity envelope, then the agent.roster envelope only
+        // when the roster actually changed for this touch.
+        events.push(self.envelope(
+            EventType::AgentActivity,
+            Payload::AgentActivity {
+                agent_id: agent_id.to_string(),
+                action: action.to_string(),
+                node_id: node.to_string(),
+                session_id: session.to_string(),
+                process_id: Some(pid),
+                ts: None,
+                msg: msg.map(str::to_string),
+            },
+        ));
+        if !roster_unchanged {
+            events.push(self.roster_envelope(session.to_string()));
+        }
+
+        events
+    }
+
+    /// Times out every quiet process and returns the rebuilt roster on any change.
+    ///
+    /// The collector has no process-exit signal, so `"inactive"` is an **idle
+    /// timeout**: this flips every still-`"active"` roster row whose `last_seen`
+    /// (recorded by [`Graph::apply_clv_at`]) is **strictly older** than
+    /// [`ROSTER_IDLE_MS`] relative to `now_ms` to `"inactive"`. A process touched
+    /// exactly one window ago is *not* expired (the comparison is strict). When at
+    /// least one row changed it returns **exactly one** full `agent.roster` snapshot
+    /// envelope (every row, sorted by pid); when nothing changed — including a repeat
+    /// call after a process is already `"inactive"` — it returns an empty vector and
+    /// broadcasts nothing. `now_ms` shares the monotonic-millisecond domain of
+    /// [`monotonic_now_ms`]; a `last_seen` ahead of `now_ms` is treated as age zero
+    /// (saturating), so it is panic-free.
+    pub fn expire_idle(&mut self, now_ms: u64) -> Vec<EventEnvelope> {
+        let mut changed = false;
+        for (pid, info) in self.roster.iter_mut() {
+            if info.status != "active" {
+                continue;
+            }
+            let last_seen = self.last_seen.get(pid).copied().unwrap_or(0);
+            if now_ms.saturating_sub(last_seen) > ROSTER_IDLE_MS {
+                info.status = "inactive".to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            vec![self.roster_envelope(self.session_id.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Builds one full `agent.roster` snapshot envelope stamped with `session_id`.
+    ///
+    /// Clones every [`AgentInfo`] roster row and sorts it by `process_id` for a
+    /// stable order, then wraps it in an [`EventType::AgentRoster`] envelope. Shared
+    /// by [`Graph::apply_activity`] (a new/changed process) and [`Graph::expire_idle`]
+    /// (a timed-out process) so both paths broadcast an identical full-roster shape.
+    fn roster_envelope(&self, session_id: String) -> EventEnvelope {
+        let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
+        agents.sort_by_key(|a| a.process_id);
+        self.envelope(
+            EventType::AgentRoster,
+            Payload::AgentRoster { session_id, agents },
+        )
     }
 
     /// Wraps `payload` in an [`EventEnvelope`] stamped now with this graph's session.
@@ -395,6 +679,43 @@ fn status_from_outcome(outcome: TestOutcome) -> NodeStatus {
     }
 }
 
+/// Folds an agent id with FNV-1a into a stable 32-bit hash.
+///
+/// Shared seed of the deterministic [`agent_type_for`]/[`agent_color_for`]
+/// mappings (Phase 8): a given agent id always yields the same hash, so its
+/// roster type and colour are stable across processes and runs.
+fn agent_id_hash(agent_id: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in agent_id.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Derives a stable display colour (`#rrggbb`) for an agent from its id.
+///
+/// Deterministic via [`agent_id_hash`]: the low 24 bits of the hash become the RGB
+/// triple, so each agent id keeps one visually distinct colour across runs. The
+/// roster's `color` is presentation-only (consumed by the Phase-8.3/8.6 client),
+/// never an identity, so any stable mapping suffices.
+fn agent_color_for(agent_id: &str) -> String {
+    format!("#{:06x}", agent_id_hash(agent_id) & 0x00ff_ffff)
+}
+
+/// Derives a stable role label for an agent from its id.
+///
+/// Deterministic (Phase 8): pending a richer agent-role taxonomy, the `agentType`
+/// mirrors the stable agent id itself, which is the only role information the wire
+/// carries today. The empty id collapses to `"agent"` so the field is never blank.
+fn agent_type_for(agent_id: &str) -> String {
+    if agent_id.is_empty() {
+        "agent".to_string()
+    } else {
+        agent_id.to_string()
+    }
+}
+
 /// Returns a best-effort RFC3339 UTC timestamp for an outgoing envelope.
 ///
 /// Phase 0 does not interpret `ts` semantically — clients and tests key only on
@@ -424,14 +745,30 @@ fn rfc3339_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Returns milliseconds elapsed on a process-monotonic clock.
+///
+/// The real-clock source for the roster idle timer: [`Graph::apply_clv`] stamps a
+/// process's `last_seen` with this, and the collector's tick passes it to
+/// [`Graph::expire_idle`], so both sit in one monotonic domain immune to wall-clock
+/// jumps. The zero point is a process-start [`std::time::Instant`] anchor captured
+/// once on first call; tests bypass this and inject `now_ms` directly via
+/// [`Graph::apply_clv_at`]/[`Graph::expire_idle`]. Panic-free.
+pub(crate) fn monotonic_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    // Process-start anchor: the monotonic zero point shared by every reading.
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::Graph;
     use crate::clv::ClvEvent;
     use crate::parser::parse_rust_source;
     use crate::wire::{
-        edge_id, node_id, Edge, EdgeKind, EventEnvelope, EventType, HotEdgeState, Node, NodeStatus,
-        NodeType, Payload, TestOutcome,
+        agent_node_id, edge_id, node_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
+        HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -667,6 +1004,8 @@ mod tests {
         let mut graph = graph_with_function();
         let env = graph
             .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Fail))
+            .into_iter()
+            .next()
             .expect("test event for an existing node returns an envelope");
 
         assert_eq!(env.event_type, EventType::TestResult);
@@ -684,6 +1023,8 @@ mod tests {
 
         let env = graph
             .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Pass))
+            .into_iter()
+            .next()
             .expect("test event for an existing node returns an envelope");
         assert_eq!(env.event_type, EventType::TestResult);
         assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Passing));
@@ -694,6 +1035,8 @@ mod tests {
         let mut graph = graph_with_function();
         let env = graph
             .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Skip))
+            .into_iter()
+            .next()
             .expect("test event for an existing node returns an envelope");
         assert_eq!(env.event_type, EventType::TestResult);
         assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Stale));
@@ -704,6 +1047,8 @@ mod tests {
         let mut graph = graph_with_function();
         let env = graph
             .apply_clv(&status_event("fn:a.rs:f", TestOutcome::Running))
+            .into_iter()
+            .next()
             .expect("status event for an existing node returns an envelope");
 
         assert_eq!(env.event_type, EventType::StatusUpdate);
@@ -725,7 +1070,7 @@ mod tests {
         let before = graph.nodes.clone();
 
         let result = graph.apply_clv(&test_event("fn:does.not.exist", TestOutcome::Fail));
-        assert!(result.is_none(), "absent node must yield None");
+        assert!(result.is_empty(), "absent node must yield no envelope");
         assert_eq!(
             graph.nodes, before,
             "graph must be untouched for an absent node"
@@ -733,7 +1078,10 @@ mod tests {
 
         // The same contract holds for a status event.
         let result = graph.apply_clv(&status_event("fn:does.not.exist", TestOutcome::Running));
-        assert!(result.is_none(), "absent node must yield None for status");
+        assert!(
+            result.is_empty(),
+            "absent node must yield no envelope for status"
+        );
         assert_eq!(
             graph.nodes, before,
             "graph must be untouched for an absent node"
@@ -753,7 +1101,10 @@ mod tests {
             node: "fn:a.rs:f".to_string(),
             action: "modified".to_string(),
         });
-        assert!(result.is_none(), "activity must yield None");
+        assert!(
+            result.is_empty(),
+            "an unattributable activity (no agent/pid) must yield no envelope"
+        );
         assert_eq!(graph.nodes, before, "activity must not change node colour");
         assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Unknown));
     }
@@ -795,6 +1146,8 @@ mod tests {
 
         let env = graph
             .apply_clv(&hotedge_event("e:test", "enter"))
+            .into_iter()
+            .next()
             .expect("enter on an existing cold edge returns an envelope");
 
         assert_eq!(env.event_type, EventType::HotEdge);
@@ -824,11 +1177,16 @@ mod tests {
         graph.upsert_edge(cold_edge("e:test"));
         let _ = graph
             .apply_clv(&hotedge_event("e:test", "enter"))
+            .into_iter()
+            .next()
             .expect("first enter returns an envelope");
 
         // Transition-coalescing: a second enter on an already-hot edge emits nothing.
         let result = graph.apply_clv(&hotedge_event("e:test", "enter"));
-        assert!(result.is_none(), "re-entering a hot edge must yield None");
+        assert!(
+            result.is_empty(),
+            "re-entering a hot edge must yield no envelope"
+        );
         assert_eq!(edge_hot(&graph, "e:test"), Some(true), "edge stays hot");
     }
 
@@ -838,10 +1196,14 @@ mod tests {
         graph.upsert_edge(cold_edge("e:test"));
         let _ = graph
             .apply_clv(&hotedge_event("e:test", "enter"))
+            .into_iter()
+            .next()
             .expect("enter returns an envelope");
 
         let env = graph
             .apply_clv(&hotedge_event("e:test", "exit"))
+            .into_iter()
+            .next()
             .expect("exit on a hot edge returns an envelope");
         assert_eq!(env.event_type, EventType::HotEdge);
         match &env.payload {
@@ -852,7 +1214,10 @@ mod tests {
 
         // A second exit on the already-cold edge coalesces to None.
         let result = graph.apply_clv(&hotedge_event("e:test", "exit"));
-        assert!(result.is_none(), "re-exiting a cold edge must yield None");
+        assert!(
+            result.is_empty(),
+            "re-exiting a cold edge must yield no envelope"
+        );
         assert_eq!(edge_hot(&graph, "e:test"), Some(false), "edge stays cold");
     }
 
@@ -863,7 +1228,7 @@ mod tests {
         let before = graph.edges.clone();
 
         let result = graph.apply_clv(&hotedge_event("e:absent", "enter"));
-        assert!(result.is_none(), "unknown edge id must yield None");
+        assert!(result.is_empty(), "unknown edge id must yield no envelope");
         assert_eq!(
             graph.edges, before,
             "no edge may be mutated for an absent id"
@@ -878,7 +1243,7 @@ mod tests {
 
         // Any state word other than enter/exit is ignored panic-free.
         let result = graph.apply_clv(&hotedge_event("e:test", "wat"));
-        assert!(result.is_none(), "garbage state must yield None");
+        assert!(result.is_empty(), "garbage state must yield no envelope");
         assert_eq!(graph.edges, before, "garbage state must not toggle hot");
     }
 
@@ -915,6 +1280,393 @@ mod tests {
         assert!(
             children.iter().any(|n| n.id == "fn:a.rs:f"),
             "function child must survive a re-parse: {children:?}"
+        );
+    }
+
+    // ---- P8-2: activity → agent node + authored_by edge + in-memory roster ----
+    //
+    // These tests pin the widened `apply_clv` contract (`-> Vec<EventEnvelope>`) and
+    // the agent-layer side effects of an `activity` event. They are RED until P8-2
+    // lands: every `let events: Vec<EventEnvelope> = graph.apply_clv(..)` is a
+    // signature mismatch against today's `Option<EventEnvelope>` return, and the
+    // roster/snapshot/escaping assertions have no implementation behind them yet.
+
+    /// Builds a `modified` activity CLV event from `agent`/`pid` touching `node`.
+    fn activity_event(node: &str, agent: &str, pid: u32) -> ClvEvent {
+        ClvEvent::Activity {
+            session: "s1".to_string(),
+            pid: Some(pid),
+            agent: Some(agent.to_string()),
+            msg: Some("touched it".to_string()),
+            node: node.to_string(),
+            action: "modified".to_string(),
+        }
+    }
+
+    /// Returns the first `authored_by` edge from an `edge.upsert` envelope, if any.
+    fn authored_by_edge(events: &[EventEnvelope]) -> Option<Edge> {
+        events
+            .iter()
+            .find_map(|env| match (&env.event_type, &env.payload) {
+                (EventType::EdgeUpsert, Payload::EdgeUpsert { edge })
+                    if edge.kind == EdgeKind::AuthoredBy =>
+                {
+                    Some(edge.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Extracts the `agent.roster` payload's agent rows, panicking if none was emitted.
+    fn roster_agents(events: &[EventEnvelope]) -> Vec<AgentInfo> {
+        events
+            .iter()
+            .find_map(|env| match (&env.event_type, &env.payload) {
+                (EventType::AgentRoster, Payload::AgentRoster { agents, .. }) => {
+                    Some(agents.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an AgentRoster payload, got {events:?}"))
+    }
+
+    #[test]
+    fn apply_clv_activity_emits_agent_node_authored_edge_activity_and_roster() {
+        let mut graph = Graph::new();
+        // Pins the widened signature: `apply_clv` must return `Vec<EventEnvelope>`.
+        let events: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        // (a) a node.upsert for the agent vertex, typed NodeType::Agent.
+        let agent_id = agent_node_id("tdd-green");
+        let agent_node = upserted_node(&events, &agent_id)
+            .unwrap_or_else(|| panic!("expected a node.upsert for {agent_id}, got {events:?}"));
+        assert_eq!(
+            agent_node.node_type,
+            NodeType::Agent,
+            "agent node is typed Agent"
+        );
+
+        // (b) an edge.upsert of kind authored_by from the code node to the agent node.
+        let edge = authored_by_edge(&events)
+            .unwrap_or_else(|| panic!("expected an authored_by edge.upsert, got {events:?}"));
+        assert_eq!(edge.kind, EdgeKind::AuthoredBy);
+        assert_eq!(
+            edge.source, "fn:src/x.rs:foo",
+            "edge sources at the code node"
+        );
+        assert_eq!(edge.target, agent_id, "edge targets the agent node");
+
+        // (c) an agent.activity envelope and (d) an agent.roster envelope.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == EventType::AgentActivity),
+            "expected an AgentActivity envelope, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == EventType::AgentRoster),
+            "expected an AgentRoster envelope, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn apply_clv_activity_roster_lists_the_active_process() {
+        let mut graph = Graph::new();
+        let events: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        let agents = roster_agents(&events);
+        let row = agents
+            .iter()
+            .find(|a| a.agent_id == "tdd-green" && a.process_id == 48213)
+            .unwrap_or_else(|| panic!("expected a roster row for tdd-green/48213, got {agents:?}"));
+        assert_eq!(row.status, "active", "the touched process is marked active");
+    }
+
+    #[test]
+    fn apply_clv_second_activity_new_pid_adds_roster_row_reuses_node_and_edge_id() {
+        let mut graph = Graph::new();
+        let first: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+        let second: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 99999));
+
+        // The second roster carries TWO process rows, both under the one agentId.
+        let agents = roster_agents(&second);
+        let rows: Vec<&AgentInfo> = agents
+            .iter()
+            .filter(|a| a.agent_id == "tdd-green")
+            .collect();
+        assert_eq!(rows.len(), 2, "two pids under one agentId, got {agents:?}");
+        let mut pids: Vec<u32> = rows.iter().map(|a| a.process_id).collect();
+        pids.sort_unstable();
+        assert_eq!(
+            pids,
+            vec![48213, 99999],
+            "both pids tracked under the agent"
+        );
+
+        // The agent vertex id is reused — exactly one agent node, no duplicate.
+        let agent_id = agent_node_id("tdd-green");
+        let agent_nodes: Vec<Node> = snapshot_nodes(&graph.snapshot())
+            .into_iter()
+            .filter(|n| n.id == agent_id)
+            .collect();
+        assert_eq!(
+            agent_nodes.len(),
+            1,
+            "no duplicate agent node: {agent_nodes:?}"
+        );
+
+        // The authored_by edge id is deterministic/stable across the two activities.
+        let e1 = authored_by_edge(&first).expect("first authored_by edge");
+        let e2 = authored_by_edge(&second).expect("second authored_by edge");
+        assert_eq!(
+            e1.id, e2.id,
+            "authored_by edge id must be deterministic/stable across activities"
+        );
+    }
+
+    #[test]
+    fn apply_clv_repeat_activity_same_pid_coalesces_roster_but_keeps_edge() {
+        let mut graph = Graph::new();
+        let _first: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+        // A second identical touch (same pid, same agent identity, already "active")
+        // is a no-change roster repeat: SPEC §11.2 coalescing skips the roster
+        // rebuild + broadcast. The authored_by edge is still emitted on the re-touch.
+        let repeat: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        assert!(
+            !repeat
+                .iter()
+                .any(|e| e.event_type == EventType::AgentRoster),
+            "a no-change roster repeat must not re-broadcast the roster, got {repeat:?}"
+        );
+        assert!(
+            authored_by_edge(&repeat).is_some(),
+            "the authored_by edge is still emitted on the repeat touch, got {repeat:?}"
+        );
+    }
+
+    #[test]
+    fn apply_clv_test_status_hotedge_each_return_a_single_element_vec() {
+        // Test event → exactly one TestResult envelope (regression for the Vec widen).
+        let mut graph = graph_with_function();
+        let events: Vec<EventEnvelope> =
+            graph.apply_clv(&test_event("fn:a.rs:f", TestOutcome::Fail));
+        assert_eq!(
+            events.len(),
+            1,
+            "test event yields one envelope, got {events:?}"
+        );
+        assert_eq!(events[0].event_type, EventType::TestResult);
+
+        // Status event → exactly one StatusUpdate envelope.
+        let mut graph = graph_with_function();
+        let events: Vec<EventEnvelope> =
+            graph.apply_clv(&status_event("fn:a.rs:f", TestOutcome::Running));
+        assert_eq!(
+            events.len(),
+            1,
+            "status event yields one envelope, got {events:?}"
+        );
+        assert_eq!(events[0].event_type, EventType::StatusUpdate);
+
+        // HotEdge enter on a cold edge → exactly one HotEdge envelope.
+        let mut graph = graph_with_function();
+        graph.upsert_edge(cold_edge("e:test"));
+        let events: Vec<EventEnvelope> = graph.apply_clv(&hotedge_event("e:test", "enter"));
+        assert_eq!(
+            events.len(),
+            1,
+            "hotedge yields one envelope, got {events:?}"
+        );
+        assert_eq!(events[0].event_type, EventType::HotEdge);
+    }
+
+    #[test]
+    fn snapshot_includes_agent_root_node_but_not_the_authored_by_edge() {
+        let mut graph = Graph::new();
+        // Seed a genuine non-root function node (child of file:src/x.rs).
+        let _ = graph.apply_parsed(parse_rust_source("src/x.rs", "fn foo() {}"));
+        let _events: Vec<EventEnvelope> =
+            graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        let snap = graph.snapshot();
+        let nodes = snapshot_nodes(&snap);
+        let agent_id = agent_node_id("tdd-green");
+        let agent_node = nodes
+            .iter()
+            .find(|n| n.id == agent_id)
+            .unwrap_or_else(|| panic!("agent node must appear as a snapshot root, got {nodes:?}"));
+        assert!(
+            agent_node.parent_id.is_none(),
+            "agent node is a root (no parentId): {agent_node:?}"
+        );
+        assert_eq!(agent_node.node_type, NodeType::Agent);
+
+        let edges = snapshot_edges(&snap);
+        assert!(
+            !edges.iter().any(|e| e.kind == EdgeKind::AuthoredBy),
+            "snapshot must omit the authored_by edge (its source is a non-root function): {edges:?}"
+        );
+    }
+
+    // ---- P8-4: roster idle-timeout → `inactive`, plus respawn ----------------
+    //
+    // The collector has no process-exit signal, so `inactive` is an idle-timeout.
+    // P8-4 records a per-pid `last_seen` on each activity and adds
+    // `Graph::expire_idle(now_ms)`, which flips any still-`active` process whose
+    // last activity is **strictly older** than the named window `ROSTER_IDLE_MS`
+    // to `status: "inactive"` and returns the full `agent.roster` snapshot —
+    // exactly one envelope, and **only** when at least one row changed.
+    //
+    // Time is injectable so these tests are deterministic with NO real sleeps:
+    //   * `Graph::apply_clv_at(&event, now_ms) -> Vec<EventEnvelope>` records the
+    //     activity's `last_seen = now_ms` (production `apply_clv` delegates with a
+    //     real monotonic now), and
+    //   * `Graph::expire_idle(now_ms) -> Vec<EventEnvelope>` compares against an
+    //     injected `now_ms` (same monotonic-millisecond domain).
+    //
+    // RED until P8-4 lands: `ROSTER_IDLE_MS`, `Graph::apply_clv_at`, and
+    // `Graph::expire_idle` do not yet exist, so this module fails to compile.
+
+    /// Finds the roster row for `pid` in `agents`, panicking if it is absent.
+    fn roster_row(agents: &[AgentInfo], pid: u32) -> &AgentInfo {
+        agents
+            .iter()
+            .find(|a| a.process_id == pid)
+            .unwrap_or_else(|| panic!("expected a roster row for pid {pid}, got {agents:?}"))
+    }
+
+    #[test]
+    fn expire_idle_flips_a_stale_process_to_inactive_then_coalesces() {
+        let mut graph = Graph::new();
+        // Record an activity at t0, establishing last_seen[48213] = t0.
+        let t0: u64 = 1_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213), t0);
+
+        // At t0 + window + 1 the process is strictly older than the idle window,
+        // so expire_idle flips it to inactive and emits exactly one agent.roster.
+        let now = t0 + super::ROSTER_IDLE_MS + 1;
+        let expired: Vec<EventEnvelope> = graph.expire_idle(now);
+        let rosters = expired
+            .iter()
+            .filter(|e| e.event_type == EventType::AgentRoster)
+            .count();
+        assert_eq!(
+            rosters, 1,
+            "exactly one agent.roster on the first expiry, got {expired:?}"
+        );
+        let agents = roster_agents(&expired);
+        assert_eq!(
+            roster_row(&agents, 48213).status,
+            "inactive",
+            "the stale process is marked inactive, got {agents:?}"
+        );
+
+        // Calling again with no further change yields an EMPTY vec — no roster
+        // envelope is emitted when nothing changed (already inactive).
+        let again: Vec<EventEnvelope> = graph.expire_idle(now);
+        assert!(
+            again.is_empty(),
+            "a second expiry with no change emits nothing, got {again:?}"
+        );
+    }
+
+    #[test]
+    fn expire_idle_marks_only_the_idle_process_inactive() {
+        let mut graph = Graph::new();
+        // pid 100 last touched at t_old; pid 200 last touched a full window later.
+        let t_old: u64 = 1_000;
+        let t_fresh: u64 = t_old + super::ROSTER_IDLE_MS;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "agent-old", 100), t_old);
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:foo", "agent-new", 200),
+            t_fresh,
+        );
+
+        // `now` is one tick past the window for pid 100 (age = window + 1) but
+        // only 1 ms past pid 200's touch (age = 1, well within the window).
+        let now = t_fresh + 1;
+        let expired: Vec<EventEnvelope> = graph.expire_idle(now);
+        let agents = roster_agents(&expired);
+        assert_eq!(
+            roster_row(&agents, 100).status,
+            "inactive",
+            "the idle process flips to inactive, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 200).status,
+            "active",
+            "the fresh process stays active, got {agents:?}"
+        );
+    }
+
+    #[test]
+    fn expire_idle_then_new_pid_same_agent_keeps_old_inactive_and_new_active() {
+        let mut graph = Graph::new();
+        // The original process touches a node, then goes idle and is expired.
+        let t0: u64 = 1_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 111), t0);
+        let now = t0 + super::ROSTER_IDLE_MS + 1;
+        let _ = graph.expire_idle(now); // pid 111 → inactive
+
+        // Respawn: a NEW pid under the SAME agentId emits a fresh activity at `now`.
+        // Its roster carries BOTH pids under the one agentId — the old one still
+        // inactive, the new one active.
+        let respawn: Vec<EventEnvelope> =
+            graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 222), now);
+        let agents = roster_agents(&respawn);
+        let rows = agents.iter().filter(|a| a.agent_id == "tdd-green").count();
+        assert_eq!(
+            rows, 2,
+            "both pids tracked under one agentId, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 111).status,
+            "inactive",
+            "the expired original pid stays inactive, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 222).status,
+            "active",
+            "the respawned pid is active, got {agents:?}"
+        );
+    }
+
+    #[test]
+    fn an_activity_records_last_seen_so_expiry_respects_the_window() {
+        let mut graph = Graph::new();
+        // The activity must record last_seen = t0 (not 0); otherwise the boundary
+        // check below would see a huge age and expire prematurely.
+        let t0: u64 = 5_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 333), t0);
+
+        // Just after the activity, and again at exactly t0 + window, the process is
+        // NOT strictly older than the window, so expiry is a no-op (empty vec).
+        assert!(
+            graph.expire_idle(t0 + 1).is_empty(),
+            "just after the activity the process is not idle"
+        );
+        let boundary = graph.expire_idle(t0 + super::ROSTER_IDLE_MS);
+        assert!(
+            boundary.is_empty(),
+            "at the window boundary the process is not yet idle, got {boundary:?}"
+        );
+
+        // One millisecond past the window it is strictly older and expires.
+        let past = graph.expire_idle(t0 + super::ROSTER_IDLE_MS + 1);
+        let agents = roster_agents(&past);
+        assert_eq!(
+            roster_row(&agents, 333).status,
+            "inactive",
+            "one ms past the window the process expires, got {agents:?}"
         );
     }
 }

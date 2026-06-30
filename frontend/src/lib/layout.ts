@@ -29,7 +29,7 @@ import {
 	type Edge as FlowEdge,
 	type NodeHandle
 } from '@xyflow/svelte';
-import type { Edge, EdgeKind, Node, NodeStatus } from './types';
+import type { Edge, EdgeKind, Node, NodeStatus, NodeType } from './types';
 
 /** Vertical spacing between stacked rows, in pixels. */
 const ROW_HEIGHT = 120;
@@ -65,6 +65,15 @@ const NODE_HANDLES: NodeHandle[] = [
 export type HierarchyNodeData = {
 	/** Display label (the CLV node's `label`). */
 	label: string;
+	/**
+	 * The CLV node's structural {@link NodeType}, copied straight from the store by
+	 * {@link buildHierarchy} so `HierarchyNode` can apply a type-specific style (via
+	 * {@link TYPE_NODE_CLASS}) on top of the status colour — in particular giving
+	 * `agent` nodes a distinct badge/border from ordinary code nodes. Optional so
+	 * pre-P8-6 `HierarchyNodeData` literals (e.g. test fixtures) remain valid;
+	 * `buildHierarchy` always populates it.
+	 */
+	type?: NodeType;
 	/** Whether the node has children and so carries an expand/collapse affordance. */
 	expandable: boolean;
 	/** Whether the node is currently expanded (its children are revealed). */
@@ -116,6 +125,24 @@ export const STATUS_NODE_CLASS: Record<NodeStatus, string> = {
 	error: 'lattice-status-error border-red-600 bg-red-50 dark:border-red-700 dark:bg-red-950'
 };
 
+/**
+ * Node-type → node-styling Tailwind classes, applied by `HierarchyNode` on top of
+ * {@link STATUS_NODE_CLASS} so a node can be distinguished by its structural
+ * {@link NodeType} as well as its live status. Only the Phase-8 `agent` node gets
+ * a distinct cue today — a dashed violet border/ring marking it as an agent rather
+ * than a code element — so every other type maps to the empty string (status
+ * colour alone). Colours come from Tailwind theme tokens, never hard-coded hex.
+ */
+export const TYPE_NODE_CLASS: Record<NodeType, string> = {
+	service: '',
+	module: '',
+	file: '',
+	function: '',
+	variable: '',
+	test: '',
+	agent: 'border-dashed border-violet-500 ring-1 ring-violet-400/60 dark:border-violet-400'
+};
+
 function compareId(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -131,22 +158,33 @@ function compareId(a: string, b: string): number {
  * already present in the store — so a lazily-loaded parent still offers an
  * expand affordance before its subtree arrives.
  *
+ * The Phase-8 agent layer is gated by `showAgents`: when `false` (the default),
+ * `type === 'agent'` nodes are pre-filtered out entirely so the canvas shows only
+ * the code hierarchy; when `true`, agent nodes are included alongside it.
+ *
  * @param graphNodes - all current CLV nodes from the `nodes` store.
  * @param expanded - ids of nodes whose children should be revealed (the zoom gate).
  * @param onSelect - selection callback threaded into every node's data block
  *   (defaults to a no-op so layout-only callers need not supply one).
+ * @param showAgents - when `false` (default), exclude `agent`-type nodes; when
+ *   `true`, include the Phase-8 agent layer.
  * @returns positioned SvelteFlow nodes for exactly the visible tiers.
  */
 export function buildHierarchy(
 	graphNodes: Node[],
 	expanded: ReadonlySet<string>,
-	onSelect: (nodeId: string) => void = () => {}
+	onSelect: (nodeId: string) => void = () => {},
+	showAgents = false
 ): HierarchyFlowNode[] {
+	// Agent-layer gate: drop agent nodes up front when the layer is off, so they
+	// never reach the roots/children scan below.
+	const nodes = showAgents ? graphNodes : graphNodes.filter((n) => n.type !== 'agent');
+
 	const childrenOf = (id: string): Node[] =>
-		graphNodes.filter((n) => n.parentId === id).sort((a, b) => compareId(a.id, b.id));
+		nodes.filter((n) => n.parentId === id).sort((a, b) => compareId(a.id, b.id));
 
 	const hasChildren = (node: Node): boolean =>
-		node.childIds.length > 0 || graphNodes.some((n) => n.parentId === node.id);
+		node.childIds.length > 0 || nodes.some((n) => n.parentId === node.id);
 
 	const flow: HierarchyFlowNode[] = [];
 	let row = 0;
@@ -161,6 +199,7 @@ export function buildHierarchy(
 			handles: NODE_HANDLES,
 			data: {
 				label: node.label,
+				type: node.type,
 				expandable: hasChildren(node),
 				expanded: expanded.has(node.id),
 				status: node.status,
@@ -174,30 +213,35 @@ export function buildHierarchy(
 		}
 	};
 
-	const roots = graphNodes.filter((n) => n.parentId == null).sort((a, b) => compareId(a.id, b.id));
+	const roots = nodes.filter((n) => n.parentId == null).sort((a, b) => compareId(a.id, b.id));
 	for (const root of roots) walk(root, 0);
 
 	return flow;
 }
 
 /**
- * The two edge classes the canvas renders, keyed off the CLV {@link EdgeKind}:
- * `calls` is **control flow**, and `param_source` / `data_flows_from` are
- * **data flow**. `contains` (and every other kind) is not a flow class and is
+ * The edge classes the canvas renders, keyed off the CLV {@link EdgeKind}:
+ * `calls` is **control flow**, `param_source` / `data_flows_from` are **data
+ * flow**, and the Phase-8 `authored_by` is **agent** flow (a code node ↔ the agent
+ * that wrote it). `contains` (and every other kind) is not a flow class and is
  * never drawn — containment is already conveyed by the column layout.
  */
-export type EdgeFlowClass = 'control' | 'data';
+export type EdgeFlowClass = 'control' | 'data' | 'agent';
 
 /**
- * Independent visibility toggles for the two edge classes. Both default on in
- * `Graph.svelte`; flipping one to `false` drops that class of edge from the
- * canvas without touching the other.
+ * Independent visibility toggles for the edge classes. `controlFlow`/`dataFlow`
+ * default on in `Graph.svelte`; flipping one to `false` drops that class of edge
+ * from the canvas without touching the others. The Phase-8 `agent` toggle is
+ * **optional and defaults off** at runtime (an absent flag draws no `authored_by`
+ * edges), so pre-Phase-8 `{ controlFlow, dataFlow }` literals keep working.
  */
 export interface EdgeFilter {
 	/** When `false`, `calls` (control-flow) edges are excluded. */
 	controlFlow: boolean;
 	/** When `false`, `param_source` / `data_flows_from` (data-flow) edges are excluded. */
 	dataFlow: boolean;
+	/** When absent or `false`, `authored_by` (agent-flow) edges are excluded. */
+	agent?: boolean;
 }
 
 /**
@@ -223,14 +267,25 @@ export type HierarchyEdgeData = {
 /** A SvelteFlow edge carrying its {@link HierarchyEdgeData} flow-class marker. */
 export type HierarchyFlowEdge = FlowEdge<HierarchyEdgeData>;
 
-/** Map a CLV edge kind to its flow class, or `null` when the kind is never drawn. */
-function flowClassOf(kind: EdgeKind): EdgeFlowClass | null {
+/**
+ * Map a CLV edge kind to its flow class, or `null` when the kind is never drawn.
+ *
+ * `calls` → `control`, `param_source` / `data_flows_from` → `data`, and the
+ * Phase-8 `authored_by` → `agent`. `contains` and every other relationship are
+ * conveyed structurally (by the column layout), not drawn, and so map to `null`.
+ *
+ * @param kind - the CLV {@link EdgeKind}.
+ * @returns the {@link EdgeFlowClass} the kind belongs to, or `null` if undrawn.
+ */
+export function flowClassOf(kind: EdgeKind): EdgeFlowClass | null {
 	switch (kind) {
 		case 'calls':
 			return 'control';
 		case 'param_source':
 		case 'data_flows_from':
 			return 'data';
+		case 'authored_by':
+			return 'agent';
 		default:
 			// `contains` and any other relationship are conveyed structurally, not drawn.
 			return null;
@@ -244,10 +299,13 @@ function flowClassOf(kind: EdgeKind): EdgeFlowClass | null {
  * stays in lockstep with the lazy node hierarchy:
  *
  * 1. Its `kind` maps to a flow class via {@link flowClassOf} (`calls` →
- *    control, `param_source` / `data_flows_from` → data). `contains` and every
- *    other kind are skipped — containment is shown by the column layout.
- * 2. That flow class is enabled in `filter` (`controlFlow` / `dataFlow`), which
- *    the two independent toggles drive.
+ *    control, `param_source` / `data_flows_from` → data, `authored_by` → agent).
+ *    `contains` and every other kind are skipped — containment is shown by the
+ *    column layout.
+ * 2. That flow class is enabled in `filter` (`controlFlow` / `dataFlow` /
+ *    `agent`), which the independent toggles drive. The `agent` flag is optional
+ *    and defaults off, so `authored_by` edges stay hidden until the agent layer
+ *    is switched on.
  * 3. **Both** `source` and `target` are present in `visibleNodeIds` — the set of
  *    node ids `buildHierarchy` actually emitted. Collapsing a parent removes its
  *    descendants from that set, so their edges drop out automatically with no
@@ -284,12 +342,15 @@ export function buildEdges(
 		if (flowClass === null) continue;
 		if (flowClass === 'control' && !filter.controlFlow) continue;
 		if (flowClass === 'data' && !filter.dataFlow) continue;
+		if (flowClass === 'agent' && !filter.agent) continue;
 		if (!visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target)) continue;
 
 		const kindClass =
 			flowClass === 'control'
 				? 'lattice-edge-control [&_path]:stroke-sky-500'
-				: 'lattice-edge-data [&_path]:stroke-amber-500';
+				: flowClass === 'data'
+					? 'lattice-edge-data [&_path]:stroke-amber-500'
+					: 'lattice-edge-agent [&_path]:stroke-violet-500';
 
 		flow.push({
 			id: edge.id,
@@ -304,4 +365,87 @@ export function buildEdges(
 	}
 
 	return flow;
+}
+
+/** Prefix every agent node id carries, e.g. `agent:tdd-green`. */
+const AGENT_ID_PREFIX = 'agent:';
+
+/**
+ * The set of code-node ids a given agent authored, for the agent → code
+ * drill-down direction.
+ *
+ * The P8-2 backend emits an `authored_by` edge **from the code node it wrote
+ * (`source`) to the agent node** (`target`, id `agent:<agentId>`). This collects
+ * the `source` of every `authored_by` edge whose `target` is `agent:<agentId>`;
+ * any other edge kind is ignored, so a `calls` edge never implies authorship.
+ *
+ * @param edges - all current CLV edges from the `edges` store.
+ * @param agentId - the bare agent id (no `agent:` prefix).
+ * @returns the ids of the code nodes the agent authored (empty if none).
+ */
+export function nodesAuthoredBy(edges: Edge[], agentId: string): Set<string> {
+	const agentNodeId = AGENT_ID_PREFIX + agentId;
+	const out = new Set<string>();
+	for (const edge of edges) {
+		if (edge.kind !== 'authored_by') continue;
+		if (edge.target !== agentNodeId) continue;
+		out.add(edge.source);
+	}
+	return out;
+}
+
+/**
+ * The set of bare agent ids that authored a given node, for the code → agent
+ * drill-down direction.
+ *
+ * Looks at every `authored_by` edge incident to `nodeId` and returns the agent
+ * endpoint with its `agent:` prefix stripped. Non-`authored_by` edges are
+ * ignored.
+ *
+ * @param edges - all current CLV edges from the `edges` store.
+ * @param nodeId - the code-node id to look up authorship for.
+ * @returns the bare agent ids that authored the node (empty if none).
+ */
+export function agentsForNode(edges: Edge[], nodeId: string): Set<string> {
+	const out = new Set<string>();
+	for (const edge of edges) {
+		if (edge.kind !== 'authored_by') continue;
+		if (edge.source !== nodeId && edge.target !== nodeId) continue;
+		const agentEnd = edge.source.startsWith(AGENT_ID_PREFIX)
+			? edge.source
+			: edge.target.startsWith(AGENT_ID_PREFIX)
+				? edge.target
+				: null;
+		if (agentEnd !== null) out.add(agentEnd.slice(AGENT_ID_PREFIX.length));
+	}
+	return out;
+}
+
+/** Strict allowlist for a `#hex` colour (3, 6, or 8 hex digits). */
+const HEX_COLOUR = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+
+/**
+ * Strict allowlist for an `rgb(...)` / `rgba(...)` colour: three 0–255-ish integer
+ * channels and an optional alpha (0–1, a fraction, or a percentage). Whitespace
+ * around commas is permitted; nothing else is.
+ */
+const RGB_COLOUR =
+	/^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(?:,\s*(?:0|1|0?\.\d+|\d{1,3}%)\s*)?\)$/;
+
+/**
+ * Sanitise an untrusted colour string before it is bound into any `style`
+ * attribute or CSS custom property, closing the deferred P8-5 XSS: an agent's
+ * `color` arrives over the wire and must never reach the DOM as raw CSS.
+ *
+ * Uses a strict allowlist — only a `#hex` (3/6/8 digit) or `rgb()`/`rgba()`
+ * value passes through **unchanged**. Anything else (a CSS-injection payload such
+ * as `red;background:url(x)`, a bare `url(x)`, `javascript:…`, `expression(…)`,
+ * a named colour, etc.) returns `null` so the caller can fall back to a neutral
+ * default instead of binding the payload.
+ *
+ * @param input - the untrusted colour string.
+ * @returns the input unchanged when it is a valid hex/rgb colour, else `null`.
+ */
+export function safeColor(input: string): string | null {
+	return HEX_COLOUR.test(input) || RGB_COLOUR.test(input) ? input : null;
 }

@@ -40,8 +40,15 @@
 //!   `agents` (when pid present) → the event row.
 //! - `hot_edge` persists **only** as the `edges.hot` flag (§B.6 has no hot-edge
 //!   table); the UPDATE is a no-op when the edge row is absent.
-//! - `agent_activity` / `protocol_versions` are **created but never written** in
-//!   Phase 7 — no such envelope reaches `persist`; their writers land in Phase 8.
+//! - `agent_activity` / `protocol_versions` are written by the **Phase-8 agent
+//!   layer** (the SQLite twin's write paths, in Postgres dialect): an `agent.roster`
+//!   ([`Payload::AgentRoster`]) upserts one **real** `agents` row per [`AgentInfo`]
+//!   (its true `agent_type`/`color`/`status`, keyed by `process_id` with
+//!   `ON CONFLICT (process_id)` so a re-emitted roster flips `status`/`updated_at`
+//!   without duplicating — never the `#888888`/agent-id placeholders) plus one
+//!   `protocol_versions` row per process; an `agent.activity`
+//!   ([`Payload::AgentActivity`]) inserts one `agent_activity` row (UUID id),
+//!   upserting its `agents` parent first so the `process_id` FK holds.
 //!
 //! Only a typed [`EventEnvelope`] reaches [`PostgresStore::persist`] — raw stdout is
 //! never persisted (§B.5).
@@ -68,7 +75,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{Storage, StorageError};
-use crate::wire::{EventEnvelope, HotEdgeState, Payload};
+use crate::wire::{AgentInfo, EventEnvelope, HotEdgeState, Payload};
 
 /// The §B.6 schema in **Postgres dialect**, as idempotent `CREATE … IF NOT EXISTS`
 /// statements (decision-2).
@@ -143,7 +150,7 @@ const SCHEMA: &[&str] = &[
         message     TEXT,
         ts          TEXT NOT NULL
     )",
-    // process_id is NULLable (decision-4); table is created but unwritten in Phase 7.
+    // process_id is NULLable (decision-4); written by the Phase-8 agent layer (P8-3).
     "CREATE TABLE IF NOT EXISTS agent_activity (
         id         TEXT PRIMARY KEY,
         process_id BIGINT REFERENCES agents(process_id),
@@ -226,6 +233,38 @@ const SQL_UPSERT_AGENT: &str = "INSERT INTO agents
      VALUES ($1, $2, $3, $4, 'active', $5, $6, $7)
      ON CONFLICT (process_id) DO UPDATE SET status = 'active', updated_at = excluded.updated_at";
 
+/// Upserts a **real** `agents` row from a roster `AgentInfo` (true
+/// `agent_id`/`agent_type`/`color`/`status`, not the placeholders), refreshing the
+/// identity/metadata, `session_id`, and `updated_at` on conflict (`agent.roster`); 8
+/// binds. The conflict clause refreshes `session_id` so a reused PID re-homes to its
+/// new session, matching [`SQL_UPSERT_PROTOCOL_VERSION`].
+const SQL_UPSERT_ROSTER_AGENT: &str = "INSERT INTO agents
+       (process_id, agent_id, agent_type, color, status, session_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (process_id) DO UPDATE SET
+       agent_id = excluded.agent_id,
+       agent_type = excluded.agent_type,
+       color = excluded.color,
+       status = excluded.status,
+       session_id = excluded.session_id,
+       updated_at = excluded.updated_at";
+
+/// Upserts one `protocol_versions` row per process, refreshing on conflict
+/// (`agent.roster`); 4 binds.
+const SQL_UPSERT_PROTOCOL_VERSION: &str = "INSERT INTO protocol_versions
+       (process_id, version, session_id, introduced_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (process_id) DO UPDATE SET
+       version = excluded.version,
+       session_id = excluded.session_id,
+       introduced_at = excluded.introduced_at";
+
+/// Inserts one `agent_activity` row (UUID id, NULLable `process_id`)
+/// (`agent.activity`); 7 binds.
+const SQL_INSERT_AGENT_ACTIVITY: &str = "INSERT INTO agent_activity
+       (id, process_id, session_id, agent_id, action, node_id, ts)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
 /// Upper bound on opening a connection (the pool's `acquire_timeout`).
 ///
 /// 5s is long enough not to be flaky against a slow-but-live Postgres, yet far below
@@ -296,9 +335,12 @@ impl Storage for PostgresStore {
     /// `test_results` row (UUID id, NULL `process_id` when the event has no pid);
     /// `status.update` updates `nodes.status`; `hot_edge` updates `edges.hot` (a
     /// no-op when the edge is absent); `node.upsert`/`edge.upsert` insert-or-update;
-    /// `node.remove`/`edge.remove` delete; `snapshot`/`subtree` (view frames) persist
-    /// nothing. A `sessions` row is upserted per event (the DB no-ops a duplicate),
-    /// and an `agents` row when a pid is present, before the event row.
+    /// `node.remove`/`edge.remove` delete; `agent.roster` upserts a **real** `agents`
+    /// row per [`AgentInfo`] plus a `protocol_versions` row per process;
+    /// `agent.activity` inserts an `agent_activity` row (upserting its `agents` parent
+    /// first for the FK); `snapshot`/`subtree` (view frames) persist nothing. A
+    /// `sessions` row is upserted per event (the DB no-ops a duplicate), and an
+    /// `agents` row when a pid is present, before the event row.
     async fn persist(&self, env: &EventEnvelope) -> Result<(), StorageError> {
         // One timestamp per event, reused by every write below (decision-3).
         let now = now_rfc3339();
@@ -422,6 +464,39 @@ impl Storage for PostgresStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::AgentActivity {
+                agent_id,
+                action,
+                node_id,
+                session_id,
+                process_id,
+                ts: _,
+                msg: _,
+            } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                // Upsert the agents parent first (placeholder metadata — a later
+                // roster refines it) so the process_id FK holds with no prior roster.
+                if let Some(pid) = *process_id {
+                    upsert_agent(&mut tx, pid, Some(agent_id.as_str()), session_id, &now).await?;
+                }
+                sqlx::query(SQL_INSERT_AGENT_ACTIVITY)
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(process_id.map(i64::from))
+                    .bind(session_id.as_str())
+                    .bind(agent_id.as_str())
+                    .bind(action.as_str())
+                    .bind(node_id.as_str())
+                    .bind(now.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Payload::AgentRoster { session_id, agents } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                for info in agents {
+                    upsert_roster_agent(&mut tx, info, session_id, &now).await?;
+                    upsert_protocol_version(&mut tx, info, session_id, &now).await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -510,6 +585,66 @@ async fn upsert_agent(
     Ok(())
 }
 
+/// Upserts a **real** `agents` row from an [`AgentInfo`] roster entry, enlisting in the
+/// caller's transaction via `conn` (P8-3) — the Postgres twin of the SQLite backend's
+/// `upsert_roster_agent`.
+///
+/// Unlike the bare-pid [`upsert_agent`] (which stamps the `#888888`/agent-id
+/// placeholders), this writes the roster's true `agent_id`/`agent_type`/`color`/
+/// `status`, keyed by `process_id`. `ON CONFLICT (process_id) DO UPDATE` refreshes the
+/// identity/metadata, `session_id`, and `updated_at` on a re-emitted roster (e.g. a
+/// `status` flip), so a process keeps exactly one row — and refines any placeholder row
+/// a prior pid-bearing event seeded. Refreshing `session_id` keeps a reused PID
+/// consistent with its `protocol_versions` row across sessions. The caller must have
+/// upserted the `sessions` row first (FK `agents.session_id`). `now` is the per-event
+/// timestamp the caller computed once.
+async fn upsert_roster_agent(
+    conn: &mut PgConnection,
+    info: &AgentInfo,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_UPSERT_ROSTER_AGENT)
+        .bind(i64::from(info.process_id))
+        .bind(info.agent_id.as_str())
+        .bind(info.agent_type.as_str())
+        .bind(info.color.as_str())
+        .bind(info.status.as_str())
+        .bind(session_id)
+        .bind(now)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Upserts a `protocol_versions` row for an [`AgentInfo`]'s process, enlisting in the
+/// caller's transaction via `conn` (P8-3) — the Postgres twin of the SQLite backend's
+/// `upsert_protocol_version`.
+///
+/// `version` is the roster's `protocol_version`, defaulting to `"1"` when absent;
+/// `introduced_at` is the per-event `now`. `ON CONFLICT (process_id) DO UPDATE`
+/// refreshes the row on a re-emitted roster, so a process keeps exactly one row. The
+/// caller must have upserted the `sessions` row **and** this process's `agents` row
+/// (via [`upsert_roster_agent`]) first, satisfying the `REFERENCES sessions` and
+/// `REFERENCES agents(process_id)` FKs.
+async fn upsert_protocol_version(
+    conn: &mut PgConnection,
+    info: &AgentInfo,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    let version = info.protocol_version.as_deref().unwrap_or("1");
+    sqlx::query(SQL_UPSERT_PROTOCOL_VERSION)
+        .bind(i64::from(info.process_id))
+        .bind(version)
+        .bind(session_id)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Returns a best-effort RFC3339 UTC timestamp for a TEXT timestamp column
 /// (decision-3).
 ///
@@ -543,8 +678,9 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
 
-    /// Every per-payload DML string and the shared session/agent upserts.
-    const ALL_DML: [&str; 9] = [
+    /// Every per-payload DML string, the shared session/agent upserts, and the P8-3
+    /// agent-layer writers (roster agent, protocol version, activity insert).
+    const ALL_DML: [&str; 12] = [
         SQL_INSERT_TEST_RESULT,
         SQL_UPDATE_NODE_STATUS,
         SQL_UPDATE_EDGE_HOT,
@@ -554,6 +690,9 @@ mod tests {
         SQL_DELETE_EDGE,
         SQL_UPSERT_SESSION,
         SQL_UPSERT_AGENT,
+        SQL_UPSERT_ROSTER_AGENT,
+        SQL_UPSERT_PROTOCOL_VERSION,
+        SQL_INSERT_AGENT_ACTIVITY,
     ];
 
     #[test]
@@ -603,6 +742,9 @@ mod tests {
         assert!(SQL_UPSERT_EDGE.contains("ON CONFLICT (id) DO UPDATE SET"));
         assert!(SQL_UPSERT_AGENT.contains("ON CONFLICT (process_id) DO UPDATE SET"));
         assert!(SQL_UPSERT_SESSION.contains("ON CONFLICT (session_id) DO NOTHING"));
+        // The P8-3 agent-layer upserts are keyed on process_id, too.
+        assert!(SQL_UPSERT_ROSTER_AGENT.contains("ON CONFLICT (process_id) DO UPDATE SET"));
+        assert!(SQL_UPSERT_PROTOCOL_VERSION.contains("ON CONFLICT (process_id) DO UPDATE SET"));
         for sql in ALL_DML {
             assert!(
                 !sql.contains("INSERT OR"),
@@ -656,7 +798,7 @@ mod tests {
     // module doc for the Docker run procedure.
 
     use crate::wire::{
-        Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
+        AgentInfo, Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
     };
 
     const TABLES: [&str; 7] = [
@@ -759,6 +901,64 @@ mod tests {
             edge_upsert_env(),
             hot_edge_env(),
         ]
+    }
+
+    /// Builds one [`AgentInfo`] roster row with explicit metadata (P8-3 fixtures).
+    fn agent_info(
+        pid: u32,
+        agent_id: &str,
+        agent_type: &str,
+        color: &str,
+        status: &str,
+        protocol_version: Option<&str>,
+    ) -> AgentInfo {
+        AgentInfo {
+            process_id: pid,
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            color: color.to_string(),
+            status: status.to_string(),
+            protocol_version: protocol_version.map(str::to_string),
+        }
+    }
+
+    /// Wraps a set of [`AgentInfo`] rows in an `agent.roster` envelope (P8-3 fixtures).
+    fn agent_roster_env(session: &str, agents: Vec<AgentInfo>) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::AgentRoster,
+            payload: Payload::AgentRoster {
+                session_id: session.to_string(),
+                agents,
+            },
+        }
+    }
+
+    /// Builds an `agent.activity` envelope for `agent_id`/`action`/`node_id` (P8-3).
+    fn agent_activity_env(
+        session: &str,
+        agent_id: &str,
+        action: &str,
+        node_id: &str,
+        pid: Option<u32>,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::AgentActivity,
+            payload: Payload::AgentActivity {
+                agent_id: agent_id.to_string(),
+                action: action.to_string(),
+                node_id: node_id.to_string(),
+                session_id: session.to_string(),
+                process_id: pid,
+                ts: None,
+                msg: None,
+            },
+        }
     }
 
     async fn pg_count(pool: &PgPool, table: &str) -> i64 {
@@ -920,5 +1120,146 @@ mod tests {
         .execute(&sqlite_ro)
         .await;
         assert!(sqlite_fk.is_err(), "SQLite must reject the orphan FK row");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via LATTICE_TEST_PG (Docker); run with --ignored"]
+    async fn pg_agent_layer_parity_with_sqlite() {
+        // P8-3 / AC6: the agent-layer round-trip — an `agent.roster` (two agents) plus an
+        // `agent.activity` — persists IDENTICALLY across Postgres and SQLite. Gated like
+        // `pg_parity_with_sqlite`: SKIPPED by `cargo test` (`#[ignore]`) and a no-op when
+        // `LATTICE_TEST_PG` is unset, so `just qg` is green with no Docker daemon. RED
+        // (when run with --ignored against a live PG) until P8-3 implements the writers.
+        //
+        // The roster lists pid 48590 as `inactive`, then the activity is emitted for that
+        // SAME pid: the activity arm's `upsert_agent` does `ON CONFLICT (process_id) DO
+        // UPDATE SET status = 'active'`, so an agent that emits activity becomes active
+        // (correct, §B.3) — the final assert checks 48590 flips to `active`, identically
+        // on both backends.
+        use super::super::sqlite::SqliteStore;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
+        let pg_url = match std::env::var("LATTICE_TEST_PG") {
+            Ok(u) if !u.trim().is_empty() => u,
+            _ => {
+                eprintln!("skipped: LATTICE_TEST_PG unset — Postgres agent-layer parity not run");
+                return;
+            }
+        };
+
+        // --- Postgres side: open, reset to a clean schema, persist the sequence. ---
+        let pg = PostgresStore::connect(&pg_url)
+            .await
+            .expect("connect Postgres");
+        sqlx::query(
+            "DROP TABLE IF EXISTS test_results, agent_activity, protocol_versions, nodes, edges, agents, sessions CASCADE",
+        )
+        .execute(&pg.pool)
+        .await
+        .expect("reset Postgres schema");
+        pg.ensure_schema().await.expect("pg ensure_schema");
+
+        // --- SQLite side: a fresh tempfile DB with the same schema. ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite_url = format!("sqlite://{}", dir.path().join("agent_parity.db").display());
+        let sqlite = SqliteStore::connect(&sqlite_url)
+            .await
+            .expect("connect SQLite");
+        sqlite.ensure_schema().await.expect("sqlite ensure_schema");
+
+        let envelopes = vec![
+            agent_roster_env(
+                "sess-1",
+                vec![
+                    agent_info(
+                        48213,
+                        "tdd-green",
+                        "implementation",
+                        "#2ecc71",
+                        "active",
+                        Some("1"),
+                    ),
+                    agent_info(
+                        48590,
+                        "security-scanner",
+                        "security",
+                        "#e67e22",
+                        "inactive",
+                        Some("1"),
+                    ),
+                ],
+            ),
+            agent_activity_env(
+                "sess-1",
+                "security-scanner",
+                "modified",
+                "fn:a.rs:f",
+                Some(48590),
+            ),
+        ];
+        for env in &envelopes {
+            pg.persist(env).await.expect("pg persist");
+            sqlite.persist(env).await.expect("sqlite persist");
+        }
+
+        // A second read pool over the same SQLite file, FK enforcement ON (parity).
+        let sqlite_ro = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::from_str(&sqlite_url)
+                    .expect("sqlite options")
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("sqlite read pool");
+
+        // Row-count parity across the three agent-layer tables.
+        for table in ["agents", "protocol_versions", "agent_activity"] {
+            let p = pg_count(&pg.pool, table).await;
+            let s = sqlite_count(&sqlite_ro, table).await;
+            assert_eq!(p, s, "agent-layer row-count parity mismatch for {table}");
+        }
+        assert_eq!(pg_count(&pg.pool, "agents").await, 2, "two roster agents");
+        assert_eq!(
+            pg_count(&pg.pool, "agent_activity").await,
+            1,
+            "one agent_activity row"
+        );
+        assert_eq!(
+            pg_count(&pg.pool, "protocol_versions").await,
+            2,
+            "one protocol_versions row per process"
+        );
+
+        // Real roster metadata (not the bare-pid placeholders) under Postgres.
+        let color: String = sqlx::query_scalar("SELECT color FROM agents WHERE process_id = $1")
+            .bind(48213_i64)
+            .fetch_one(&pg.pool)
+            .await
+            .expect("pg agent color");
+        assert_eq!(color, "#2ecc71", "roster color must be the real metadata");
+        // pid 48590 was rostered `inactive`, then emitted an `agent.activity`, whose
+        // `upsert_agent` flips it to `active` (`ON CONFLICT … SET status = 'active'`).
+        // Assert that correct flip — and that it is IDENTICAL across both backends.
+        let pg_status: String =
+            sqlx::query_scalar("SELECT status FROM agents WHERE process_id = $1")
+                .bind(48590_i64)
+                .fetch_one(&pg.pool)
+                .await
+                .expect("pg agent status");
+        assert_eq!(
+            pg_status, "active",
+            "an agent that emits activity becomes active"
+        );
+        let sqlite_status: String =
+            sqlx::query_scalar("SELECT status FROM agents WHERE process_id = ?")
+                .bind(48590_i64)
+                .fetch_one(&sqlite_ro)
+                .await
+                .expect("sqlite agent status");
+        assert_eq!(
+            pg_status, sqlite_status,
+            "agent status after activity must match across both backends"
+        );
     }
 }

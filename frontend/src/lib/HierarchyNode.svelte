@@ -9,7 +9,14 @@
 	a tooltip. The node is colour-coded by its live `data.status` (SPEC §9.6): the
 	`STATUS_NODE_CLASS` mapping drives the border/background (green passing, red
 	failing, pulsing running, grey stale, hatched error, neutral unknown), and a
-	`data-status` attribute exposes the raw status for tests/styling. Because
+	`data-status` attribute exposes the raw status for tests/styling. The node's
+	structural `data.type` adds a second, independent cue via `TYPE_NODE_CLASS`
+	(only `agent` nodes are styled distinctly today — a dashed violet border/ring),
+	exposed as a `data-type` attribute. Accessibility: when SvelteFlow `selected`s the
+	node (the agent → code drill-down highlight in `Graph.svelte`), the select button
+	carries `aria-current="true"` so the highlight is exposed to assistive tech; and
+	an `agent`-type node folds an "agent" qualifier into its accessible name so screen
+	readers can tell agent nodes from code nodes. Because
 	`status` is threaded straight from the store, a `test.result`/`status.update`
 	event recolours the node live. Clicking the expand button calls `data.onToggle(id)` (injected by
 	`Graph.svelte` to flip the node's id in its expansion set, requesting or
@@ -21,23 +28,26 @@
 -->
 <script lang="ts">
 	import { Handle, Position, type NodeProps, type Node as FlowNode } from '@xyflow/svelte';
-	import { STATUS_NODE_CLASS, type HierarchyNodeData } from './layout';
+	import { STATUS_NODE_CLASS, TYPE_NODE_CLASS, type HierarchyNodeData } from './layout';
 
 	/** Layout/selection data plus the toggle callback injected by `Graph.svelte`. */
 	type NodeData = HierarchyNodeData & { onToggle: (nodeId: string) => void };
 
-	let { id, data }: NodeProps<FlowNode<NodeData, 'hierarchy'>> = $props();
+	let { id, data, selected }: NodeProps<FlowNode<NodeData, 'hierarchy'>> = $props();
 </script>
 
 <div
-	class={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm text-neutral-900 shadow-sm dark:text-neutral-100 ${STATUS_NODE_CLASS[data.status]}`}
+	class={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm text-neutral-900 shadow-sm dark:text-neutral-100 ${STATUS_NODE_CLASS[data.status]} ${data.type ? TYPE_NODE_CLASS[data.type] : ''}`}
 	data-status={data.status}
+	data-type={data.type}
 	title={data.docs}
 >
 	<button
 		type="button"
 		class="nodrag flex-1 text-left"
 		data-testid={`select-${id}`}
+		aria-current={selected ? 'true' : undefined}
+		aria-label={data.type === 'agent' ? `${data.label}, agent` : undefined}
 		onclick={() => data.onSelect(id)}
 	>
 		{data.label}
