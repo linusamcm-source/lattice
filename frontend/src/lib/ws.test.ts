@@ -10,9 +10,10 @@ import {
 	requestExpand,
 	graphStore,
 	nodes,
-	edges
+	edges,
+	agents
 } from './ws';
-import type { Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
+import type { AgentInfo, Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
 
 const fileNode: Node = {
 	id: 'file:src/x.rs',
@@ -550,5 +551,202 @@ describe('applyEvent (hot_edge)', () => {
 		const before = base.edges.get(containsEdge.id)?.hot;
 		applyEvent(base, hotEdgeEnv(containsEdge.id, 'enter'));
 		expect(base.edges.get(containsEdge.id)?.hot).toBe(before);
+	});
+});
+
+// --- P8-5: agent.roster / agent.activity ingest + roster state ---
+//
+// Field names mirror the Rust serde-camelCase wire (crates/backend/src/wire.rs:
+// `Payload::AgentRoster`/`Payload::AgentActivity` + `AgentInfo`) and the
+// DATA_MODEL.md §A.5 literals exactly. RED until P8-5 adds the union arms,
+// `AgentInfo`/payload interfaces, `GraphState.agents`, the reducer branches, and
+// the derived `agents` store.
+
+const tddGreen: AgentInfo = {
+	processId: 48213,
+	agentId: 'tdd-green',
+	agentType: 'implementation',
+	color: '#2ecc71',
+	status: 'active'
+};
+
+const securityScanner: AgentInfo = {
+	processId: 48590,
+	agentId: 'security-scanner',
+	agentType: 'security',
+	color: '#e67e22',
+	status: 'inactive'
+};
+
+function agentRosterEnv(roster: AgentInfo[]): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:09.000Z',
+		sessionId: 'sess-abc123',
+		type: 'agent.roster',
+		payload: { sessionId: 'sess-abc123', agents: roster }
+	};
+}
+
+function agentActivityEnv(agentId: string, nodeId: string): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:10.000Z',
+		sessionId: 'sess-abc123',
+		type: 'agent.activity',
+		payload: {
+			agentId,
+			action: 'modified',
+			nodeId,
+			sessionId: 'sess-abc123',
+			processId: 48590
+		}
+	};
+}
+
+describe('parseEnvelope (agent.roster / agent.activity)', () => {
+	it('parses a well-formed agent.roster envelope (non-null, typed)', () => {
+		const env = parseEnvelope(JSON.stringify(agentRosterEnv([tddGreen, securityScanner])));
+		expect(env?.type).toBe('agent.roster');
+	});
+
+	it('parses a well-formed agent.activity envelope (non-null, typed)', () => {
+		const env = parseEnvelope(
+			JSON.stringify(agentActivityEnv('security-scanner', 'fn:src/auth/token.rs:verify_token'))
+		);
+		expect(env?.type).toBe('agent.activity');
+	});
+
+	it('returns null for an agent.roster missing its agents array', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'agent.roster',
+					payload: { sessionId: 'sess-abc123' }
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for an agent.activity missing a string agentId', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'agent.activity',
+					payload: {
+						action: 'modified',
+						nodeId: 'fn:src/auth/token.rs:verify_token',
+						sessionId: 'sess-abc123'
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('never throws on a malformed agent payload (returns null)', () => {
+		expect(() =>
+			parseEnvelope(
+				JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'agent.roster', payload: 5 })
+			)
+		).not.toThrow();
+		expect(
+			parseEnvelope(
+				JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'agent.roster', payload: 5 })
+			)
+		).toBeNull();
+	});
+});
+
+describe('applyEvent (agent.roster roster state)', () => {
+	it('populates GraphState.agents keyed by processId (string key)', () => {
+		const state = applyEvent(initialState(), agentRosterEnv([tddGreen, securityScanner]));
+		expect(state.agents.size).toBe(2);
+		const a = state.agents.get('48213');
+		expect(a?.agentId).toBe('tdd-green');
+		expect(a?.agentType).toBe('implementation');
+		expect(a?.color).toBe('#2ecc71');
+		expect(a?.status).toBe('active');
+	});
+
+	it('flips a process to inactive on a second roster', () => {
+		const first = applyEvent(initialState(), agentRosterEnv([tddGreen]));
+		const second = applyEvent(first, agentRosterEnv([{ ...tddGreen, status: 'inactive' }]));
+		expect(second.agents.get('48213')?.status).toBe('inactive');
+	});
+
+	it('is pure: the input agents map is unchanged and a new Map is returned', () => {
+		const first = applyEvent(initialState(), agentRosterEnv([tddGreen]));
+		const second = applyEvent(first, agentRosterEnv([{ ...tddGreen, status: 'inactive' }]));
+		expect(first.agents.get('48213')?.status).toBe('active');
+		expect(second.agents).not.toBe(first.agents);
+	});
+});
+
+describe('agents store ingest', () => {
+	it('emits the current roster after ingesting an agent.roster', () => {
+		ingest(agentRosterEnv([tddGreen, securityScanner]));
+		const roster = get(agents);
+		expect(roster.length).toBe(2);
+		expect(roster.map((a) => a.agentId)).toEqual(
+			expect.arrayContaining(['tdd-green', 'security-scanner'])
+		);
+	});
+});
+
+// Agent structure (an `agent` node + an `authored_by` edge) must ride the
+// existing node.upsert / edge.upsert channels — these stay GREEN, proving the
+// agent layer reuses the structural graph rather than a parallel store.
+
+const agentNode: Node = {
+	id: 'agent:security-scanner',
+	type: 'agent',
+	label: 'security-scanner',
+	parentId: null,
+	childIds: [],
+	status: 'running'
+};
+
+const authoredByEdge: Edge = {
+	id: 'e:security-scanner->verify_token',
+	source: agentNode.id,
+	target: 'fn:src/auth/token.rs:verify_token',
+	kind: 'authored_by',
+	hot: false
+};
+
+function edgeUpsertEnv(edge: Edge): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:11.000Z',
+		sessionId: 'sess-abc123',
+		type: 'edge.upsert',
+		payload: { edge }
+	};
+}
+
+describe('agent structure rides existing node/edge channels', () => {
+	it('folds an agent node.upsert into the nodes map (type agent)', () => {
+		const state = applyEvent(initialState(), upsertEnv(agentNode));
+		expect(state.nodes.get(agentNode.id)?.type).toBe('agent');
+	});
+
+	it('folds an authored_by edge.upsert into the edges map', () => {
+		const state = applyEvent(initialState(), edgeUpsertEnv(authoredByEdge));
+		expect(state.edges.get(authoredByEdge.id)?.kind).toBe('authored_by');
+	});
+
+	it('exposes the agent node and authored_by edge through the derived stores', () => {
+		ingest(upsertEnv(agentNode));
+		ingest(edgeUpsertEnv(authoredByEdge));
+		expect(get(nodes).some((n) => n.id === agentNode.id && n.type === 'agent')).toBe(true);
+		expect(get(edges).some((e) => e.id === authoredByEdge.id && e.kind === 'authored_by')).toBe(
+			true
+		);
 	});
 });
