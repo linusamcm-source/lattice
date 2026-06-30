@@ -168,6 +168,46 @@ Phase 5 surfaces each node's live `NodeStatus` as colour on the canvas (SPEC §9
   failing event flows store → `buildHierarchy` → `HierarchyNode` and recolours the
   rendered node automatically — no store wiring beyond the status thread.
 
+## Agent layer (P8-6)
+
+Phase 8 surfaces the tracked-agent layer behind an **Agent layer** toggle in the
+canvas edge fieldset (default off, like the others).
+
+- **Agent nodes.** `buildHierarchy(graphNodes, expanded, onSelect, showAgents)`
+  (`src/lib/layout.ts`) takes a fourth `showAgents` flag: off (default) it
+  pre-filters `type === 'agent'` nodes out of the hierarchy entirely; on, it
+  includes them. Each node's `type` is threaded into its layout `data`, and
+  `HierarchyNode.svelte` applies `TYPE_NODE_CLASS[data.type]` on top of the status
+  colour — only `agent` nodes are styled distinctly today (a dashed violet
+  border/ring), exposed as a `data-type` attribute.
+- **`authored_by` edges.** `flowClassOf` maps `authored_by` to the `agent` flow
+  class, and `buildEdges` draws those edges (violet stroke, `lattice-edge-agent`)
+  only when the optional `filter.agent` flag is on **and** both endpoints are
+  visible. The flag is optional and defaults off, so the control/data-flow toggles
+  keep working unchanged.
+- **Roster.** `RosterPanel.svelte` lists the live roster (`$agents`) beside the
+  selection sidebar, collapsing the per-`processId` rows to **one entry per
+  distinct `agentId`** (active iff any of its processes is active). Each entry is a
+  button with `data-testid="agent-<id>"` / `data-active`, and clicking it fires
+  `onSelect(agentId)`. Liveness is **not colour-only**: the entry's accessible name
+  folds in `active`/`inactive` (`aria-label`) and the status indicator is a shape
+  cue (filled dot vs hollow ring). A polite `role="status"` live region announces
+  agents entering/leaving the active set and the drill-down highlight count.
+- **Bidirectional drill-down.** The backend (P8-2) emits `authored_by` as
+  **code-node `source` → agent `target`**. Clicking a roster entry sets
+  `selectedAgentId`; `nodesAuthoredBy($edges, agentId)` (matching `edge.target` on
+  the agent, collecting `edge.source`) then `selected`-flags the agent's authored
+  nodes on the canvas — `HierarchyNode` exposes that flag as `aria-current`.
+  Clicking a node surfaces its authoring agent in the roster via
+  `agentsForNode($edges, nodeId)`, or clears the highlight when the node has no
+  author; toggling the agent layer off also clears it.
+- **Security.** An agent's wire-provided `color` is **never** bound raw into a
+  `style`: `safeColor` (`src/lib/layout.ts`) allows only `#hex` (3/6/8) and
+  `rgb()`/`rgba()` through unchanged and returns `null` for anything else (a
+  CSS-injection payload, `url(...)`, `javascript:`, `expression(...)`). The panel
+  binds only the sanitised value as the `--agent-color` custom property, falling
+  back to a neutral token when rejected — closing the deferred P8-5 XSS.
+
 ## Notes
 
 - Coverage uses the v8 provider and emits `coverage/coverage-final.json`
