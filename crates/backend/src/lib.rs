@@ -54,6 +54,15 @@
 //!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
 //!   through [`graph::Graph::apply_clv`] into live node colour, broadcasting the
 //!   resulting patch [`wire::EventEnvelope`]s to connected clients.
+//! - [`storage`] — the Phase-7 persistence seam (`DATA_MODEL.md` §B): a single
+//!   async [`storage::Storage`] trait write-throughs the structured CLV
+//!   [`wire::EventEnvelope`] stream to one of two interchangeable `sqlx` backends —
+//!   SQLite or Postgres — selected by the `LATTICE_DB_URL` scheme
+//!   ([`storage::backend_for_url`] / [`storage::open_store`]). Persistence is
+//!   **opt-in** (no `LATTICE_DB_URL` ⇒ no database) and **write-through**: the
+//!   in-memory [`graph::Graph`] stays the live source of truth for snapshots and
+//!   subtrees; storage only records history, and only structured events (never raw
+//!   stdout, §B.5).
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
@@ -73,6 +82,7 @@ pub mod clv;
 pub mod collector;
 pub mod graph;
 pub mod parser;
+pub mod storage;
 pub mod tracing_layer;
 pub mod watcher;
 pub mod wire;

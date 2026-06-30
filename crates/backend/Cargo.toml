@@ -40,6 +40,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "registry",
     "std",
 ] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "postgres",
+] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
