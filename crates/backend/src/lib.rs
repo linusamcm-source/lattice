@@ -38,6 +38,17 @@
 //!   `test.result`/`status.update`/`hot_edge` envelope. An unknown node/edge id, an
 //!   unparsable hot-edge state, a no-change heat transition, or an `activity` event
 //!   is a no-op.
+//! - [`tracing_layer`] — the Phase-6 runtime tracing emitter (the *write* side of
+//!   the hot-edge seam): [`tracing_layer::HotEdgeLayer`] is a `tracing` layer that
+//!   records an `edge` field off each span and emits a throttled `#CLV1` `hotedge`
+//!   `enter`/`exit` line on span enter/close, round-tripping through
+//!   [`clv::parse_clv_line`]. Its pure [`tracing_layer::HotEdgeThrottle`] caps
+//!   emissions per edge per fixed time window — with independent `enter`/`exit`
+//!   sub-budgets so a terminal exit is never starved — so a hot loop cannot flood
+//!   the collector. **Transport decision:** the line-based `#CLV1` stdout/sink
+//!   transport is kept — no dedicated binary channel — *because* this time-windowed
+//!   throttle bounds the per-edge line rate (`enter_cap + exit_cap` per window); the
+//!   evidence is the `throttle_bounds_emissions_per_window` throughput-bound test.
 //! - [`collector`] — the Phase-5 CLV collector ([`collector::collect`]): a `tokio`
 //!   task that tails `<root>/.lattice/clv.ndjson`, parses each newly appended line
 //!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
@@ -62,6 +73,7 @@ pub mod clv;
 pub mod collector;
 pub mod graph;
 pub mod parser;
+pub mod tracing_layer;
 pub mod watcher;
 pub mod wire;
 pub mod ws;
