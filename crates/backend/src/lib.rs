@@ -10,6 +10,11 @@
 //!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`] / the
 //!   kind-qualified [`wire::typed_edge_id`]) that mirror
 //!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
+//! - [`clv`] — the read side of the `AGENT_PROTOCOL.md` §2 CLV line protocol:
+//!   [`clv::parse_clv_line`] decodes one `#CLV1`-tagged stdout line into a typed
+//!   [`clv::ClvEvent`] (`activity`/`test`/`status`/`hotedge`), returning [`None`]
+//!   panic-free for any untagged, non-JSON, or malformed line (the
+//!   ignore-malformed contract).
 //! - [`parser`] — source parsers that lower a single file to the structural
 //!   [`wire::Node`]/[`wire::Edge`] graph contribution. [`parser::parse_source`] is
 //!   the entry point, dispatching on file extension: `syn` for Rust
@@ -40,6 +45,7 @@
 //!   updates a connected client's graph live.
 
 pub mod app;
+pub mod clv;
 pub mod graph;
 pub mod parser;
 pub mod watcher;
