@@ -18,14 +18,17 @@
 //! Story P7-1 laid the contract: the [`Storage`] trait, the [`StorageError`] type,
 //! the [`Backend`] scheme classifier ([`backend_for_url`]), and the [`open_store`]
 //! factory. Story P7-2 adds the **live SQLite backend** in the [`sqlite`] submodule
-//! ([`sqlite::SqliteStore`]) and wires it into [`open_store`]'s `sqlite:` arm; the
-//! Postgres twin (P7-3) still returns a [`StorageError::Config`] rather than
-//! panicking until implemented.
+//! ([`sqlite::SqliteStore`]) and wires it into [`open_store`]'s `sqlite:` arm. Story
+//! P7-3 adds the **live Postgres backend** in the [`postgres`] submodule
+//! ([`postgres::PostgresStore`]) — the SQLite twin in Postgres dialect (`$N` binds,
+//! `BIGINT`/`BOOLEAN`, `ON CONFLICT` upserts) — and wires it into [`open_store`]'s
+//! `postgres:`/`postgresql:` arm; both arms now open a live store.
 //!
 //! The backends use `sqlx`'s **runtime** query API (not the compile-time `query!`
 //! macro), so the build and `just qg` stay hermetic — no `DATABASE_URL` and no live
 //! database are required to compile or test.
 
+mod postgres;
 mod sqlite;
 
 use crate::wire::EventEnvelope;
@@ -155,18 +158,18 @@ pub trait Storage: Send + Sync {
 /// Dispatches on [`backend_for_url`]: a `sqlite:` URL opens the **live** SQLite
 /// backend ([`sqlite::SqliteStore`], story P7-2) — connecting the pool with
 /// `PRAGMA foreign_keys = ON` and creating the database file if missing — while a
-/// `postgres:`/`postgresql:` URL is not yet implemented (story P7-3) and returns a
-/// [`StorageError::Config`] rather than panicking. Opening does **not** create the
-/// schema; the caller invokes [`Storage::ensure_schema`] (and
-/// [`Storage::record_session`]) once after opening. A connect failure surfaces as a
-/// [`StorageError::Db`]; an unknown or malformed scheme propagates the
-/// [`backend_for_url`] error.
+/// `postgres:`/`postgresql:` URL opens the **live** Postgres backend
+/// ([`postgres::PostgresStore`], story P7-3), connecting a `PgPool` (plaintext only —
+/// `sqlx` is built with no TLS feature, so point at an `sslmode=disable` server).
+/// Opening does **not** create the schema; the caller invokes
+/// [`Storage::ensure_schema`] (and [`Storage::record_session`]) once after opening. A
+/// connect failure (e.g. an unreachable Postgres host) surfaces as a
+/// [`StorageError::Db`] rather than panicking; an unknown or malformed scheme
+/// propagates the [`backend_for_url`] error.
 pub async fn open_store(url: &str) -> Result<Box<dyn Storage + Send + Sync>, StorageError> {
     match backend_for_url(url)? {
         Backend::Sqlite => Ok(Box::new(sqlite::SqliteStore::connect(url).await?)),
-        Backend::Postgres => Err(StorageError::Config(
-            "postgres backend not yet implemented (Phase 7 story P7-3)".to_string(),
-        )),
+        Backend::Postgres => Ok(Box::new(postgres::PostgresStore::connect(url).await?)),
     }
 }
 
@@ -228,12 +231,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_store_postgres_arm_still_returns_config_error() {
-        // The Postgres arm must error (not panic) until P7-3 lands.
-        match open_store("postgres://u@h/db").await {
-            Err(StorageError::Config(_)) => {}
-            Ok(_) => panic!("postgres unexpectedly opened a store"),
-            Err(other) => panic!("expected Config err, got {other:?}"),
+    async fn open_store_postgres_arm_dispatches_to_live_backend() {
+        // P7-3: the Postgres arm is live — it dispatches to PostgresStore::connect
+        // (no longer the Config stub). Connecting to a refused port (127.0.0.1:1, no
+        // DNS) returns a Db error, never a panic and never a Config error.
+        match open_store("postgres://lattice:lattice@127.0.0.1:1/lattice").await {
+            Err(StorageError::Db(_)) => {}
+            Err(StorageError::Config(msg)) => panic!("postgres arm still stubbed: {msg}"),
+            Ok(_) => panic!("unexpectedly connected to an unreachable postgres"),
         }
     }
 
