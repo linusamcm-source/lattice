@@ -19,6 +19,14 @@
 	**Control flow** (`calls`) and **Data flow** (`param_source`/`data_flows_from`),
 	both default on — include/exclude each edge class; `contains` is never drawn.
 
+	P6-4 renders hot edges: an edge whose store `hot` flag is true (a live runtime
+	call path, flipped by `hot_edge` events) gains a dedicated `hot-edge` overlay
+	(red pulse, `app.css`) on top of its kind colour. Because the flow edges are
+	rebuilt from the `edges` store, this needs no extra wiring here — `buildEdges`
+	appends the class and the canvas recolours. Hot is independent of the data-flow
+	`animated` dash cue and of the control/data-flow toggles: a filtered-out edge
+	stays hidden even when hot, and the overlay reverts the moment it goes cold.
+
 	@component
 -->
 <script lang="ts">

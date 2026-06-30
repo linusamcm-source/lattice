@@ -14,6 +14,12 @@
  * the canvas until the function is drilled into, even when they already live in
  * the store.
  *
+ * Edges are projected by {@link buildEdges}: each visible CLV {@link Edge}
+ * becomes a SvelteFlow edge coloured by flow class, with data-flow edges
+ * carrying the `animated` dash cue. A **hot** edge (live runtime call path)
+ * additionally gains a dedicated `hot-edge` class for the red pulse overlay
+ * (`app.css`) — a separate cue that never disturbs the `animated` flag.
+ *
  * @module
  */
 
@@ -204,6 +210,14 @@ export type HierarchyEdgeData = {
 	kind: EdgeKind;
 	/** Which toggle class the edge belongs to. */
 	flowClass: EdgeFlowClass;
+	/**
+	 * Whether the edge is on the live runtime stack (the CLV {@link Edge.hot} flag,
+	 * toggled by `hot_edge` events). When `true` the built edge also carries the
+	 * dedicated `hot-edge` class for the hot overlay; mirroring it here lets tests
+	 * and any custom edge component read hot without re-parsing the `class` string.
+	 * This is a **dedicated** cue, independent of the data-flow `animated` flag.
+	 */
+	hot: boolean;
 };
 
 /** A SvelteFlow edge carrying its {@link HierarchyEdgeData} flow-class marker. */
@@ -244,6 +258,15 @@ function flowClassOf(kind: EdgeKind): EdgeFlowClass | null {
  * utility, `animated` for data flow (a non-colour cue), and a typed
  * {@link HierarchyEdgeData} `data` block.
  *
+ * A **hot** edge (CLV {@link Edge.hot} true — a live runtime call path, set by
+ * `hot_edge` events) additionally gets the dedicated `hot-edge` class **appended
+ * to** its kind colour class (so it keeps that colour and gains the red pulse
+ * overlay defined in `app.css`) and `data.hot === true`. Hot is a **separate**
+ * cue: it never touches `animated` (a cold data-flow edge stays `animated`, a
+ * cold control-flow edge stays not, and hot changes neither) and it never
+ * bypasses the visibility / toggle gates above — a filtered-out edge stays out
+ * even when hot. The overlay reverts the instant the edge goes cold.
+ *
  * @param graphEdges - all current CLV edges from the `edges` store.
  * @param visibleNodeIds - ids of the nodes currently on the canvas (the zoom gate).
  * @param filter - the control-/data-flow toggle state.
@@ -263,16 +286,20 @@ export function buildEdges(
 		if (flowClass === 'data' && !filter.dataFlow) continue;
 		if (!visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target)) continue;
 
+		const kindClass =
+			flowClass === 'control'
+				? 'lattice-edge-control [&_path]:stroke-sky-500'
+				: 'lattice-edge-data [&_path]:stroke-amber-500';
+
 		flow.push({
 			id: edge.id,
 			source: edge.source,
 			target: edge.target,
+			// Data flow keeps its `animated` dash cue; `hot` deliberately never
+			// touches this — the hot overlay is the dedicated `hot-edge` class below.
 			animated: flowClass === 'data',
-			class:
-				flowClass === 'control'
-					? 'lattice-edge-control [&_path]:stroke-sky-500'
-					: 'lattice-edge-data [&_path]:stroke-amber-500',
-			data: { kind: edge.kind, flowClass }
+			class: edge.hot ? `${kindClass} hot-edge` : kindClass,
+			data: { kind: edge.kind, flowClass, hot: edge.hot }
 		});
 	}
 
