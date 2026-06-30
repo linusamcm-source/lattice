@@ -1,6 +1,6 @@
 # team-sprint configuration for the Lattice build.
 # Stories execute in isolated git worktrees and merge back to `main`.
-plan_path: docs/sprints/phase-7-storage.md
+plan_path: docs/sprints/phase-8-agent-layer.md
 target_branch: main
 coverage_threshold: 90
 coverage_mode: new
