@@ -31,6 +31,10 @@
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
 //!   `node.*`/`edge.*` patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
+//!   [`graph::Graph::apply_clv`] (Phase 5) folds a correlated
+//!   [`clv::ClvEvent`] `test`/`status` event onto the target node's
+//!   [`wire::NodeStatus`] colour, emitting the matching `test.result`/`status.update`
+//!   envelope (an unknown node id, or an `activity`/`hotedge` event, is a no-op).
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts

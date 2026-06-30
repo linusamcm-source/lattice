@@ -6,12 +6,17 @@
 //! parser output into the [`EventEnvelope`](crate::wire::EventEnvelope) stream a
 //! WebSocket client consumes.
 //!
-//! Two write paths exist. [`Graph::upsert_node`]/[`Graph::upsert_edge`] are raw
+//! Three write paths exist. [`Graph::upsert_node`]/[`Graph::upsert_edge`] are raw
 //! insert-or-update-by-id mutators. [`Graph::apply_parsed`] is the higher-level
-//! path: it diffs a file's previous contribution against a fresh
+//! structural path: it diffs a file's previous contribution against a fresh
 //! [`ParsedFile`](crate::parser::ParsedFile) and emits `node.upsert`/`edge.upsert`
 //! for added-or-changed elements and `node.remove`/`edge.remove` for elements that
 //! vanished from that file, so re-applying an identical parse is a no-op.
+//! [`Graph::apply_clv`] (Phase 5) is the colour path: it maps a correlated
+//! [`ClvEvent`](crate::clv::ClvEvent) `test`/`status` event onto the target node's
+//! [`NodeStatus`](crate::wire::NodeStatus) and emits the matching
+//! `test.result`/`status.update` envelope (an unknown node id, or an `activity`/
+//! `hotedge` event, is a no-op).
 //!
 //! Reads are lazy (Phase 1). [`Graph::snapshot`] renders only the **root** tier
 //! (file nodes and the edges among them) for a freshly connected client; deeper
@@ -24,8 +29,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
-use crate::wire::{Edge, EdgeKind, EventEnvelope, EventType, Node, NodeType, Payload};
+use crate::wire::{
+    Edge, EdgeKind, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload, TestOutcome,
+};
 
 /// CLV protocol version stamped on every envelope this graph emits.
 const PROTOCOL_VERSION: u32 = 1;
@@ -223,6 +231,81 @@ impl Graph {
         events
     }
 
+    /// Applies one correlated CLV event onto a node's colour and emits its patch.
+    ///
+    /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live
+    /// [`NodeStatus`](crate::wire::NodeStatus) of the node it targets:
+    /// - [`ClvEvent::Test`] / [`ClvEvent::Status`]: when the event's `node` id is a
+    ///   known node, its stored [`Node::status`] is set from the event `outcome`
+    ///   ([`TestOutcome::Fail`]→`Failing`, [`TestOutcome::Pass`]→`Passing`,
+    ///   [`TestOutcome::Skip`]→`Stale`, [`TestOutcome::Running`]→`Running`) so a later
+    ///   [`Graph::snapshot`]/[`Graph::subtree`] reflects the colour, and the method
+    ///   returns `Some` of a `test.result` / `status.update` [`EventEnvelope`]
+    ///   (stamped via [`Graph::envelope`], exactly like [`Graph::apply_parsed`]) for
+    ///   the WebSocket layer to broadcast.
+    /// - **Absent node:** a `Test`/`Status` event whose `node` id is *not* in the
+    ///   graph returns [`None`] and mutates nothing (the emitter-↔-graph node-id
+    ///   contract; an out-of-graph id is ignored, never an error).
+    /// - [`ClvEvent::Activity`] / [`ClvEvent::HotEdge`]: return [`None`] and change no
+    ///   colour — `activity` attribution is the Phase-8 agent layer (no `NodeStatus`
+    ///   "touched" state) and `hotedge` is the Phase-6 runtime tracer, so both are
+    ///   parsed and correlated but are no-ops for node colour here.
+    ///
+    /// Only [`Node::status`] is touched; the file-contribution bookkeeping
+    /// ([`Graph::apply_parsed`] relies on) is left intact, so colouring a node then
+    /// re-parsing its source keeps the structural diff correct. Panic-free.
+    pub fn apply_clv(&mut self, event: &ClvEvent) -> Option<EventEnvelope> {
+        match event {
+            ClvEvent::Test {
+                node,
+                outcome,
+                session,
+                pid,
+                agent,
+                msg,
+                duration_ms,
+            } => {
+                let status = status_from_outcome(*outcome);
+                self.nodes.get_mut(node)?.status = status;
+                Some(self.envelope(
+                    EventType::TestResult,
+                    Payload::TestResult {
+                        node_id: node.clone(),
+                        test_id: node.clone(),
+                        outcome: *outcome,
+                        duration_ms: *duration_ms,
+                        session_id: session.clone(),
+                        agent_id: agent.clone(),
+                        process_id: *pid,
+                        message: msg.clone(),
+                    },
+                ))
+            }
+            ClvEvent::Status {
+                node,
+                outcome,
+                session,
+                pid,
+                agent,
+                ..
+            } => {
+                let status = status_from_outcome(*outcome);
+                self.nodes.get_mut(node)?.status = status;
+                Some(self.envelope(
+                    EventType::StatusUpdate,
+                    Payload::StatusUpdate {
+                        node_id: node.clone(),
+                        status,
+                        session_id: session.clone(),
+                        agent_id: agent.clone(),
+                        process_id: *pid,
+                    },
+                ))
+            }
+            ClvEvent::Activity { .. } | ClvEvent::HotEdge { .. } => None,
+        }
+    }
+
     /// Wraps `payload` in an [`EventEnvelope`] stamped with this graph's session.
     fn envelope(&self, event_type: EventType, payload: Payload) -> EventEnvelope {
         EventEnvelope {
@@ -232,6 +315,21 @@ impl Graph {
             event_type,
             payload,
         }
+    }
+}
+
+/// Maps a CLV `outcome` word onto the [`NodeStatus`] colour it sets.
+///
+/// Shared by the [`ClvEvent::Test`] and [`ClvEvent::Status`] arms of
+/// [`Graph::apply_clv`]: [`TestOutcome::Fail`]→[`NodeStatus::Failing`],
+/// [`TestOutcome::Pass`]→[`NodeStatus::Passing`], [`TestOutcome::Skip`]→
+/// [`NodeStatus::Stale`], [`TestOutcome::Running`]→[`NodeStatus::Running`].
+fn status_from_outcome(outcome: TestOutcome) -> NodeStatus {
+    match outcome {
+        TestOutcome::Pass => NodeStatus::Passing,
+        TestOutcome::Fail => NodeStatus::Failing,
+        TestOutcome::Skip => NodeStatus::Stale,
+        TestOutcome::Running => NodeStatus::Running,
     }
 }
 
@@ -267,9 +365,11 @@ fn rfc3339_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::Graph;
+    use crate::clv::ClvEvent;
     use crate::parser::parse_rust_source;
     use crate::wire::{
         edge_id, node_id, Edge, EventEnvelope, EventType, Node, NodeStatus, NodeType, Payload,
+        TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -456,5 +556,180 @@ mod tests {
 
         let events = graph.apply_parsed(parsed);
         assert!(events.is_empty(), "idempotent re-apply, got {events:?}");
+    }
+
+    /// Seeds a graph from one Rust function so `fn:a.rs:f` exists with status
+    /// [`NodeStatus::Unknown`], mirroring how the other tests build a graph.
+    fn graph_with_function() -> Graph {
+        let mut graph = Graph::new();
+        let _ = graph.apply_parsed(parse_rust_source("a.rs", "fn f() {}"));
+        graph
+    }
+
+    fn test_event(node: &str, outcome: TestOutcome) -> ClvEvent {
+        ClvEvent::Test {
+            session: "s1".to_string(),
+            pid: None,
+            agent: None,
+            msg: None,
+            node: node.to_string(),
+            outcome,
+            duration_ms: None,
+        }
+    }
+
+    fn status_event(node: &str, outcome: TestOutcome) -> ClvEvent {
+        ClvEvent::Status {
+            session: "s1".to_string(),
+            pid: None,
+            agent: None,
+            msg: None,
+            node: node.to_string(),
+            outcome,
+        }
+    }
+
+    /// Reads the stored status of a direct child of `file:a.rs` via the public
+    /// lazy-children path, proving a later `subtree` reflects the colour.
+    fn child_status(graph: &Graph, id: &str) -> Option<NodeStatus> {
+        graph
+            .children_of("file:a.rs")
+            .0
+            .into_iter()
+            .find(|n| n.id == id)
+            .map(|n| n.status)
+    }
+
+    #[test]
+    fn apply_clv_test_fail_colours_node_failing_and_returns_test_result() {
+        let mut graph = graph_with_function();
+        let env = graph
+            .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Fail))
+            .expect("test event for an existing node returns an envelope");
+
+        assert_eq!(env.event_type, EventType::TestResult);
+        match &env.payload {
+            Payload::TestResult { node_id, .. } => assert_eq!(node_id, "fn:a.rs:f"),
+            other => panic!("expected TestResult payload, got {other:?}"),
+        }
+        assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Failing));
+    }
+
+    #[test]
+    fn apply_clv_test_pass_flips_stored_status_to_passing() {
+        let mut graph = graph_with_function();
+        let _ = graph.apply_clv(&test_event("fn:a.rs:f", TestOutcome::Fail));
+
+        let env = graph
+            .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Pass))
+            .expect("test event for an existing node returns an envelope");
+        assert_eq!(env.event_type, EventType::TestResult);
+        assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Passing));
+    }
+
+    #[test]
+    fn apply_clv_test_skip_colours_node_stale() {
+        let mut graph = graph_with_function();
+        let env = graph
+            .apply_clv(&test_event("fn:a.rs:f", TestOutcome::Skip))
+            .expect("test event for an existing node returns an envelope");
+        assert_eq!(env.event_type, EventType::TestResult);
+        assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Stale));
+    }
+
+    #[test]
+    fn apply_clv_status_running_sets_running_and_returns_status_update() {
+        let mut graph = graph_with_function();
+        let env = graph
+            .apply_clv(&status_event("fn:a.rs:f", TestOutcome::Running))
+            .expect("status event for an existing node returns an envelope");
+
+        assert_eq!(env.event_type, EventType::StatusUpdate);
+        match &env.payload {
+            Payload::StatusUpdate {
+                node_id, status, ..
+            } => {
+                assert_eq!(node_id, "fn:a.rs:f");
+                assert_eq!(*status, NodeStatus::Running);
+            }
+            other => panic!("expected StatusUpdate payload, got {other:?}"),
+        }
+        assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Running));
+    }
+
+    #[test]
+    fn apply_clv_absent_node_returns_none_and_leaves_graph_unchanged() {
+        let mut graph = graph_with_function();
+        let before = graph.nodes.clone();
+
+        let result = graph.apply_clv(&test_event("fn:does.not.exist", TestOutcome::Fail));
+        assert!(result.is_none(), "absent node must yield None");
+        assert_eq!(
+            graph.nodes, before,
+            "graph must be untouched for an absent node"
+        );
+
+        // The same contract holds for a status event.
+        let result = graph.apply_clv(&status_event("fn:does.not.exist", TestOutcome::Running));
+        assert!(result.is_none(), "absent node must yield None for status");
+        assert_eq!(
+            graph.nodes, before,
+            "graph must be untouched for an absent node"
+        );
+    }
+
+    #[test]
+    fn apply_clv_activity_is_a_noop_for_colour() {
+        let mut graph = graph_with_function();
+        let before = graph.nodes.clone();
+
+        let result = graph.apply_clv(&ClvEvent::Activity {
+            session: "s1".to_string(),
+            pid: None,
+            agent: None,
+            msg: None,
+            node: "fn:a.rs:f".to_string(),
+            action: "modified".to_string(),
+        });
+        assert!(result.is_none(), "activity must yield None");
+        assert_eq!(graph.nodes, before, "activity must not change node colour");
+        assert_eq!(child_status(&graph, "fn:a.rs:f"), Some(NodeStatus::Unknown));
+    }
+
+    #[test]
+    fn apply_clv_hotedge_is_a_noop_for_colour() {
+        let mut graph = graph_with_function();
+        let before = graph.nodes.clone();
+
+        let result = graph.apply_clv(&ClvEvent::HotEdge {
+            session: "s1".to_string(),
+            pid: None,
+            agent: None,
+            msg: None,
+            edge: "e:a->b".to_string(),
+            state: "enter".to_string(),
+        });
+        assert!(result.is_none(), "hotedge must yield None");
+        assert_eq!(graph.nodes, before, "hotedge must not change node colour");
+    }
+
+    #[test]
+    fn colouring_a_node_then_reparsing_same_source_keeps_structure() {
+        let mut graph = graph_with_function();
+        let _ = graph.apply_clv(&test_event("fn:a.rs:f", TestOutcome::Fail));
+
+        // Re-parsing the identical source must keep the structural graph intact.
+        let _ = graph.apply_parsed(parse_rust_source("a.rs", "fn f() {}"));
+
+        let roots = snapshot_nodes(&graph.snapshot());
+        assert!(
+            roots.iter().any(|n| n.id == "file:a.rs"),
+            "root file node must survive a re-parse: {roots:?}"
+        );
+        let (children, _) = graph.children_of("file:a.rs");
+        assert!(
+            children.iter().any(|n| n.id == "fn:a.rs:f"),
+            "function child must survive a re-parse: {children:?}"
+        );
     }
 }
