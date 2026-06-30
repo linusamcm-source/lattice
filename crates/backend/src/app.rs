@@ -13,7 +13,17 @@
 //! `<root>/.lattice/clv.ndjson` and folds each correlated `test`/`status` event
 //! onto its node's colour — so a failing test reddens its node within ~1s on the
 //! same live graph the watcher feeds. [`RunHandle::shutdown`] aborts the watcher,
-//! the pump, and the collector.
+//! the pump, the collector, and the optional persistence task.
+//!
+//! Persistence is an **opt-in, best-effort write-through** (Phase 7,
+//! `DATA_MODEL.md` §B): set `LATTICE_DB_URL` and [`run`] also subscribes a task that
+//! durably records the structured event stream to that database via
+//! [`crate::storage`]; unset, the backend runs exactly as before. The store is
+//! observability rather than a hard dependency, so a storage failure (bad URL,
+//! unreachable DB, schema error, per-event write error) is logged and **degrades
+//! gracefully** — the watch/WS/collector path is never failed or interrupted by it.
+//! Tests drive [`run_with_db_url`] to pass an explicit URL without the process-global
+//! env var.
 //!
 //! File paths are normalised to repo-relative form (matching `DATA_MODEL.md` §A.1
 //! ids such as `fn:a.rs:alpha`) by stripping the **canonicalised** repository
@@ -31,6 +41,7 @@ use walkdir::WalkDir;
 use crate::collector::collect;
 use crate::graph::Graph;
 use crate::parser::parse_source;
+use crate::storage::open_store;
 use crate::watcher::{is_source_file, watch};
 use crate::wire::EventEnvelope;
 use crate::ws::{serve, BoundServer};
@@ -38,10 +49,19 @@ use crate::ws::{serve, BoundServer};
 /// Capacity of the broadcast channel fanning patch events out to WS clients.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Session id recorded for a single local run's `sessions` row when persistence is
+/// enabled (`DATA_MODEL.md` §B.6). Matches the [`Graph`] default session id
+/// (`"sess-local"`) so the run's `sessions` row aligns with the in-memory graph.
+const RUN_SESSION_ID: &str = "sess-local";
+
 /// A running Lattice backend: the WebSocket server plus the watcher pump.
 ///
 /// Holds the bound server [`addr`](RunHandle::addr) (read it to connect) and the
 /// background tasks. [`RunHandle::shutdown`] stops the server and the watcher.
+/// `store_task` is the optional opt-in persistence task: it is [`Some`] only when a
+/// `LATTICE_DB_URL` was provided **and** the store opened and applied its schema
+/// successfully ([`run_with_db_url`]); it is [`None`] when persistence is disabled
+/// or storage failed to initialise (graceful degradation).
 pub struct RunHandle {
     /// The address the WebSocket server is listening on.
     pub addr: SocketAddr,
@@ -49,16 +69,20 @@ pub struct RunHandle {
     watcher_task: JoinHandle<()>,
     pump_task: JoinHandle<()>,
     collector_task: JoinHandle<()>,
+    store_task: Option<JoinHandle<()>>,
 }
 
 impl RunHandle {
-    /// Stops the WebSocket server, the watcher pump, and the CLV collector and
-    /// waits for teardown.
+    /// Stops the WebSocket server, the watcher pump, the CLV collector, and (when
+    /// present) the persistence task, and waits for teardown.
     pub async fn shutdown(self) {
         self.server.shutdown().await;
         self.watcher_task.abort();
         self.pump_task.abort();
         self.collector_task.abort();
+        if let Some(store_task) = self.store_task {
+            store_task.abort();
+        }
     }
 }
 
@@ -115,19 +139,109 @@ pub fn resolve_listen_addr(raw: Option<&str>) -> Result<SocketAddr, String> {
 
 /// Starts the Lattice backend against `root`, listening on `addr`.
 ///
-/// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
-/// or TypeScript) into a fresh [`Graph`], starts the WebSocket [`serve`]r, and
-/// spawns a watcher pump that
-/// re-parses changed files and broadcasts their patch events. Pass `127.0.0.1:0`
-/// for an ephemeral port and read [`RunHandle::addr`] back.
+/// Thin wrapper over [`run_with_db_url`] that reads the persistence target from the
+/// `LATTICE_DB_URL` environment variable: when it is **set**, the run additionally
+/// durably records the structured CLV event stream to that database (opt-in and
+/// best-effort — see [`run_with_db_url`]); when it is **unset**, the backend behaves
+/// exactly as before, with no database. Pass `127.0.0.1:0` for an ephemeral port and
+/// read [`RunHandle::addr`] back.
 ///
 /// # Errors
 /// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
-/// cannot bind to `addr`.
+/// cannot bind to `addr`. A storage problem never fails the run — it degrades to no
+/// persistence (see [`run_with_db_url`]).
 pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> {
+    run_with_db_url(root, addr, std::env::var("LATTICE_DB_URL").ok()).await
+}
+
+/// Starts the Lattice backend against `root` on `addr`, optionally write-through
+/// persisting the structured event stream to `db_url`.
+///
+/// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
+/// or TypeScript) into a fresh [`Graph`], starts the WebSocket [`serve`]r, and spawns
+/// the watcher pump (re-parses changed files, broadcasting their patch events) and
+/// the CLV [`collect`]or.
+///
+/// When `db_url` is [`Some`], a **best-effort** persistence task is additionally
+/// spawned: it [`open_store`]s the backend selected by the URL scheme, applies the
+/// schema ([`ensure_schema`](crate::storage::Storage::ensure_schema)), records the
+/// run's `sessions` row ([`record_session`](crate::storage::Storage::record_session)
+/// keyed by [`RUN_SESSION_ID`]), then subscribes to the broadcast channel and
+/// write-throughs every structured [`EventEnvelope`] via
+/// [`persist`](crate::storage::Storage::persist). Only structured events flow on that
+/// channel, so raw/untagged stdout is never persisted (`DATA_MODEL.md` §B.5). When
+/// `db_url` is [`None`] the backend runs with no database, identical to before this
+/// story.
+///
+/// # Graceful degradation
+/// Storage is observability, not a hard dependency, so it must never take down the
+/// watch/WS/collector path. If [`open_store`] or
+/// [`ensure_schema`](crate::storage::Storage::ensure_schema) fails, the failure is
+/// logged to stderr and the run continues **without** persistence
+/// ([`RunHandle::store_task`](RunHandle) is [`None`]). A per-event
+/// [`persist`](crate::storage::Storage::persist) error is likewise logged and
+/// skipped — the persistence task never panics and keeps consuming the channel.
+///
+/// # Errors
+/// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
+/// cannot bind to `addr`. A storage problem is *not* an error here — it degrades to
+/// no persistence as described above.
+pub async fn run_with_db_url(
+    root: PathBuf,
+    addr: SocketAddr,
+    db_url: Option<String>,
+) -> std::io::Result<RunHandle> {
     let root = std::fs::canonicalize(&root)?;
     let graph = Arc::new(Mutex::new(Graph::new()));
     let (events_tx, _) = broadcast::channel::<EventEnvelope>(EVENT_CHANNEL_CAPACITY);
+
+    // Opt-in, best-effort write-through persistence. The subscriber is registered
+    // here — before any task can send — so no structured event is missed; any
+    // storage failure degrades to `None` (no persistence) and never fails the run.
+    let store_task = match db_url {
+        None => None,
+        Some(url) => match open_store(&url).await {
+            Ok(store) => {
+                if let Err(error) = store.ensure_schema().await {
+                    eprintln!("lattice: storage disabled (schema error: {error})");
+                    None
+                } else {
+                    if let Err(error) = store
+                        .record_session(RUN_SESSION_ID, &root.display().to_string())
+                        .await
+                    {
+                        // Best-effort: log but keep persisting — `persist` lazily
+                        // upserts the session row on first sight (`DATA_MODEL.md` §B.2).
+                        eprintln!("lattice: record_session failed: {error}");
+                    }
+                    let mut rx = events_tx.subscribe();
+                    Some(tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(env) => {
+                                    if let Err(error) = store.persist(&env).await {
+                                        eprintln!("lattice: persist error: {error}");
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                                    // Best-effort persistence: the store fell behind the
+                                    // channel capacity, so `dropped` events are gone from the DB
+                                    // (the in-memory Graph stays the source of truth).
+                                    eprintln!("lattice: persist lagged, dropped {dropped} events");
+                                    continue;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    }))
+                }
+            }
+            Err(error) => {
+                eprintln!("lattice: storage disabled ({error})");
+                None
+            }
+        },
+    };
 
     // Initial parse: fill the graph so the first snapshot reflects the repo.
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
@@ -164,6 +278,7 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
         watcher_task,
         pump_task,
         collector_task,
+        store_task,
     })
 }
 
@@ -682,5 +797,134 @@ mod tests {
         timeout(Duration::from_secs(2), handle.shutdown())
             .await
             .expect("shutdown completes promptly, aborting the collector");
+    }
+
+    /// Polls the sqlite DB at `db_url` up to ~2s for the count of `test_results`
+    /// rows whose `node_id` equals `node`, returning the count once non-zero (or 0
+    /// after the budget). Mirrors [`next_test_result_for`]'s wait pattern; tolerates
+    /// a not-yet-applied schema by treating a query error as `0` and retrying.
+    async fn poll_test_result_count(db_url: &str, node: &str) -> i64 {
+        let pool = sqlx::SqlitePool::connect(db_url)
+            .await
+            .expect("open db for read");
+        let mut count = 0i64;
+        for _ in 0..40 {
+            count = sqlx::query_scalar("SELECT COUNT(*) FROM test_results WHERE node_id = ?")
+                .bind(node)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        pool.close().await;
+        count
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_url_set_persists_the_structured_test_event() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.rs"), "fn f() {}").expect("write");
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("events.db").display());
+        let handle = run_with_db_url(dir.path().to_path_buf(), local(), Some(db_url.clone()))
+            .await
+            .expect("run");
+
+        // A structured CLV test line for an in-graph node yields a TestResult
+        // envelope, which the persistence task write-throughs to `test_results`.
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","pid":1,"node":"fn:x.rs:f","outcome":"fail"}"#,
+        );
+
+        let count = poll_test_result_count(&db_url, "fn:x.rs:f").await;
+        assert_eq!(
+            count, 1,
+            "the structured test event must persist exactly one test_results row"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_url_none_runs_with_no_persistence() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.rs"), "fn f() {}").expect("write");
+        let handle = run_with_db_url(dir.path().to_path_buf(), local(), None)
+            .await
+            .expect("run");
+        assert!(
+            handle.store_task.is_none(),
+            "no persistence task when LATTICE_DB_URL is unset"
+        );
+
+        // Serves exactly as today: a root snapshot still arrives.
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Snapshot);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_aborts_the_store_task_without_hanging() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.rs"), "fn f() {}").expect("write");
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("events.db").display());
+        let handle = run_with_db_url(dir.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+        assert!(
+            handle.store_task.is_some(),
+            "a persistence task exists when LATTICE_DB_URL is set"
+        );
+        // The store task is an endless recv loop; a prompt shutdown proves it is
+        // aborted (not leaked) rather than hanging the teardown.
+        timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown aborts the store task without hanging");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_and_malformed_sink_lines_are_never_persisted() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("x.rs"), "fn f() {}").expect("write");
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("events.db").display());
+        let handle = run_with_db_url(dir.path().to_path_buf(), local(), Some(db_url.clone()))
+            .await
+            .expect("run");
+
+        // Neither an untagged stdout line nor a malformed `#CLV1` line parses to an
+        // envelope, so neither reaches the store.
+        append_sink_line(dir.path(), "PASS foo");
+        append_sink_line(dir.path(), "#CLV1 {garbage");
+        // A trailing structured line DOES persist — the barrier proving the collector
+        // has processed (and skipped) the two non-persisting lines above it in order.
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","node":"fn:x.rs:f","outcome":"fail"}"#,
+        );
+
+        // Wait for the structured line to land, then assert it is the ONLY row.
+        let by_node = poll_test_result_count(&db_url, "fn:x.rs:f").await;
+        assert_eq!(by_node, 1, "the structured line persists");
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("open db for read");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM test_results")
+            .fetch_one(&pool)
+            .await
+            .expect("count all");
+        pool.close().await;
+        assert_eq!(
+            total, 1,
+            "raw and malformed sink lines must not persist any test_results row"
+        );
+        handle.shutdown().await;
     }
 }
