@@ -91,16 +91,29 @@ decoding (`wire.rs:300-315`). Field names must match `DATA_MODEL.md §A.5` exact
 serde rename, as the existing payloads do).
 
 ### Depends On: none
-### Touches: crates/backend/src/wire.rs, docs/orignal_specs/DATA_MODEL.md
+### Touches: crates/backend/src/wire.rs, crates/backend/src/storage/sqlite.rs, crates/backend/src/storage/postgres.rs, docs/orignal_specs/DATA_MODEL.md
 
 ### Acceptance Criteria
 - A `Payload::AgentActivity` variant exists carrying (serde-camelCase) `agentId: String`,
-  `action: String`, `nodeId: String`, `sessionId: String`, `processId: Option<u64>`, and optional
-  `ts`/`msg`; it serializes to the exact shape in `DATA_MODEL.md §A.5` `agent.activity`.
+  `action: String`, `nodeId: String`, `sessionId: String`, `processId: Option<u32>`, and optional
+  `ts`/`msg` (every optional `#[serde(skip_serializing_if = "Option::is_none")]`); with the optionals
+  `None` it serializes **byte-identically** to `DATA_MODEL.md §A.5` `agent.activity`, and is a
+  documented superset when they are set. `processId` is `u32` to match every existing wire payload and
+  `ClvEvent.pid` (`wire.rs:397/422/444`, `clv.rs:39`) — no `u64` widening.
 - A `Payload::AgentRoster` variant exists carrying `sessionId: String` and `agents: Vec<AgentInfo>`,
-  where `AgentInfo` has `processId: u64`, `agentId: String`, `agentType: String`, `color: String`,
-  `status: String` (`active`|`inactive`), and optional `protocolVersion: String`; it serializes to
-  the `DATA_MODEL.md §A.5` `agent.roster` shape.
+  where `AgentInfo` has `processId: u32`, `agentId: String`, `agentType: String`, `color: String`,
+  `status: String` (`active`|`inactive`), and optional `protocolVersion: String`
+  (`#[serde(skip_serializing_if = "Option::is_none")]`); with `protocolVersion` `None` it serializes
+  byte-identically to `DATA_MODEL.md §A.5` `agent.roster`, and is a documented superset when set.
+- **The workspace still compiles and `just qg` is green after adding the variants.** The `persist`
+  match in `storage/sqlite.rs` (`:339`) and `storage/postgres.rs` (`:422`) is exhaustive with **no**
+  `_ =>` wildcard, so the two new `Payload` variants would be E0004 non-exhaustive. P8-1 therefore
+  adds a temporary no-op catch-all arm `Payload::AgentActivity { .. } | Payload::AgentRoster { .. } =>
+  {}` to **both** matches — an empty block yielding `()`, identical in form to the existing
+  `Payload::Snapshot { .. } | Payload::Subtree { .. } => { … }` no-op arm, so the arm type matches its
+  siblings and the trailing `tx.commit().await?; Ok(())` (it is **not** `=> Ok(())`, which is an E0308
+  "incompatible match arms" error). A unit test asserts persisting an agent envelope is a no-op for
+  now; P8-3 replaces these stubs with the real writes.
 - A pure helper (e.g. `agent_node_id(agent_id: &str) -> String`) returns `"agent:<agentId>"` and is
   deterministic for the same input (asserted by a unit test).
 - `serde_json` round-trips both new payloads (serialize → deserialize → equal); a unit test feeds the
@@ -114,6 +127,9 @@ serde rename, as the existing payloads do).
 - New `#[cfg(test)]` cases in `wire.rs` cover round-trip, literal-JSON decode, untagged
   disambiguation, and id determinism; `just test` green; new-code coverage ≥ 90%.
 - `just qg` (fmt-check + lint + test) clean — clippy `-D warnings`.
+- The transient `postgres.rs` no-op stub arm is coverage-excluded for the new-code gate when the
+  sprint env has no Docker Postgres (same carve-out as P8-3); the `sqlite.rs` stub arm is exercised by
+  the no-op persist unit test.
 - Doc comments on both new `Payload` variants and `AgentInfo` and the id helper, per
   `AGENT_PROTOCOL.md §6`; if any field deviates from `DATA_MODEL.md §A.5`, `DATA_MODEL.md` is updated
   in the same story with a noted, deliberate extension (otherwise it is left untouched).
@@ -147,7 +163,12 @@ snapshot, not subtree).
   one-element `Vec`) — existing behaviour unchanged (regression-asserted).
 - `poll_once` broadcasts **every** envelope returned by `apply_clv` (a multi-envelope activity is
   fully fanned out, verified via the broadcast receiver in a collector test).
-- A `snapshot` taken after an activity includes the agent node and the `authored_by` edge.
+- After an activity, the agent node (a root, `parentId == null`) and the `authored_by` edge reach
+  clients via the emitted `node.upsert` / `edge.upsert` envelopes. A fresh-connect `snapshot`
+  includes the agent **node** (it is a root) but **not** the `authored_by` edge — `snapshot` emits an
+  edge only when both endpoints are roots (`graph.rs:121-128`) and the edge's code-node source is a
+  non-root function; this preserves the existing root-only snapshot invariant (attribution rides
+  explicit upserts, not snapshot/subtree, per this plan's grounding).
 
 ### Definition of Done
 - New `#[cfg(test)]` cases in `graph.rs` (apply_clv multi-envelope, node/edge identity, respawn
@@ -181,12 +202,21 @@ the single seam (`storage/mod.rs:135-154` unchanged).
   derived from the CLV sentinel, e.g. `"1"`), keyed by `process_id`, FK-valid against `agents`.
 - Persisting an `agent.activity` envelope writes one `agent_activity` row (`agent_id`, `action`,
   `node_id`, `process_id`, `session_id`, `ts`); the row count increments by exactly one per event.
+  The arm first `upsert_session` + (when a `pid` is present) `upsert_agent` **before** the
+  `INSERT INTO agent_activity`, mirroring the existing `TestResult`/`StatusUpdate`/`HotEdge` arms
+  (`sqlite.rs:226`), so the `agent_activity.process_id REFERENCES agents(process_id)` FK holds
+  regardless of envelope ordering (the `agents` row is otherwise created only by `agent.roster`); a
+  test asserts an activity-then-query with no prior roster still writes the row (no FK violation).
 - The Phase-7 tests that asserted `agent_activity`/`protocol_versions` stay empty
   (`sqlite.rs:926-947`) are updated to assert the new write behaviour (the "stay empty" invariant is
   intentionally retired for these two tables, documented in the test).
 - The SQLite and Postgres schemas remain identical in shape; switching `LATTICE_DB_URL` requires no
   code change (the Docker-gated Postgres parity test from Phase 7 is extended to cover an agent
-  roster + activity round-trip, skipped when no Postgres is available).
+  roster + activity round-trip, skipped when no Postgres is available). The new `postgres.rs` persist
+  arms are **structural twins** of the `sqlite.rs` arms; the new-code coverage gate is met on the
+  always-run `sqlite.rs` arms, and `postgres.rs` is coverage-excluded for the gate when the sprint
+  env has no Docker Postgres — matching the Phase-7 precedent — with parity asserted by the gated
+  round-trip test under `LATTICE_TEST_PG` when Docker is present.
 
 ### Definition of Done
 - New/updated `#[cfg(test)]` cases in `sqlite.rs` (roster upsert real values, inactive flip,
@@ -200,9 +230,11 @@ the single seam (`storage/mod.rs:135-154` unchanged).
 
 Give the roster a real lifecycle. Because the collector has no process-exit signal
 (`collector.rs:82-150`), add an **idle-timeout**: track `last_seen` per `process_id` in the
-`Graph` roster (from P8-2) and, on each `poll_once` tick (or a dedicated interval in the `collect`
-loop, `collector.rs:90-93`), flip any process whose last activity is older than a named idle window
-to `status: inactive`, emitting an `agent.roster` envelope when any status changes. Respawn needs no
+`Graph` roster (from P8-2) and, driven from the **`collect` loop itself on every tick**
+(`collector.rs:90-93`) — **not** inside `poll_once`, which returns early on a quiet sink via
+`if len == *offset { return }` (`collector.rs:120-127`) and so would never expire idle processes when
+no new lines arrive — flip any process whose last activity is older than a named idle window to
+`status: inactive`, emitting an `agent.roster` envelope when any status changes. Respawn needs no
 special handling — a new `pid` is a fresh active row under the same `agentId` node (from P8-2).
 
 ### Depends On: P8-2
@@ -217,9 +249,11 @@ special handling — a new `pid` is a fresh active row under the same `agentId` 
 - After a process is marked `inactive`, a new activity from a **new** `pid` under the same `agentId`
   yields a roster where the old pid stays `inactive` and the new pid is `active`, both under one
   `agentId` (respawn, deterministic against a controllable `now`).
-- The collector invokes the expiry check on its poll loop and broadcasts the resulting roster
+- The collector invokes `expire_idle` from the `collect` loop on every tick **independent of file
+  growth** (not behind `poll_once`'s no-growth early return), and broadcasts the resulting roster
   envelope (verified through the broadcast receiver with an injected/controllable clock so the test
-  is not wall-clock-flaky).
+  is not wall-clock-flaky). A test with a quiet sink (no new lines) confirms an idle process is still
+  expired.
 
 ### Definition of Done
 - New `#[cfg(test)]` cases (idle flip, partial flip, respawn-after-inactive, no-op when unchanged)
@@ -279,16 +313,22 @@ beside `<Sidebar>` (`Graph.svelte:172`). Wire **bidirectional drill-down**: clic
 roster → highlight the code nodes it authored (resolve `authored_by` edges); click a code node
 (existing `onSelect` path, `HierarchyNode.svelte:41`) → list the agents that touched it.
 
-### Depends On: P8-5
+### Depends On: P8-5, P8-2, P8-4
 ### Touches: frontend/src/lib/Graph.svelte, frontend/src/lib/HierarchyNode.svelte, frontend/src/lib/layout.ts, frontend/src/lib/RosterPanel.svelte, frontend/src/lib/RosterPanel.test.ts
 
 ### Acceptance Criteria
-- An agent-layer toggle exists in the canvas controls; when off, `authored_by` edges and agent nodes
-  are not drawn (parity with today); when on, agent nodes render with a distinct `agent`-type style
-  and `authored_by` edges are drawn.
+- An agent-layer toggle (`$state` boolean) exists in the canvas controls. When **off**, agent
+  **nodes** are excluded from the hierarchy (e.g. `buildHierarchy($nodes.filter(n => n.type !==
+  'agent'), …)` — `buildHierarchy` renders every root unconditionally, so the node gate is a
+  pre-filter, distinct from the edge gate) **and** `authored_by` **edges** are filtered out (parity
+  with today). When **on**, agent nodes render with a distinct `agent`-type style (via `node.type`
+  threaded into `HierarchyNodeData`) and `authored_by` edges are drawn. Both the node gate and the
+  edge gate are asserted via computed id sets (not pixels).
 - `RosterPanel` renders one entry per roster `agentId`, colour-coded by `agentType`, showing an
   active vs inactive state; a roster update flipping a process to `inactive` updates the indicator;
-  a respawn (new `processId`, same `agentId`) keeps a single agent entry shown as active.
+  a respawn (new `processId`, same `agentId`) keeps a single agent entry shown as active. Per
+  **Design Decision #1**, `RosterPanel` derives this per-`agentId` view from the P8-5 `agents` store
+  (which is keyed by `processId`): an `agentId` is active iff **any** of its processes is active.
 - Clicking a roster agent highlights the set of code nodes linked to `agent:<agentId>` by
   `authored_by` (asserted via the computed highlighted-id set, not pixels).
 - Selecting a code node surfaces the agent ids that authored it (the agents-for-node mapping is
@@ -312,20 +352,25 @@ roster → highlight the code nodes it authored (resolve `authored_by` edges); c
 ## Dependency graph
 
 ```
-P8-1  Wire payloads + agent-node id (wire.rs) ........ Depends: none
-  ├─ P8-2  Activity → agent node + authored_by + roster (graph.rs, collector.rs) ... Depends: P8-1
-  │    └─ P8-4  Roster idle-timeout inactive + respawn (collector.rs, graph.rs) .... Depends: P8-2
-  ├─ P8-3  Persist agents/agent_activity/protocol_versions (sqlite, postgres) ...... Depends: P8-1
-  └─ P8-5  Frontend ingest: roster state + reducer (types.ts, ws.ts) .............. Depends: P8-1
-       └─ P8-6  Agent-layer view: panel, styling, drill-down, toggle (UI) ......... Depends: P8-5
+P8-1  Wire payloads + storage no-op stubs + agent-node id (wire.rs, sqlite.rs, postgres.rs) . Depends: none
+  ├─ P8-2  Activity → agent node + authored_by + roster (graph.rs, collector.rs) ........... Depends: P8-1
+  │    └─ P8-4  Roster idle-timeout inactive + respawn (collector.rs, graph.rs) ........... Depends: P8-2
+  ├─ P8-3  Persist agents/agent_activity/protocol_versions; replace P8-1 stubs (storage) ... Depends: P8-1
+  └─ P8-5  Frontend ingest: roster state + reducer (types.ts, ws.ts) ...................... Depends: P8-1
+       └─ P8-6  Agent-layer view: panel, styling, drill-down, toggle (UI) ... Depends: P8-5, P8-2, P8-4
 ```
 
-- Acyclic. **Backend contract (P8-1) gates everything.** After P8-1, the backend behaviour (P8-2),
-  storage (P8-3), and frontend ingest (P8-5) proceed in parallel — disjoint `Touches` (graph/
-  collector vs storage vs types/ws), so no file collisions.
+- Acyclic. **Backend contract (P8-1) gates everything.** P8-1 adds the wire variants **and** the
+  temporary no-op `persist` stubs in `sqlite.rs`/`postgres.rs` so `main` stays compilable + `just qg`
+  green at its merge. After P8-1, backend behaviour (P8-2), storage (P8-3), and frontend ingest
+  (P8-5) proceed in parallel — P8-1 is already merged, so P8-3's storage edits (which replace P8-1's
+  stub arms) start from P8-1's merged state, not a live collision with P8-2 (graph/collector) or P8-5
+  (types/ws).
 - P8-2 → P8-4 share `graph.rs` + `collector.rs`; the edge serialises them (no parallel collision).
-- P8-5 → P8-6 share the frontend; P8-6 deliberately does **not** touch `ws.ts`/`types.ts` (P8-5 owns
-  the contract), only the canvas/panel files.
+- P8-6 depends on **P8-5** (the frontend contract/store), **P8-2** (emits agent nodes/`authored_by`/
+  roster), and **P8-4** (live `inactive` flip) — all three are required for its live-validation DoD to
+  pass. P8-6 deliberately does **not** touch `ws.ts`/`types.ts` (P8-5 owns the contract); it only
+  imports the `agents` store + `AgentInfo` and edits the canvas/panel files.
 - Phase-8 accept (BUILD_PLAN) is met when P8-2 (touched nodes + authored_by + live status), P8-4
   (respawn shows new pid; active/inactive), and P8-6 (bidirectional drill-down view) are all merged;
   P8-3 makes the layer durable across a backend restart.
