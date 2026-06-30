@@ -4,8 +4,11 @@
 //! **source** files (Rust, Python, or TypeScript) to an async consumer. A burst of
 //! rapid events for the same path is coalesced into a single emission via a
 //! [`DEBOUNCE`] quiet-period window, so a save that the editor reports as several
-//! events re-parses the file only once (`SPEC.md` §11.2). The watcher never panics
-//! on a `notify` error — it logs to stderr and keeps running (`SPEC.md` §11.1).
+//! events re-parses the file only once (`SPEC.md` §11.2). Because that window
+//! extends on every event, a continuously-touched file is bounded by a
+//! [`MAX_DEBOUNCE`] cap that forces a flush under sustained churn. The watcher
+//! never panics on a `notify` error — it logs to stderr and keeps running
+//! (`SPEC.md` §11.1).
 //!
 //! The OS-callback glue is deliberately thin; the testable logic lives in
 //! [`is_source_file`] (the extension filter) and [`debounce_loop`] (the coalescer),
@@ -17,7 +20,7 @@ use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::{unbounded_channel, Sender, UnboundedReceiver};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 /// Quiet period used to coalesce a burst of change events for the same path.
 ///
@@ -25,6 +28,18 @@ use tokio::time::timeout;
 /// further event before emitting once. 150 ms absorbs an editor's multi-event
 /// save without adding perceptible latency to the live graph.
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Hard upper bound on how long a path may be deferred under sustained churn.
+///
+/// The [`DEBOUNCE`] quiet window resets on *every* event, so a file written
+/// continuously faster than 150 ms would never go quiet and would never flush —
+/// an unbounded-latency starvation gap. This cap, measured from a burst's first
+/// event, guarantees the path is emitted at least once per `MAX_DEBOUNCE` even
+/// while events keep arriving; the window then restarts. 1 s is a small multiple
+/// of `DEBOUNCE`: long enough that ordinary multi-event saves still coalesce via
+/// the quiet window, yet short enough to keep the live graph responsive under a
+/// hot write loop.
+pub const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Returns `true` when `path` names a source file Lattice parses (`.rs`, `.py`,
 /// or `.ts` extension).
@@ -46,22 +61,33 @@ pub fn is_source_file(path: &Path) -> bool {
 /// distinct path once on `tx` after the window settles. Returns when `rx` closes
 /// (all senders dropped) or `tx`'s receiver is gone.
 ///
+/// The quiet window extends on each event, so a path touched faster than
+/// `DEBOUNCE` forever would never settle. To bound that latency the loop also
+/// arms a [`MAX_DEBOUNCE`] deadline from the burst's first event: whichever of the
+/// two fires first flushes the accumulated set, after which the window restarts.
+///
 /// Kept separate from the `notify` wiring so it can be unit-tested against an
 /// in-memory channel, with no filesystem dependency.
 async fn debounce_loop(mut rx: UnboundedReceiver<PathBuf>, tx: Sender<PathBuf>) {
     while let Some(first) = rx.recv().await {
         let mut pending: HashSet<PathBuf> = HashSet::new();
         pending.insert(first);
-        // Extend the window on each subsequent event; flush once it goes quiet.
+        // Hard ceiling from the burst's first event, so sustained churn cannot
+        // starve a flush; the quiet timer below is re-armed on every event.
+        let max_deadline = sleep(MAX_DEBOUNCE);
+        tokio::pin!(max_deadline);
         loop {
-            match timeout(DEBOUNCE, rx.recv()).await {
-                Ok(Some(path)) => {
-                    pending.insert(path);
-                }
-                // Channel closed: flush what we have, then the outer loop ends.
-                Ok(None) => break,
-                // Quiet for DEBOUNCE: the burst is over.
-                Err(_) => break,
+            tokio::select! {
+                // The cap wins ties: it is a guaranteed upper bound on latency.
+                biased;
+                _ = &mut max_deadline => break,
+                event = timeout(DEBOUNCE, rx.recv()) => match event {
+                    Ok(Some(path)) => {
+                        pending.insert(path);
+                    }
+                    // Channel closed or quiet for DEBOUNCE: this burst is over.
+                    Ok(None) | Err(_) => break,
+                },
             }
         }
         for path in pending {
@@ -169,6 +195,67 @@ mod tests {
             .expect("emit")
             .expect("some");
         assert_eq!(got, p);
+
+        drop(raw_tx);
+        let _ = handle.await;
+    }
+
+    // Sustained churn: a path touched faster than DEBOUNCE for longer than the cap
+    // must still flush at least once, bounding latency. Paused time auto-advances
+    // tokio's own timers deterministically, so this needs no wall-clock sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn debounce_loop_caps_latency_under_sustained_churn() {
+        let (raw_tx, raw_rx) = unbounded_channel::<PathBuf>();
+        let (out_tx, mut out_rx) = channel::<PathBuf>(8);
+        let handle = tokio::spawn(debounce_loop(raw_rx, out_tx));
+
+        let hot = PathBuf::from("/x/hot.rs");
+        // Step shorter than DEBOUNCE keeps the quiet window perpetually resetting;
+        // churn for twice the cap so the cap is the only thing that can flush.
+        let step = DEBOUNCE / 2;
+        let steps = (MAX_DEBOUNCE.as_millis() * 2 / step.as_millis()) as u32;
+
+        let mut emitted_during_churn = false;
+        for _ in 0..steps {
+            raw_tx.send(hot.clone()).expect("send");
+            sleep(step).await;
+            if let Ok(got) = out_rx.try_recv() {
+                assert_eq!(got, hot, "only the churned path is ever emitted");
+                emitted_during_churn = true;
+            }
+        }
+        assert!(
+            emitted_during_churn,
+            "MAX_DEBOUNCE cap must flush a continuously-touched path mid-churn",
+        );
+
+        drop(raw_tx);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn debounce_loop_forwards_each_distinct_path_once() {
+        let (raw_tx, raw_rx) = unbounded_channel::<PathBuf>();
+        let (out_tx, mut out_rx) = channel::<PathBuf>(16);
+        let handle = tokio::spawn(debounce_loop(raw_rx, out_tx));
+
+        // One burst of distinct source paths, each sent twice to prove dedup.
+        let paths = [
+            PathBuf::from("/x/a.rs"),
+            PathBuf::from("/x/b.py"),
+            PathBuf::from("/x/c.ts"),
+        ];
+        for p in &paths {
+            raw_tx.send(p.clone()).expect("send");
+            raw_tx.send(p.clone()).expect("send");
+        }
+
+        let mut got: HashSet<PathBuf> = HashSet::new();
+        while let Ok(Some(p)) = timeout(DEBOUNCE * 4, out_rx.recv()).await {
+            assert!(got.insert(p), "each distinct path is emitted exactly once");
+        }
+        let want: HashSet<PathBuf> = paths.iter().cloned().collect();
+        assert_eq!(got, want, "every distinct path in the burst flushes once");
 
         drop(raw_tx);
         let _ = handle.await;

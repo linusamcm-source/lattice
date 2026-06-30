@@ -77,7 +77,8 @@
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
-//!   within [`watcher::DEBOUNCE`].
+//!   within [`watcher::DEBOUNCE`] and bounding sustained churn via a
+//!   [`watcher::MAX_DEBOUNCE`] cap.
 //! - [`ws`] — a `tokio-tungstenite` WebSocket server ([`ws::serve`]) that sends
 //!   each connecting client the current [`graph::Graph`] root-only `snapshot` and
 //!   then streams broadcast [`wire::EventEnvelope`]s, replying to a client
