@@ -10,16 +10,21 @@
 //! - §A.4 — [`EventEnvelope`] (`{ v, ts, sessionId, type, payload }`), tagged by
 //!   [`EventType`].
 //! - §A.5 — the test/status CLV event payloads [`Payload::TestResult`] and
-//!   [`Payload::StatusUpdate`], and the Phase-6 runtime-tracer `hot_edge` payload
-//!   [`Payload::HotEdge`] (carrying [`HotEdgeState`]).
+//!   [`Payload::StatusUpdate`], the Phase-6 runtime-tracer `hot_edge` payload
+//!   [`Payload::HotEdge`] (carrying [`HotEdgeState`]), and the Phase-8 agent-layer
+//!   payloads [`Payload::AgentActivity`] and [`Payload::AgentRoster`] (the latter
+//!   carrying [`AgentInfo`] rows), whose agent vertices are addressed by
+//!   [`agent_node_id`].
 //!
 //! It also pins the wire payload contract as the typed [`Payload`] variants: the
 //! Phase-0 `snapshot`/`node.upsert`/`node.remove`/`edge.upsert`/`edge.remove`
 //! diff set, plus the Phase-1 lazy-hierarchy `subtree` reply (the direct children
 //! of an expanded node — see [`Payload::Subtree`]), the Phase-5 §A.5
 //! `test.result` / `status.update` payloads ([`Payload::TestResult`],
-//! [`Payload::StatusUpdate`]), and the Phase-6 §A.5 `hot_edge` payload
-//! ([`Payload::HotEdge`], toggling an [`Edge::hot`] flag via [`HotEdgeState`]).
+//! [`Payload::StatusUpdate`]), the Phase-6 §A.5 `hot_edge` payload
+//! ([`Payload::HotEdge`], toggling an [`Edge::hot`] flag via [`HotEdgeState`]), and
+//! the Phase-8 §A.5 agent-layer `agent.activity` / `agent.roster` payloads
+//! ([`Payload::AgentActivity`], [`Payload::AgentRoster`]).
 //! Per `AGENT_PROTOCOL.md` §5 the
 //! protocol is identified on the CLV stdio channel by the `#CLV1` sentinel (see
 //! [`crate::protocol_sentinel`]).
@@ -313,6 +318,12 @@ pub struct Edge {
 /// [`Payload::StatusUpdate`]: a `test.result` object carries every field
 /// `StatusUpdate` requires, so the `testId`-bearing variant is tried first or a
 /// test result would silently mis-decode as a status update.
+///
+/// The Phase-8 agent-layer variants [`Payload::AgentActivity`] and
+/// [`Payload::AgentRoster`] are declared **last**: each is disambiguated by a
+/// required field no earlier variant carries (`action` for `agent.activity`, the
+/// `agents` array for `agent.roster`), so they neither mis-decode as an earlier
+/// variant nor capture any earlier payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
@@ -451,6 +462,73 @@ pub enum Payload {
         /// ISO-8601 timestamp of the transition.
         ts: String,
     },
+    /// `agent.activity` — one tracked agent touched a node (`DATA_MODEL.md` §A.5).
+    ///
+    /// Declared **last** (with [`Payload::AgentRoster`]): under this
+    /// `#[serde(untagged)]` enum a variant resolves by its required fields, and
+    /// `action` is required here but carried by no earlier variant, so an
+    /// `agent.activity` object resolves here and never captures an earlier payload.
+    /// The agent's vertex id is built by [`agent_node_id`].
+    AgentActivity {
+        /// Id of the agent that performed the action.
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        /// What the agent did (e.g. `"modified"`); its presence disambiguates this
+        /// variant under the untagged decode.
+        action: String,
+        /// Id of the node the agent touched.
+        #[serde(rename = "nodeId")]
+        node_id: String,
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// OS process id of the agent, when known.
+        #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
+        process_id: Option<u32>,
+        /// ISO-8601 timestamp of the activity, when supplied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ts: Option<String>,
+        /// Optional human-readable detail of the activity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        msg: Option<String>,
+    },
+    /// `agent.roster` — the live set of tracked agents in a session
+    /// (`DATA_MODEL.md` §A.5).
+    ///
+    /// Declared **last** (with [`Payload::AgentActivity`]): its required `agents`
+    /// array is carried by no earlier variant, so an `agent.roster` object resolves
+    /// here and never mis-decodes as [`Payload::Snapshot`]/[`Payload::Subtree`] or
+    /// any other variant.
+    AgentRoster {
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// One [`AgentInfo`] row per tracked agent in the session.
+        agents: Vec<AgentInfo>,
+    },
+}
+
+/// A single tracked agent in an [`Payload::AgentRoster`] (`DATA_MODEL.md` §A.5).
+///
+/// Carries the agent's identity (`agentId`/`agentType`), OS `processId`, display
+/// `color`, live `status`, and an optional CLV `protocolVersion`. All JSON keys are
+/// camelCase, and `protocolVersion` is omitted when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInfo {
+    /// OS process id of the agent.
+    pub process_id: u32,
+    /// Stable id of the agent (e.g. `"tdd-green"`).
+    pub agent_id: String,
+    /// Agent role / kind (e.g. `"implementation"`, `"security"`).
+    pub agent_type: String,
+    /// Display colour for the agent (CSS hex string).
+    pub color: String,
+    /// Live status of the agent (e.g. `"active"`, `"inactive"`).
+    pub status: String,
+    /// CLV protocol version the agent speaks, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
 }
 
 /// A CLV event envelope (`DATA_MODEL.md` §A.4).
@@ -506,6 +584,20 @@ pub fn node_id(node_type: NodeType, path: &str, symbol: &str) -> String {
 /// ```
 pub fn edge_id(src_symbol: &str, dst_symbol: &str) -> String {
     format!("e:{src_symbol}->{dst_symbol}")
+}
+
+/// Builds a deterministic agent node id from its agent id.
+///
+/// Implements the `agent:<agentId>` form of `DATA_MODEL.md` §A.1, mirroring
+/// [`node_id`]/[`edge_id`]; the `agent` token matches [`NodeType::Agent`]'s
+/// [`NodeType::id_prefix`], so an agent vertex keeps a stable identity across runs.
+///
+/// ```
+/// use lattice_backend::wire::agent_node_id;
+/// assert_eq!(agent_node_id("security-scanner"), "agent:security-scanner");
+/// ```
+pub fn agent_node_id(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
 }
 
 /// Builds a deterministic, **kind-qualified** edge id, unique per
@@ -1233,5 +1325,304 @@ mod tests {
             matches!(rm, Payload::NodeRemove { .. }),
             "bare id mis-decoded as {rm:?}"
         );
+    }
+
+    // ---- P8-1: agent wire payloads + agent_node_id (DATA_MODEL §A.5) ----
+    //
+    // RED-phase contract for the agent layer. These tests fix the field names,
+    // serde camelCase keys, untagged-decode behaviour, and the `agent:<id>` node-id
+    // helper that P8-1 must implement in `wire.rs`. They reference
+    // `Payload::AgentActivity`, `Payload::AgentRoster`, the `AgentInfo` struct, and
+    // `agent_node_id`, none of which exist yet — so the crate fails to compile until
+    // P8-1 adds them.
+
+    /// The literal `agent.activity` payload object from `DATA_MODEL.md` §A.5.
+    const AGENT_ACTIVITY_A5_JSON: &str = r##"{"agentId":"security-scanner","action":"modified","nodeId":"fn:src/auth/token.rs:verify_token","sessionId":"sess-abc123","processId":48590}"##;
+
+    /// The literal `agent.roster` payload object from `DATA_MODEL.md` §A.5.
+    const AGENT_ROSTER_A5_JSON: &str = r##"{"sessionId":"sess-abc123","agents":[{"processId":48213,"agentId":"tdd-green","agentType":"implementation","color":"#2ecc71","status":"active"},{"processId":48590,"agentId":"security-scanner","agentType":"security","color":"#e67e22","status":"inactive"}]}"##;
+
+    /// Builds the §A.5 `agent.roster` envelope with both agents' optional
+    /// `protocolVersion` absent (so the wire object matches the §A.5 literal).
+    fn agent_roster_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.123Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::AgentRoster,
+            payload: Payload::AgentRoster {
+                session_id: "sess-abc123".to_string(),
+                agents: vec![
+                    AgentInfo {
+                        process_id: 48213,
+                        agent_id: "tdd-green".to_string(),
+                        agent_type: "implementation".to_string(),
+                        color: "#2ecc71".to_string(),
+                        status: "active".to_string(),
+                        protocol_version: None,
+                    },
+                    AgentInfo {
+                        process_id: 48590,
+                        agent_id: "security-scanner".to_string(),
+                        agent_type: "security".to_string(),
+                        color: "#e67e22".to_string(),
+                        status: "inactive".to_string(),
+                        protocol_version: None,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn agent_activity_decodes_from_data_model_a5_literal() {
+        let payload: Payload = serde_json::from_str(AGENT_ACTIVITY_A5_JSON)
+            .expect("decode §A.5 agent.activity payload object");
+        match payload {
+            Payload::AgentActivity {
+                agent_id,
+                action,
+                node_id,
+                session_id,
+                process_id,
+                ts,
+                msg,
+            } => {
+                assert_eq!(agent_id, "security-scanner");
+                assert_eq!(action, "modified");
+                assert_eq!(node_id, "fn:src/auth/token.rs:verify_token");
+                assert_eq!(session_id, "sess-abc123");
+                assert_eq!(process_id, Some(48590));
+                assert_eq!(ts, None, "ts is absent in the §A.5 example");
+                assert_eq!(msg, None, "msg is absent in the §A.5 example");
+            }
+            other => panic!("agent.activity mis-decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_activity_serializes_field_set_identical_to_a5_literal() {
+        // With the optionals (ts/msg) None, skip_serializing_if must omit them and
+        // the serialized object must match the §A.5 literal field-for-field.
+        let payload: Payload = serde_json::from_str(AGENT_ACTIVITY_A5_JSON)
+            .expect("decode §A.5 agent.activity payload object");
+        let got = serde_json::to_value(&payload).expect("serialize");
+        let want: Value =
+            serde_json::from_str(AGENT_ACTIVITY_A5_JSON).expect("parse §A.5 literal to a Value");
+        assert_eq!(got, want, "field set must match §A.5 literal");
+
+        let obj = got.as_object().expect("payload is a JSON object");
+        assert_eq!(
+            obj.len(),
+            5,
+            "exactly the 5 §A.5 keys, no optionals leaked: {got}"
+        );
+        assert!(
+            !obj.contains_key("ts"),
+            "ts must be omitted when None: {got}"
+        );
+        assert!(
+            !obj.contains_key("msg"),
+            "msg must be omitted when None: {got}"
+        );
+        assert!(
+            obj.contains_key("processId") && !obj.contains_key("process_id"),
+            "processId must be camelCase, not snake_case: {got}"
+        );
+        assert!(
+            obj.contains_key("agentId")
+                && obj.contains_key("nodeId")
+                && obj.contains_key("sessionId"),
+            "agentId/nodeId/sessionId must be camelCase: {got}"
+        );
+    }
+
+    #[test]
+    fn agent_activity_envelope_round_trips_with_optionals_present() {
+        // Full envelope round-trip with every optional populated, including ts/msg.
+        let env = EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.123Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::AgentActivity,
+            payload: Payload::AgentActivity {
+                agent_id: "tdd-red".to_string(),
+                action: "modified".to_string(),
+                node_id: "fn:src/wire.rs:agent_node_id".to_string(),
+                session_id: "sess-abc123".to_string(),
+                process_id: Some(48590),
+                ts: Some("2026-06-27T10:32:01.123Z".to_string()),
+                msg: Some("wrote failing tests".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"agent.activity\""),
+            "missing agent.activity envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"agentId\":\"tdd-red\""),
+            "missing camelCase agentId: {json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::AgentActivity);
+        assert!(
+            matches!(back.payload, Payload::AgentActivity { .. }),
+            "agent.activity mis-decoded as {:?}",
+            back.payload
+        );
+    }
+
+    #[test]
+    fn agent_roster_decodes_from_data_model_a5_literal() {
+        let payload: Payload = serde_json::from_str(AGENT_ROSTER_A5_JSON)
+            .expect("decode §A.5 agent.roster payload object");
+        match payload {
+            Payload::AgentRoster { session_id, agents } => {
+                assert_eq!(session_id, "sess-abc123");
+                assert_eq!(agents.len(), 2);
+                assert_eq!(
+                    agents[0],
+                    AgentInfo {
+                        process_id: 48213,
+                        agent_id: "tdd-green".to_string(),
+                        agent_type: "implementation".to_string(),
+                        color: "#2ecc71".to_string(),
+                        status: "active".to_string(),
+                        protocol_version: None,
+                    }
+                );
+                assert_eq!(
+                    agents[1],
+                    AgentInfo {
+                        process_id: 48590,
+                        agent_id: "security-scanner".to_string(),
+                        agent_type: "security".to_string(),
+                        color: "#e67e22".to_string(),
+                        status: "inactive".to_string(),
+                        protocol_version: None,
+                    }
+                );
+            }
+            other => panic!("agent.roster mis-decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_info_serializes_camel_case_and_omits_absent_protocol_version() {
+        let info = AgentInfo {
+            process_id: 48213,
+            agent_id: "tdd-green".to_string(),
+            agent_type: "implementation".to_string(),
+            color: "#2ecc71".to_string(),
+            status: "active".to_string(),
+            protocol_version: None,
+        };
+        let value = serde_json::to_value(&info).expect("serialize AgentInfo");
+        let obj = value.as_object().expect("AgentInfo is a JSON object");
+        for key in ["processId", "agentId", "agentType", "color", "status"] {
+            assert!(
+                obj.contains_key(key),
+                "missing camelCase key {key}: {value}"
+            );
+        }
+        assert!(
+            !obj.contains_key("protocolVersion"),
+            "protocolVersion must be omitted when None: {value}"
+        );
+        assert!(
+            !obj.contains_key("process_id") && !obj.contains_key("agent_type"),
+            "snake_case key leaked: {value}"
+        );
+
+        // When present, protocolVersion serializes under its camelCase key.
+        let info2 = AgentInfo {
+            protocol_version: Some("1".to_string()),
+            ..info
+        };
+        let value2 = serde_json::to_value(&info2).expect("serialize AgentInfo");
+        assert_eq!(value2["protocolVersion"], Value::from("1"));
+    }
+
+    #[test]
+    fn agent_roster_envelope_round_trips() {
+        let env = agent_roster_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"agent.roster\""),
+            "missing agent.roster envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"agentType\":\"implementation\""),
+            "missing camelCase agentType in nested AgentInfo: {json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::AgentRoster);
+        assert!(
+            matches!(back.payload, Payload::AgentRoster { .. }),
+            "agent.roster mis-decoded as {:?}",
+            back.payload
+        );
+    }
+
+    #[test]
+    fn untagged_decode_disambiguates_agent_payloads() {
+        // The `Payload` enum is `#[serde(untagged)]` with order-sensitive decode. An
+        // agent.activity object must resolve to Payload::AgentActivity, NOT to an
+        // earlier variant (it carries `agentId`+`action`, which no earlier variant
+        // requires).
+        let activity: Payload = serde_json::from_str(AGENT_ACTIVITY_A5_JSON)
+            .expect("decode agent.activity payload object");
+        assert!(
+            matches!(activity, Payload::AgentActivity { .. }),
+            "agent.activity mis-decoded as {activity:?}"
+        );
+
+        // An agent.roster object (`sessionId`+`agents`) must resolve to
+        // Payload::AgentRoster, NOT to Payload::Snapshot/Subtree or any other variant.
+        let roster: Payload =
+            serde_json::from_str(AGENT_ROSTER_A5_JSON).expect("decode agent.roster payload object");
+        assert!(
+            matches!(roster, Payload::AgentRoster { .. }),
+            "agent.roster mis-decoded as {roster:?}"
+        );
+    }
+
+    #[test]
+    fn agent_node_id_uses_agent_prefix() {
+        let cases = [
+            ("security-scanner", "agent:security-scanner"),
+            ("tdd-green", "agent:tdd-green"),
+            ("", "agent:"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(agent_node_id(input), want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn agent_node_id_is_deterministic() {
+        assert_eq!(
+            agent_node_id("security-scanner"),
+            agent_node_id("security-scanner"),
+            "agent_node_id must be a pure function of its input"
+        );
+    }
+
+    #[test]
+    fn agent_node_id_matches_agent_type_id_prefix() {
+        // The `agent` token mirrors NodeType::Agent's id prefix (the §A.1 convention).
+        assert!(
+            agent_node_id("x").starts_with(&format!("{}:", NodeType::Agent.id_prefix())),
+            "agent_node_id must start with the NodeType::Agent id prefix"
+        );
+    }
+
+    #[test]
+    fn protocol_sentinel_unchanged_by_phase_8() {
+        // P8-1 must not bump the CLV sentinel.
+        assert_eq!(crate::protocol_sentinel(), "#CLV1");
     }
 }

@@ -422,6 +422,9 @@ impl Storage for PostgresStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::AgentActivity { .. } | Payload::AgentRoster { .. } => {
+                // Phase-8 agent-layer payloads — persistence lands in P8-3 (no-op here).
+            }
         }
         tx.commit().await?;
         Ok(())
