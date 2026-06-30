@@ -31,10 +31,13 @@
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
 //!   `node.*`/`edge.*` patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
-//!   [`graph::Graph::apply_clv`] (Phase 5) folds a correlated
-//!   [`clv::ClvEvent`] `test`/`status` event onto the target node's
-//!   [`wire::NodeStatus`] colour, emitting the matching `test.result`/`status.update`
-//!   envelope (an unknown node id, or an `activity`/`hotedge` event, is a no-op).
+//!   [`graph::Graph::apply_clv`] folds a correlated [`clv::ClvEvent`] onto the live
+//!   graph: a `test`/`status` event recolours the target node's [`wire::NodeStatus`]
+//!   (Phase 5) and a `hotedge` `enter`/`exit` event toggles the target
+//!   [`wire::Edge`] `hot` flag (Phase 6), emitting the matching
+//!   `test.result`/`status.update`/`hot_edge` envelope. An unknown node/edge id, an
+//!   unparsable hot-edge state, a no-change heat transition, or an `activity` event
+//!   is a no-op.
 //! - [`collector`] — the Phase-5 CLV collector ([`collector::collect`]): a `tokio`
 //!   task that tails `<root>/.lattice/clv.ndjson`, parses each newly appended line
 //!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
