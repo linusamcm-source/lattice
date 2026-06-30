@@ -650,6 +650,36 @@ pub fn typed_edge_id(src_symbol: &str, dst_symbol: &str, kind: EdgeKind) -> Stri
     format!("e:{src_symbol}->{dst_symbol}:{kind_str}")
 }
 
+/// Builds the canonical parent → `child_ids` map from a node set's `contains` edges.
+///
+/// For every [`EdgeKind::Contains`] edge the edge's `target` (a child id) is collected
+/// under its `source` (the parent id), then **each child list is sorted by child id**,
+/// so the result is deterministic and **independent of the input edge order**. This is
+/// the single shared derivation rule applied by both the parser's `populate_child_ids`
+/// and the crash-rebuild [`crate::graph::Graph::from_records`]: because a persisted
+/// `edges` row set carries **no guaranteed order** (neither storage backend's
+/// `load_edges` has an `ORDER BY`), deriving in raw edge order would yield a different
+/// `child_ids` permutation on rebuild than the parser produced, spuriously failing the
+/// byte-equality no-op check in [`crate::graph::Graph::apply_parsed`]. Sorting here
+/// makes a freshly parsed node and a node rebuilt from records byte-equal regardless of
+/// how the edges were ordered. Non-`contains` edges are ignored. Never panics.
+pub(crate) fn derive_child_ids(edges: &[Edge]) -> std::collections::HashMap<String, Vec<String>> {
+    let mut children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for edge in edges {
+        if edge.kind == EdgeKind::Contains {
+            children
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+        }
+    }
+    for ids in children.values_mut() {
+        ids.sort();
+    }
+    children
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,6 +24,11 @@
 //! `BIGINT`/`BOOLEAN`, `ON CONFLICT` upserts) — and wires it into [`open_store`]'s
 //! `postgres:`/`postgresql:` arm; both arms now open a live store.
 //!
+//! Story P9-1 adds the **read** side to the contract — [`Storage::load_nodes`] and
+//! [`Storage::load_edges`], implemented by both backends — so the crash-rebuild path
+//! can rehydrate a session's persisted `nodes`/`edges` into the in-memory graph at
+//! startup (via [`crate::graph::Graph::from_records`]) before re-parse reconciles.
+//!
 //! The backends use `sqlx`'s **runtime** query API (not the compile-time `query!`
 //! macro), so the build and `just qg` stay hermetic — no `DATABASE_URL` and no live
 //! database are required to compile or test.
@@ -31,7 +36,7 @@
 mod postgres;
 mod sqlite;
 
-use crate::wire::EventEnvelope;
+use crate::wire::{Edge, EventEnvelope, Node};
 
 /// An error from the persistence layer (`DATA_MODEL.md` §B).
 ///
@@ -120,18 +125,23 @@ pub fn backend_for_url(url: &str) -> Result<Backend, StorageError> {
 /// The persistence contract — write-through storage of structured CLV events
 /// (`DATA_MODEL.md` §B).
 ///
-/// Each method maps onto the §B relational model: [`ensure_schema`] creates the §B.6
-/// seven-table schema idempotently, [`persist`] write-throughs one structured
+/// The write side maps onto the §B relational model: [`ensure_schema`] creates the
+/// §B.6 seven-table schema idempotently, [`persist`] write-throughs one structured
 /// [`EventEnvelope`] (§B.5 — only structured events, never raw stdout), and
-/// [`record_session`] inserts the run's `sessions` row (§B.6 `sessions`). It is
-/// annotated `#[async_trait::async_trait]` so it stays **object-safe**: the factory
-/// hands callers a `Box<dyn Storage + Send + Sync>`, which native async-fn-in-trait
-/// does not yet support on stable Rust. Implementations use `sqlx`'s runtime query
-/// API so no database is needed to build or test the contract itself.
+/// [`record_session`] inserts the run's `sessions` row (§B.6 `sessions`). The **read**
+/// side ([`load_nodes`]/[`load_edges`], story P9-1) reconstructs a session's persisted
+/// `nodes`/`edges` so [`crate::graph::Graph::from_records`] can warm-start the
+/// in-memory graph after a restart (crash-rebuild). It is annotated
+/// `#[async_trait::async_trait]` so it stays **object-safe**: the factory hands callers
+/// a `Box<dyn Storage + Send + Sync>`, which native async-fn-in-trait does not yet
+/// support on stable Rust. Implementations use `sqlx`'s runtime query API so no
+/// database is needed to build or test the contract itself.
 ///
 /// [`ensure_schema`]: Storage::ensure_schema
 /// [`persist`]: Storage::persist
 /// [`record_session`]: Storage::record_session
+/// [`load_nodes`]: Storage::load_nodes
+/// [`load_edges`]: Storage::load_edges
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
     /// Creates the `DATA_MODEL.md` §B.6 schema idempotently (`CREATE TABLE IF NOT
@@ -151,6 +161,27 @@ pub trait Storage: Send + Sync {
     /// `session_id` and recording the watched `repo_path`, satisfying the
     /// `REFERENCES sessions(session_id)` foreign keys of the event tables.
     async fn record_session(&self, session_id: &str, repo_path: &str) -> Result<(), StorageError>;
+
+    /// Loads every persisted [`Node`] for `session_id` — the crash-rebuild **read**
+    /// side (story P9-1) that feeds [`crate::graph::Graph::from_records`].
+    ///
+    /// Reconstructs each [`Node`] from its `nodes` row, mirroring the columns the
+    /// `node.upsert` write arm binds (`id`/`type`/`label`/`parentId`/`status`/`docs`/
+    /// `signature`/`meta`). **`child_ids` has no column** (`DATA_MODEL.md` §B.6 — the
+    /// write binds 12 fields without it), so every loaded node carries an **empty**
+    /// `child_ids`; [`crate::graph::Graph::from_records`] re-derives them from the
+    /// loaded `contains` edges (Design Decision #7). A `node.remove`-then-load does not
+    /// return the removed node. Read-only — it never mutates the database; an empty or
+    /// unknown session yields an empty `Vec`. Never panics on malformed stored data.
+    async fn load_nodes(&self, session_id: &str) -> Result<Vec<Node>, StorageError>;
+
+    /// Loads every persisted [`Edge`] for `session_id` — the crash-rebuild **read**
+    /// side (story P9-1) that feeds [`crate::graph::Graph::from_records`].
+    ///
+    /// Reconstructs each [`Edge`] (`source`/`target`/`kind`/`hot`) from its `edges`
+    /// row. Read-only; an empty or unknown session yields an empty `Vec`. Never panics
+    /// on malformed stored data.
+    async fn load_edges(&self, session_id: &str) -> Result<Vec<Edge>, StorageError>;
 }
 
 /// Opens the [`Storage`] backend selected by a `LATTICE_DB_URL` (`DATA_MODEL.md` §B).
@@ -222,6 +253,12 @@ mod tests {
             _repo_path: &str,
         ) -> Result<(), StorageError> {
             Ok(())
+        }
+        async fn load_nodes(&self, _session_id: &str) -> Result<Vec<Node>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn load_edges(&self, _session_id: &str) -> Result<Vec<Edge>, StorageError> {
+            Ok(Vec::new())
         }
     }
 

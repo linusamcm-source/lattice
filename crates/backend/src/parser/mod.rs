@@ -48,8 +48,8 @@ use quote::ToTokens;
 use syn::visit::Visit;
 
 use crate::wire::{
-    edge_id, node_id, typed_edge_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Param,
-    Range, Signature,
+    derive_child_ids, edge_id, node_id, typed_edge_id, Edge, EdgeKind, Meta, Node, NodeStatus,
+    NodeType, Param, Range, Signature,
 };
 
 mod treesitter;
@@ -214,19 +214,17 @@ pub fn parse_source(path: &str, source: &str) -> ParsedFile {
 /// subtree itself is fetched on `expand`). This derives `child_ids` from the
 /// `contains` edges so a `file` node lists its `function` children and a
 /// `function` node lists its `variable` children.
+///
+/// The derivation goes through the shared [`derive_child_ids`] helper, which sorts
+/// each `child_ids` **canonically by child id**. Using the same helper as the
+/// crash-rebuild [`crate::graph::Graph::from_records`] guarantees a freshly parsed node
+/// and a node rebuilt from persisted records are **byte-equal**, so a reparse after a
+/// warm start is a no-op regardless of the loaded edge order.
 fn populate_child_ids(parsed: &mut ParsedFile) {
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for edge in &parsed.edges {
-        if edge.kind == EdgeKind::Contains {
-            children
-                .entry(edge.source.clone())
-                .or_default()
-                .push(edge.target.clone());
-        }
-    }
+    let mut children = derive_child_ids(&parsed.edges);
     for node in &mut parsed.nodes {
-        if let Some(ids) = children.get(&node.id) {
-            node.child_ids = ids.clone();
+        if let Some(ids) = children.remove(&node.id) {
+            node.child_ids = ids;
         }
     }
 }

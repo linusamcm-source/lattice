@@ -39,6 +39,16 @@
 //! and [`Graph::subtree`] wraps them in a `subtree` envelope replying to an
 //! `expand` request.
 //!
+//! Crash-rebuild warm start (Phase 9). [`Graph::from_records`] rehydrates a graph
+//! from a [`Storage`](crate::storage::Storage) backend's persisted `nodes`/`edges`,
+//! re-deriving the unpersisted `child_ids` from the loaded `contains` edges (canonically
+//! sorted via the shared [`crate::wire::derive_child_ids`], so the result is independent
+//! of the loaded edge order) and rebuilding the `file_nodes`/`file_edges` diff
+//! bookkeeping — excluding the agent-layer overlays (`agent` vertices and `authored_by`
+//! edges) exactly as the live path does — so a follow-up [`Graph::apply_parsed`] of an
+//! unchanged file reconciles to a no-op with no spurious removals. The agent roster is
+//! **not** restored (no table) — it repopulates from live activity.
+//!
 //! Per `AGENT_PROTOCOL.md` §6 this is panic-free: a clock error or a parse with no
 //! `file` node degrades to a safe default rather than unwrapping.
 
@@ -47,8 +57,8 @@ use std::collections::{HashMap, HashSet};
 use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
 use crate::wire::{
-    agent_node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
-    HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+    agent_node_id, derive_child_ids, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
+    EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
 };
 
 /// CLV protocol version stamped on every envelope this graph emits.
@@ -127,6 +137,108 @@ impl Graph {
             roster: HashMap::new(),
             last_seen: HashMap::new(),
         }
+    }
+
+    /// Rebuilds a graph from persisted node/edge records (crash-rebuild warm start).
+    ///
+    /// Given the `nodes`/`edges` a [`Storage`](crate::storage::Storage) backend loaded
+    /// for `session_id` ([`load_nodes`](crate::storage::Storage::load_nodes) /
+    /// [`load_edges`](crate::storage::Storage::load_edges)), this bulk-loads the node
+    /// and edge maps and reconstructs the diff-tracking bookkeeping so a subsequent
+    /// [`Graph::apply_parsed`] of an **unchanged** file is a no-op (the reconcile path,
+    /// Design Decision #1).
+    ///
+    /// **Re-derives each node's `child_ids` from the loaded `contains` edges (Design
+    /// Decision #7).** `child_ids` is part of a [`Node`]'s identity (and the
+    /// [`Graph::apply_parsed`] byte-equality no-op check) but has **no persisted
+    /// column**, so [`load_nodes`](crate::storage::Storage::load_nodes) returns it
+    /// empty. This applies the shared [`derive_child_ids`] rule — the **same** one the
+    /// parser's `populate_child_ids` uses — which sorts each node's `child_ids`
+    /// **canonically by child id**. The sort is what makes this **order-independent**:
+    /// neither backend's `load_edges` guarantees an order, so deriving in raw edge order
+    /// would yield a different permutation than the parser produced and spuriously fail
+    /// the no-op check; sorting makes a rebuilt node byte-equal to a freshly parsed one
+    /// regardless of loaded edge order, so re-parsing the same source emits no spurious
+    /// upsert.
+    ///
+    /// **Rebuilds `file_nodes`/`file_edges`** (the per-file id sets
+    /// [`Graph::apply_parsed`] uses to compute removals): a node is grouped under the
+    /// root `file:` node reached by walking its `parent_id` chain, and an edge under
+    /// the file of its **source** node (so cross-file `calls`/`data_flows_from`/
+    /// `authored_by` edges are attributed to the file that produces them, not removed
+    /// when another file re-parses).
+    ///
+    /// The `roster`/`last_seen` maps start **empty**: the agent roster has no table and
+    /// is **not restored** here — it is repopulated by live activity after restart
+    /// (Design Decision #1). Never panics.
+    pub fn from_records(session_id: impl Into<String>, nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
+        let mut graph = Self::with_session(session_id);
+
+        // Re-derive child_ids canonically (sorted, backend-independent) from the
+        // `contains` edges (DD#7) — the same shared rule the parser applies. Move each
+        // child list out of the map (rather than clone) as it is consumed.
+        let mut children = derive_child_ids(&edges);
+        for mut node in nodes {
+            node.child_ids = children.remove(&node.id).unwrap_or_default();
+            graph.nodes.insert(node.id.clone(), node);
+        }
+        for edge in edges {
+            graph.edges.insert(edge.id.clone(), edge);
+        }
+
+        graph.rebuild_file_tracking();
+        graph
+    }
+
+    /// Rebuilds the `file_nodes`/`file_edges` diff-tracking maps from the current
+    /// node/edge maps, grouping each node under its owning `file:` root and each edge
+    /// under its **source** node's file (Design Decision #7). Used by
+    /// [`Graph::from_records`] after a bulk load.
+    ///
+    /// **Agent-layer overlays are excluded**, mirroring exactly what [`Graph::apply_parsed`]
+    /// file-tracks: [`NodeType::Agent`] vertices and [`EdgeKind::AuthoredBy`] edges are the
+    /// live-overlay product of [`Graph::apply_clv`] and are **never** recorded in
+    /// `file_nodes`/`file_edges`. Tracking them here would make a follow-up reparse of an
+    /// agent-touched file treat the agent vertex / `authored_by` edge as a vanished
+    /// file element and emit a spurious `node.remove`/`edge.remove`.
+    fn rebuild_file_tracking(&mut self) {
+        let mut file_nodes: HashMap<String, Vec<String>> = HashMap::new();
+        for node in self.nodes.values() {
+            // Agent vertices are live-overlay, not file-tracked by `apply_parsed`.
+            if node.node_type == NodeType::Agent {
+                continue;
+            }
+            if let Some(file_id) = self.owning_file(&node.id) {
+                file_nodes.entry(file_id).or_default().push(node.id.clone());
+            }
+        }
+        let mut file_edges: HashMap<String, Vec<String>> = HashMap::new();
+        for edge in self.edges.values() {
+            // `authored_by` edges are live-overlay, not file-tracked by `apply_parsed`.
+            if edge.kind == EdgeKind::AuthoredBy {
+                continue;
+            }
+            if let Some(file_id) = self.owning_file(&edge.source) {
+                file_edges.entry(file_id).or_default().push(edge.id.clone());
+            }
+        }
+        self.file_nodes = file_nodes;
+        self.file_edges = file_edges;
+    }
+
+    /// Returns the id of the root `file:` node that owns `node_id`, by walking the
+    /// `parent_id` chain to its topmost present ancestor (a node with no `parent_id`,
+    /// i.e. the file). Returns `None` when `node_id` is unknown. A bounded loop guards
+    /// against a malformed parent cycle, so it never hangs or panics.
+    fn owning_file(&self, node_id: &str) -> Option<String> {
+        let mut current = self.nodes.get(node_id)?;
+        for _ in 0..=self.nodes.len() {
+            match current.parent_id.as_deref().and_then(|p| self.nodes.get(p)) {
+                Some(parent) => current = parent,
+                None => return Some(current.id.clone()),
+            }
+        }
+        Some(current.id.clone())
     }
 
     /// Inserts `node`, or replaces the existing node with the same [`Node::id`].
@@ -765,10 +877,10 @@ pub(crate) fn monotonic_now_ms() -> u64 {
 mod tests {
     use super::Graph;
     use crate::clv::ClvEvent;
-    use crate::parser::parse_rust_source;
+    use crate::parser::{parse_rust_source, parse_source};
     use crate::wire::{
-        agent_node_id, edge_id, node_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
-        HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+        agent_node_id, edge_id, node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
+        EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -1667,6 +1779,177 @@ mod tests {
             roster_row(&agents, 333).status,
             "inactive",
             "one ms past the window the process expires, got {agents:?}"
+        );
+    }
+
+    // ---- P9-1: Graph::from_records rehydration constructor ----
+
+    /// Models the load path for one file: parses `(path, src)` and strips each
+    /// node's `child_ids` (the unpersisted field `load_nodes` returns as `[]`), so
+    /// [`Graph::from_records`] must re-derive them from the `contains` edges (DD#7).
+    fn loaded_records(path: &str, src: &str) -> (Vec<Node>, Vec<Edge>) {
+        let parsed = parse_source(path, src);
+        let nodes = parsed
+            .nodes
+            .into_iter()
+            .map(|mut n| {
+                n.child_ids = Vec::new();
+                n
+            })
+            .collect();
+        (nodes, parsed.edges)
+    }
+
+    /// Normalises a `snapshot` envelope for order-independent comparison: nodes
+    /// sorted by id with each node's `child_ids` sorted, edges sorted by id.
+    fn normalised_snapshot(env: &EventEnvelope) -> (Vec<Node>, Vec<Edge>) {
+        let mut nodes = snapshot_nodes(env);
+        for n in &mut nodes {
+            n.child_ids.sort();
+        }
+        nodes.sort_by_key(|n| n.id.clone());
+        let mut edges = snapshot_edges(env);
+        edges.sort_by_key(|e| e.id.clone());
+        (nodes, edges)
+    }
+
+    #[test]
+    fn from_records_snapshot_equals_parsed_baseline() {
+        // AC#3: a graph rebuilt from loaded records (child_ids stripped) has a
+        // snapshot equal — order-independently, child_ids re-derived — to a graph
+        // that PARSED the same file.
+        let src = "fn alpha() { let x = 1; }\nfn beta() {}";
+
+        let mut baseline = Graph::new();
+        let _ = baseline.apply_parsed(parse_source("a.rs", src));
+
+        let (nodes, edges) = loaded_records("a.rs", src);
+        let rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        assert_eq!(
+            normalised_snapshot(&rebuilt.snapshot()),
+            normalised_snapshot(&baseline.snapshot()),
+            "rebuilt snapshot must equal the parsed-baseline snapshot"
+        );
+    }
+
+    #[test]
+    fn from_records_single_file_reparse_is_a_noop() {
+        // AC#3 load-bearing proof: after rebuilding from loaded records, re-parsing
+        // the SAME unchanged file emits no node.upsert/node.remove — proving the
+        // child_ids re-derivation and the file_nodes/file_edges rebuild are correct.
+        let src = "fn alpha() { let x = 1; }\nfn beta() {}";
+        let (nodes, edges) = loaded_records("a.rs", src);
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse of an unchanged file must be a no-op, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_multi_file_reparse_one_leaves_other_intact() {
+        // AC#4: rebuild from two files' records, re-parse ONE unchanged file → empty
+        // diff AND the other file's nodes are not removed.
+        let a_src = "fn alpha() { let x = 1; }";
+        let b_src = "fn beta() {}";
+
+        let (mut nodes, mut edges) = loaded_records("a.rs", a_src);
+        let (b_nodes, b_edges) = loaded_records("b.rs", b_src);
+        nodes.extend(b_nodes);
+        edges.extend(b_edges);
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", a_src));
+        assert!(
+            diff.is_empty(),
+            "reparse of unchanged a.rs must be a no-op, got {diff:?}"
+        );
+
+        // b.rs's nodes must survive the a.rs reparse (no cross-file removal).
+        let (b_children, _) = rebuilt.children_of("file:b.rs");
+        assert!(
+            b_children.iter().any(|n| n.id == "fn:b.rs:beta"),
+            "b.rs function must not be removed by reparsing a.rs, got {b_children:?}"
+        );
+        let roots = snapshot_nodes(&rebuilt.snapshot());
+        assert!(
+            roots.iter().any(|n| n.id == "file:b.rs"),
+            "b.rs file root must remain after reparsing a.rs, got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_reparse_noop_is_edge_order_independent() {
+        // Finding #2 regression: neither backend's `load_edges` has an `ORDER BY`, so
+        // the loaded edge order is arbitrary. `from_records` must derive `child_ids`
+        // canonically (sorted) — NOT in incidental edge order — or a differently-ordered
+        // child list makes a rebuilt node fail the byte-equality no-op check on reparse.
+        // The variable names (c, a, b) are deliberately out of source order so the sort
+        // genuinely reorders them; reversing the loaded edges before rebuilding proves
+        // the no-op holds regardless of edge order.
+        let src = "fn alpha() { let c = 1; let a = 2; let b = 3; }\nfn beta() {}";
+        let (nodes, mut edges) = loaded_records("a.rs", src);
+        edges.reverse();
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse must be a no-op regardless of loaded edge order, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_with_agent_overlay_reparse_emits_no_spurious_removal() {
+        // Finding #3 regression: `rebuild_file_tracking` must NOT absorb agent-layer
+        // overlays — the live `apply_clv` path never file-tracks an `agent` vertex or an
+        // `authored_by` edge. With both present in the loaded records (as a crash would
+        // have persisted them), reparsing the agent-touched source file unchanged must
+        // be a no-op — no spurious `node.remove`/`edge.remove` for the overlay.
+        let src = "fn alpha() { let x = 1; }";
+        let (mut nodes, mut edges) = loaded_records("a.rs", src);
+
+        // The agent overlay `apply_clv` would have produced + persisted: a root agent
+        // vertex and an `authored_by` edge from the touched function to it.
+        let agent_vertex = agent_node_id("tdd-green");
+        nodes.push(Node {
+            id: agent_vertex.clone(),
+            node_type: NodeType::Agent,
+            label: "tdd-green".to_string(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            status: NodeStatus::Unknown,
+            docs: None,
+            signature: None,
+            meta: None,
+        });
+        let authored_by_id = typed_edge_id("fn:a.rs:alpha", &agent_vertex, EdgeKind::AuthoredBy);
+        edges.push(Edge {
+            id: authored_by_id.clone(),
+            source: "fn:a.rs:alpha".to_string(),
+            target: agent_vertex.clone(),
+            kind: EdgeKind::AuthoredBy,
+            hot: false,
+        });
+
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse of an agent-touched file must not disturb the agent overlay, got {diff:?}"
+        );
+        // The overlay must survive the reparse (not removed as a vanished file element).
+        assert!(
+            rebuilt.edges.contains_key(&authored_by_id),
+            "the authored_by edge must survive the reparse"
+        );
+        assert!(
+            rebuilt.nodes.contains_key(&agent_vertex),
+            "the agent vertex must survive the reparse"
         );
     }
 }
