@@ -6,7 +6,12 @@
 	`data.onSelect(id)`, which `Graph.svelte` threads in to open the node in the
 	selection sidebar. The node's documentation (`data.docs`) is bound to a `title`
 	attribute so hovering any tier (file/function/variable) shows its description as
-	a tooltip. Clicking the expand button calls `data.onToggle(id)` (injected by
+	a tooltip. The node is colour-coded by its live `data.status` (SPEC §9.6): the
+	`STATUS_NODE_CLASS` mapping drives the border/background (green passing, red
+	failing, pulsing running, grey stale, hatched error, neutral unknown), and a
+	`data-status` attribute exposes the raw status for tests/styling. Because
+	`status` is threaded straight from the store, a `test.result`/`status.update`
+	event recolours the node live. Clicking the expand button calls `data.onToggle(id)` (injected by
 	`Graph.svelte` to flip the node's id in its expansion set, requesting or
 	discarding its subtree) and first `stopPropagation`s so expanding never also
 	selects. Source/target handles let `contains` edges attach. Both buttons carry
@@ -16,7 +21,7 @@
 -->
 <script lang="ts">
 	import { Handle, Position, type NodeProps, type Node as FlowNode } from '@xyflow/svelte';
-	import type { HierarchyNodeData } from './layout';
+	import { STATUS_NODE_CLASS, type HierarchyNodeData } from './layout';
 
 	/** Layout/selection data plus the toggle callback injected by `Graph.svelte`. */
 	type NodeData = HierarchyNodeData & { onToggle: (nodeId: string) => void };
@@ -25,7 +30,8 @@
 </script>
 
 <div
-	class="flex items-center gap-2 rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 shadow-sm dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+	class={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm text-neutral-900 shadow-sm dark:text-neutral-100 ${STATUS_NODE_CLASS[data.status]}`}
+	data-status={data.status}
 	title={data.docs}
 >
 	<button

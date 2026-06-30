@@ -5,7 +5,7 @@ import { tick } from 'svelte';
 import Graph from './Graph.svelte';
 import HierarchyNodeHarness from './HierarchyNode.harness.svelte';
 import { ingest, graphStore, initialState } from './ws';
-import type { Node, Edge, EventEnvelope } from './types';
+import type { Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
 
 const fileNode: Node = {
 	id: 'file:src/x.rs',
@@ -188,6 +188,7 @@ describe('HierarchyNode doc tooltip', () => {
 					label: 'alpha',
 					expandable: false,
 					expanded: false,
+					status: 'unknown',
 					docs: 'Hello docs',
 					onSelect: () => {},
 					onToggle: () => {}
@@ -303,5 +304,75 @@ describe('Graph.svelte edge rendering + flow filter', () => {
 
 		// Data flow stays on, so a data-flow edge would still render.
 		expect((getByRole('checkbox', { name: /data flow/i }) as HTMLInputElement).checked).toBe(true);
+	});
+});
+
+// P5-5: colour nodes by status. The node carries a `data-status` marker plus a
+// status-keyed colour class; SvelteFlow leaves nodes `visibility: hidden` in
+// jsdom, but attributes/classes are still inspectable via a container query.
+function mountStatus(status: NodeStatus) {
+	return render(HierarchyNodeHarness, {
+		props: {
+			id: 'fn:src/x.rs:alpha',
+			data: {
+				label: 'alpha',
+				expandable: false,
+				expanded: false,
+				status,
+				onSelect: () => {},
+				onToggle: () => {}
+			}
+		}
+	});
+}
+
+const statusEl = (container: HTMLElement, status: NodeStatus): Element | null =>
+	container.querySelector(`[data-status="${status}"]`);
+
+describe('HierarchyNode status colouring', () => {
+	it('marks a failing node with a failing/red marker', () => {
+		const { container } = mountStatus('failing');
+		const el = statusEl(container, 'failing');
+		expect(el).toBeTruthy();
+		expect(el?.className).toMatch(/red/);
+	});
+
+	it('marks a passing node with a passing/green marker', () => {
+		const { container } = mountStatus('passing');
+		const el = statusEl(container, 'passing');
+		expect(el).toBeTruthy();
+		expect(el?.className).toMatch(/green/);
+	});
+
+	it('marks an unknown node with neither a passing nor failing colour marker', () => {
+		const { container } = mountStatus('unknown');
+		const el = statusEl(container, 'unknown');
+		expect(el).toBeTruthy();
+		expect(el?.className).not.toMatch(/red|green/);
+	});
+});
+
+function testResult(nodeId: string, outcome: TestOutcome): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-28T00:00:03.000Z',
+		sessionId: 'sess-test',
+		type: 'test.result',
+		payload: { nodeId, testId: 't1', outcome, sessionId: 'sess-test' }
+	};
+}
+
+describe('Graph.svelte live status recolour', () => {
+	it('recolours a rendered node to failing when a test.result fail arrives', async () => {
+		ingest(snapshot([fileNode])); // status 'unknown'
+		const { container } = render(Graph);
+		await tick();
+		await waitFor(() => expect(statusEl(container, 'unknown')).toBeTruthy());
+
+		// applyEvent (P5-1) folds the outcome onto the node's status; the canvas recolours
+		// with no extra wiring once buildHierarchy threads status into node data.
+		ingest(testResult('file:src/x.rs', 'fail'));
+		await waitFor(() => expect(statusEl(container, 'failing')).toBeTruthy());
+		expect(statusEl(container, 'unknown')).toBeNull();
 	});
 });
