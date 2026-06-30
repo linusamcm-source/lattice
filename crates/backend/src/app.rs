@@ -18,12 +18,18 @@
 //! Persistence is an **opt-in, best-effort write-through** (Phase 7,
 //! `DATA_MODEL.md` §B): set `LATTICE_DB_URL` and [`run`] also subscribes a task that
 //! durably records the structured event stream to that database via
-//! [`crate::storage`]; unset, the backend runs exactly as before. The store is
-//! observability rather than a hard dependency, so a storage failure (bad URL,
-//! unreachable DB, schema error, per-event write error) is logged and **degrades
-//! gracefully** — the watch/WS/collector path is never failed or interrupted by it.
-//! Tests drive [`run_with_db_url`] to pass an explicit URL without the process-global
-//! env var.
+//! [`crate::storage`]; unset, the backend runs exactly as before. With a database set,
+//! [`run_with_db_url`] additionally **crash-rebuilds** (Phase 9): before serving, it
+//! warm-starts the in-memory [`Graph`] from the persisted run-session records
+//! ([`Storage::load_nodes`](crate::storage::Storage::load_nodes) /
+//! [`load_edges`](crate::storage::Storage::load_edges) → [`Graph::from_records`]) so a
+//! restart's first snapshot reflects the prior run, then the filesystem re-parse
+//! reconciles drift. The store is observability rather than a hard dependency, so a
+//! storage failure (bad URL, unreachable DB, schema error, rehydrate read error,
+//! per-event write error) is logged and **degrades gracefully** to the
+//! empty-then-parse path — the watch/WS/collector path is never failed or interrupted
+//! by it. Tests drive [`run_with_db_url`] to pass an explicit URL without the
+//! process-global env var.
 //!
 //! File paths are normalised to repo-relative form (matching `DATA_MODEL.md` §A.1
 //! ids such as `fn:a.rs:alpha`) by stripping the **canonicalised** repository
@@ -154,33 +160,46 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
     run_with_db_url(root, addr, std::env::var("LATTICE_DB_URL").ok()).await
 }
 
-/// Starts the Lattice backend against `root` on `addr`, optionally write-through
-/// persisting the structured event stream to `db_url`.
+/// Starts the Lattice backend against `root` on `addr`, optionally crash-rebuilding
+/// the graph from `db_url` and write-through persisting the structured event stream
+/// back to it.
 ///
-/// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
-/// or TypeScript) into a fresh [`Graph`], starts the WebSocket [`serve`]r, and spawns
-/// the watcher pump (re-parses changed files, broadcasting their patch events) and
-/// the CLV [`collect`]or.
+/// Boot order is **rehydrate, then reconcile, then serve** (Phase 9, crash-rebuild):
+/// 1. Canonicalise `root` and, when `db_url` is [`Some`], [`open_store`] +
+///    [`ensure_schema`](crate::storage::Storage::ensure_schema) +
+///    [`record_session`](crate::storage::Storage::record_session) (keyed by
+///    [`RUN_SESSION_ID`]).
+/// 2. **Warm start:** while the store is still owned (before the persist task moves
+///    it), read the persisted run-session graph via
+///    [`load_nodes`](crate::storage::Storage::load_nodes) /
+///    [`load_edges`](crate::storage::Storage::load_edges) — keyed on the
+///    [`RUN_SESSION_ID`] constant, **not** a most-recent-session lookup — and rebuild
+///    the initial [`Graph`] with [`Graph::from_records`]. With no `db_url` (or on any
+///    read failure) the initial graph is an empty [`Graph::new`].
+/// 3. **Reconcile:** the WalkDir initial parse re-parses every on-disk source file
+///    (Rust, Python, or TypeScript) over the warm-started graph — the **filesystem
+///    wins**, so a stale persisted file is corrected and an empty graph is filled.
+/// 4. Start the WebSocket [`serve`]r (whose first snapshot now reflects the
+///    rehydrated-and-reconciled roots), then spawn the watcher pump (re-parses
+///    changed files, broadcasting patch events) and the CLV [`collect`]or.
 ///
-/// When `db_url` is [`Some`], a **best-effort** persistence task is additionally
-/// spawned: it [`open_store`]s the backend selected by the URL scheme, applies the
-/// schema ([`ensure_schema`](crate::storage::Storage::ensure_schema)), records the
-/// run's `sessions` row ([`record_session`](crate::storage::Storage::record_session)
-/// keyed by [`RUN_SESSION_ID`]), then subscribes to the broadcast channel and
-/// write-throughs every structured [`EventEnvelope`] via
+/// When `db_url` is [`Some`], the **best-effort** persistence task subscribes to the
+/// broadcast channel and write-throughs every structured [`EventEnvelope`] via
 /// [`persist`](crate::storage::Storage::persist). Only structured events flow on that
 /// channel, so raw/untagged stdout is never persisted (`DATA_MODEL.md` §B.5). When
-/// `db_url` is [`None`] the backend runs with no database, identical to before this
-/// story.
+/// `db_url` is [`None`] the backend runs with no database, identical to before the
+/// crash-rebuild story (empty graph, then filesystem parse).
 ///
 /// # Graceful degradation
 /// Storage is observability, not a hard dependency, so it must never take down the
-/// watch/WS/collector path. If [`open_store`] or
-/// [`ensure_schema`](crate::storage::Storage::ensure_schema) fails, the failure is
-/// logged to stderr and the run continues **without** persistence
-/// ([`RunHandle::store_task`](RunHandle) is [`None`]). A per-event
-/// [`persist`](crate::storage::Storage::persist) error is likewise logged and
-/// skipped — the persistence task never panics and keeps consuming the channel.
+/// watch/WS/collector path. If [`open_store`],
+/// [`ensure_schema`](crate::storage::Storage::ensure_schema), or a rehydrate read
+/// ([`load_nodes`](crate::storage::Storage::load_nodes) /
+/// [`load_edges`](crate::storage::Storage::load_edges)) fails, the failure is logged
+/// to stderr and the run continues on the **empty-then-parse** path (no warm start;
+/// [`RunHandle::store_task`](RunHandle) is [`None`] for an open/schema failure). A
+/// per-event [`persist`](crate::storage::Storage::persist) error is likewise logged
+/// and skipped — the persistence task never panics and keeps consuming the channel.
 ///
 /// # Errors
 /// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
@@ -192,19 +211,24 @@ pub async fn run_with_db_url(
     db_url: Option<String>,
 ) -> std::io::Result<RunHandle> {
     let root = std::fs::canonicalize(&root)?;
-    let graph = Arc::new(Mutex::new(Graph::new()));
     let (events_tx, _) = broadcast::channel::<EventEnvelope>(EVENT_CHANNEL_CAPACITY);
 
-    // Opt-in, best-effort write-through persistence. The subscriber is registered
-    // here — before any task can send — so no structured event is missed; any
-    // storage failure degrades to `None` (no persistence) and never fails the run.
-    let store_task = match db_url {
-        None => None,
+    // Opt-in, best-effort write-through persistence with a crash-rebuild warm start.
+    // The store is opened and **read for rehydration here** — while it is still owned,
+    // BEFORE the persist task moves it (`store` is a `Box<dyn Storage>`, not shared) —
+    // so the initial graph can be rebuilt from the DB (`load_nodes`/`load_edges` keyed
+    // on the `RUN_SESSION_ID` constant, not a most-recent-session lookup) ahead of the
+    // WalkDir re-parse that reconciles drift. The subscriber is registered here —
+    // before any task can send — so no structured event is missed. Every storage/read
+    // failure logs and degrades to an empty `Graph::new()` (then-parse), exactly like
+    // the no-`db_url` path; persistence is observability, never a hard dependency.
+    let (initial_graph, store_task) = match db_url {
+        None => (Graph::new(), None),
         Some(url) => match open_store(&url).await {
             Ok(store) => {
                 if let Err(error) = store.ensure_schema().await {
                     eprintln!("lattice: storage disabled (schema error: {error})");
-                    None
+                    (Graph::new(), None)
                 } else {
                     if let Err(error) = store
                         .record_session(RUN_SESSION_ID, &root.display().to_string())
@@ -214,8 +238,21 @@ pub async fn run_with_db_url(
                         // upserts the session row on first sight (`DATA_MODEL.md` §B.2).
                         eprintln!("lattice: record_session failed: {error}");
                     }
+                    // Crash-rebuild warm start: read the persisted run-session graph
+                    // BEFORE the store is moved into the persist task. A read error
+                    // (e.g. a corrupted row) degrades to an empty graph (then-parse).
+                    let graph = match (
+                        store.load_nodes(RUN_SESSION_ID).await,
+                        store.load_edges(RUN_SESSION_ID).await,
+                    ) {
+                        (Ok(nodes), Ok(edges)) => Graph::from_records(RUN_SESSION_ID, nodes, edges),
+                        (Err(error), _) | (_, Err(error)) => {
+                            eprintln!("lattice: rehydrate disabled (read error: {error})");
+                            Graph::new()
+                        }
+                    };
                     let mut rx = events_tx.subscribe();
-                    Some(tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 Ok(env) => {
@@ -233,17 +270,22 @@ pub async fn run_with_db_url(
                                 Err(broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                    }))
+                    });
+                    (graph, Some(task))
                 }
             }
             Err(error) => {
                 eprintln!("lattice: storage disabled ({error})");
-                None
+                (Graph::new(), None)
             }
         },
     };
 
-    // Initial parse: fill the graph so the first snapshot reflects the repo.
+    let graph = Arc::new(Mutex::new(initial_graph));
+
+    // Initial parse: reconcile the (possibly warm-started) graph against the on-disk
+    // source — the filesystem wins, so a re-parse corrects any drift in the rehydrated
+    // graph and fills an empty one. The first snapshot reflects the repo.
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if is_source_file(path) {
@@ -286,7 +328,7 @@ pub async fn run_with_db_url(
 mod tests {
     use super::*;
     use crate::watcher::DEBOUNCE;
-    use crate::wire::{EventType, Node, NodeStatus, Payload, TestOutcome};
+    use crate::wire::{Edge, EventType, Node, NodeStatus, Payload, TestOutcome};
     use futures_util::{SinkExt, StreamExt};
     use std::io::Write;
     use std::path::Path;
@@ -924,6 +966,440 @@ mod tests {
         assert_eq!(
             total, 1,
             "raw and malformed sink lines must not persist any test_results row"
+        );
+        handle.shutdown().await;
+    }
+
+    // ---- P9-2: crash-rebuild — rehydrate the graph from the DB at startup ----
+    //
+    // These integration tests mirror the `initial_snapshot_is_root_only_…` full-stack
+    // template: seed a file-backed SQLite DB with a prior run's persisted graph, then
+    // boot `run_with_db_url` against it and assert the FIRST `snapshot` already
+    // reflects the persisted roots — i.e. the warm start rehydrated the graph BEFORE
+    // any file was re-parsed (`Storage::load_nodes`/`load_edges` →
+    // `Graph::from_records`, keyed on the `RUN_SESSION_ID` constant). Tests 1, 2 and 5
+    // are RED until that wiring exists (the graph boots empty today); tests 3 and 4
+    // guard the no-DB and read-error degradation paths.
+
+    /// Builds a `node.upsert` [`EventEnvelope`] stamped with `session_id`, modelling a
+    /// prior run's write-through of one parsed node (the sqlite `node.upsert` arm keys
+    /// the persisted `nodes` row on `env.session_id`). Test-only.
+    fn upsert_node_env(session_id: &str, node: Node) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::NodeUpsert,
+            payload: Payload::NodeUpsert { node },
+        }
+    }
+
+    /// Builds an `edge.upsert` [`EventEnvelope`] stamped with `session_id` — the edge
+    /// twin of [`upsert_node_env`]. Test-only.
+    fn upsert_edge_env(session_id: &str, edge: Edge) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::EdgeUpsert,
+            payload: Payload::EdgeUpsert { edge },
+        }
+    }
+
+    /// Builds a `test.result` [`EventEnvelope`] under `session_id` — used to plant a
+    /// distinct, later-started `sessions` row so the multi-session regression can prove
+    /// rehydrate keys on [`RUN_SESSION_ID`], not the most-recent session. Test-only.
+    fn test_result_env(session_id: &str, node_id: &str) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-02-02T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::TestResult,
+            payload: Payload::TestResult {
+                node_id: node_id.to_string(),
+                test_id: "t-seed".to_string(),
+                outcome: TestOutcome::Pass,
+                duration_ms: None,
+                session_id: session_id.to_string(),
+                agent_id: None,
+                process_id: None,
+                message: None,
+            },
+        }
+    }
+
+    /// Seeds a file-backed SQLite DB at `db_url` with the parsed nodes/edges of each
+    /// `(path, src)` file, persisted as `node.upsert`/`edge.upsert` envelopes under
+    /// `session_id` — modelling exactly what a prior run's write-through persistence
+    /// stored for a session's graph (`DATA_MODEL.md` §B).
+    ///
+    /// Test-only helper. The store's pool is dropped on return; the committed rows
+    /// survive on the file-backed database for a later [`open_store`] (the run under
+    /// test) to read back via [`Storage::load_nodes`]/[`Storage::load_edges`].
+    async fn seed_persisted_graph(db_url: &str, session_id: &str, files: &[(&str, &str)]) {
+        let store = open_store(db_url).await.expect("open seed store");
+        store.ensure_schema().await.expect("seed schema");
+        store
+            .record_session(session_id, "/seed/repo")
+            .await
+            .expect("seed sessions row");
+        for (path, src) in files {
+            let parsed = parse_source(path, src);
+            for node in parsed.nodes {
+                store
+                    .persist(&upsert_node_env(session_id, node))
+                    .await
+                    .expect("persist seed node");
+            }
+            for edge in parsed.edges {
+                store
+                    .persist(&upsert_edge_env(session_id, edge))
+                    .await
+                    .expect("persist seed edge");
+            }
+        }
+    }
+
+    /// Collects a `snapshot` envelope's root node ids (panicking if the first envelope
+    /// is not a snapshot) — the first frame the server sends on connect (`ws.rs:135`).
+    fn snapshot_root_ids(env: &EventEnvelope) -> Vec<String> {
+        match &env.payload {
+            Payload::Snapshot { nodes, .. } => nodes.iter().map(|n| n.id.clone()).collect(),
+            other => panic!("expected a snapshot envelope, got {other:?}"),
+        }
+    }
+
+    /// AC#1 (rebuild-from-seeded-DB). A file-backed SQLite DB pre-seeded with persisted
+    /// nodes/edges for [`RUN_SESSION_ID`], booted against an **empty** repo dir (so the
+    /// WalkDir re-parse adds nothing), must yield a **non-empty** first `snapshot`
+    /// carrying the persisted roots — proving the graph was rehydrated from the DB
+    /// BEFORE any file was re-parsed.
+    ///
+    /// RED today: `run_with_db_url` boots `Graph::new()` (always empty) and the empty
+    /// repo parses nothing, so the first snapshot has no `file:` roots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_from_seeded_db_first_snapshot_carries_persisted_roots() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("seed.db").display());
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[
+                ("seed_a.rs", "fn alpha() {}"),
+                ("seed_b.rs", "fn gamma() {}"),
+            ],
+        )
+        .await;
+
+        // Empty repo dir → the initial WalkDir re-parse adds nothing, so any snapshot
+        // content can only have come from the DB rehydrate.
+        let repo = tempdir().expect("repo tempdir");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Snapshot);
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:seed_a.rs"),
+            "first snapshot must carry the rehydrated root file:seed_a.rs before any reparse: {roots:?}"
+        );
+        assert!(
+            roots.iter().any(|id| id == "file:seed_b.rs"),
+            "first snapshot must carry the rehydrated root file:seed_b.rs before any reparse: {roots:?}"
+        );
+        // Lazy snapshot: the rehydrated child function is NOT in the root payload.
+        assert!(
+            !roots.iter().any(|id| id == "fn:seed_a.rs:alpha"),
+            "rehydrated snapshot stays lazy — no child function at the root: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#2 (multi-session regression — adversarial-review HIGH). With the DB holding
+    /// the [`RUN_SESSION_ID`] graph PLUS a distinct, later-started CLV session (its own
+    /// nodes and a `test.result` row), the rehydrate must still load the
+    /// [`RUN_SESSION_ID`] nodes — proving it keys on the run-session constant, not a
+    /// "most-recent session" lookup (which would load the other session's nodes, or
+    /// zero run-session rows).
+    ///
+    /// RED today: no rehydrate runs at all, so the empty-repo snapshot is empty —
+    /// `file:run_file.rs` is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_keys_on_run_session_not_most_recent_session() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("multi.db").display());
+
+        // The run-session graph — what a warm start must restore.
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[("run_file.rs", "fn run_fn() {}")],
+        )
+        .await;
+
+        // A DISTINCT, later-started session with its OWN, different nodes …
+        let other = "sess-newer-deadbeef";
+        seed_persisted_graph(&db_url, other, &[("other_file.rs", "fn other_fn() {}")]).await;
+        // … plus a `test.result` row, so the other session is the most-recently-written
+        // `sessions` row a naive most-recent lookup would pick.
+        let store = open_store(&db_url)
+            .await
+            .expect("open for other test.result");
+        store
+            .persist(&test_result_env(other, "fn:other_file.rs:other_fn"))
+            .await
+            .expect("persist other session test.result");
+        drop(store);
+
+        let repo = tempdir().expect("repo tempdir");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:run_file.rs"),
+            "rehydrate must load the RUN_SESSION_ID graph: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "file:other_file.rs"),
+            "rehydrate must NOT load a different (most-recent) session's nodes: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#3 (no-DB regression guard). With `db_url == None`, boot is byte-for-byte
+    /// today's behaviour: an empty graph filled by the filesystem parse, served as a
+    /// lazy root-only `snapshot`. Passes today and must keep passing once rehydrate is
+    /// wired (the rehydrate path must never touch the no-DB case).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_db_boot_is_root_only_filesystem_snapshot() {
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("only.rs"), "fn only() {}").expect("write");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), None)
+            .await
+            .expect("run");
+        assert!(
+            handle.store_task.is_none(),
+            "no persistence task when there is no db_url"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:only.rs"),
+            "no-DB boot still parses and serves the on-disk file root: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "fn:only.rs:only"),
+            "no-DB snapshot stays lazy — no child function at the root: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 (read-error degradation). A persisted node whose `type` column is corrupted
+    /// to an unknown wire enum makes [`Storage::load_nodes`] return a
+    /// [`StorageError`](crate::storage::StorageError) — the rehydrate read error the
+    /// boot must catch, log, and degrade past, falling back to the empty-then-parse
+    /// path: the on-disk file is still parsed and served, and the run never panics or
+    /// aborts. Passes today (rehydrate is unwired); once wired it exercises the
+    /// caught-error branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_read_error_degrades_to_empty_then_parse() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("corrupt.db").display());
+        seed_persisted_graph(&db_url, RUN_SESSION_ID, &[("ghost.rs", "fn ghost() {}")]).await;
+
+        // Corrupt the persisted node's enum so the read side cannot reconstruct it —
+        // load_nodes must surface a StorageError, never panic.
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("open db to corrupt the row");
+        sqlx::query("UPDATE nodes SET type = 'not-a-real-type' WHERE session_id = ?")
+            .bind(RUN_SESSION_ID)
+            .execute(&pool)
+            .await
+            .expect("corrupt the persisted node type");
+        pool.close().await;
+
+        // A live on-disk file the empty-then-parse fallback must still serve.
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("live.rs"), "fn live() {}").expect("write live");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run must not panic/abort on a rehydrate read error");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:live.rs"),
+            "a rehydrate read error must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "file:ghost.rs"),
+            "an atomic load error must discard the entire persisted graph — the corrupt seeded node must not leak into the snapshot: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#5 (reconcile-corrects-drift). After a warm start whose persisted graph drifts
+    /// from the on-disk source, the re-parse must win: the served graph matches the
+    /// re-parsed filesystem for files that still exist on disk, while a persisted file
+    /// that is absent on disk remains from the warm start.
+    ///
+    /// The DB holds `drift.rs` → `old_fn` and a `cold.rs` → `cold_fn` that is NOT on
+    /// disk; on disk `drift.rs` instead contains `new_fn`. After rehydrate + reparse:
+    /// - `file:cold.rs` is present (warm-started; it never gets re-parsed) — this is the
+    ///   RED proof: today the graph boots empty so `file:cold.rs` is absent;
+    /// - expanding `file:drift.rs` yields `new_fn` and NOT the stale `old_fn` — reconcile
+    ///   wins over the stale DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_then_reparse_reconciles_drift_filesystem_wins() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("drift.db").display());
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[
+                ("drift.rs", "fn old_fn() {}"),
+                ("cold.rs", "fn cold_fn() {}"),
+            ],
+        )
+        .await;
+
+        // On disk, drift.rs has drifted to new_fn; cold.rs is deliberately absent.
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("drift.rs"), "fn new_fn() {}").expect("write drift");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        // RED proof: the warm-started, on-disk-absent file survives the reparse.
+        assert!(
+            roots.iter().any(|id| id == "file:cold.rs"),
+            "warm start must rehydrate the DB-only file (absent on disk) before reparse — \
+             missing means rehydrate is unwired: {roots:?}"
+        );
+        // The re-parsed file is also a root (from the filesystem).
+        assert!(
+            roots.iter().any(|id| id == "file:drift.rs"),
+            "the on-disk file must be a root after reparse: {roots:?}"
+        );
+
+        // Reconcile wins: expanding drift.rs shows the filesystem's new_fn, not the
+        // stale persisted old_fn.
+        let children = expand_subtree_nodes(&mut ws, "file:drift.rs").await;
+        let child_ids: Vec<&str> = children.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            child_ids.contains(&"fn:drift.rs:new_fn"),
+            "reparse must add the on-disk function fn:drift.rs:new_fn: {child_ids:?}"
+        );
+        assert!(
+            !child_ids.contains(&"fn:drift.rs:old_fn"),
+            "reparse must reconcile away the stale persisted fn:drift.rs:old_fn: {child_ids:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 sibling (open-store fail-soft). A `db_url` whose scheme `open_store` rejects
+    /// (`StorageError::Config`) must degrade exactly like the no-DB path: no persistence
+    /// task, an empty-then-parse graph, and the on-disk file still served — the run never
+    /// fails or panics on a bad storage URL (mirrors the `record_session`/read-error
+    /// degradation the story mandates for every storage failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_db_url_degrades_to_empty_then_parse() {
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("kept.rs"), "fn kept() {}").expect("write");
+
+        let handle = run_with_db_url(
+            repo.path().to_path_buf(),
+            local(),
+            Some("mysql://unsupported/scheme".to_string()),
+        )
+        .await
+        .expect("run must not fail on an unsupported db_url");
+        assert!(
+            handle.store_task.is_none(),
+            "an unsupported db_url scheme must disable persistence (no store task)"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:kept.rs"),
+            "a bad db_url must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 sibling (schema fail-soft). A valid `sqlite:` DB whose `nodes` is a **VIEW**
+    /// opens cleanly (WAL pragma succeeds) but fails
+    /// [`Storage::ensure_schema`](crate::storage::Storage::ensure_schema) — its
+    /// `CREATE INDEX … ON nodes(…)` cannot index a view. The run must degrade to
+    /// empty-then-parse (no persistence task) and still serve the on-disk file, never
+    /// panicking — proving the schema-error branch of the rehydrate boot is fail-soft.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_error_degrades_to_empty_then_parse() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("conflict.db");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        // Pre-create a valid SQLite DB whose `nodes` is a VIEW: connect (real DB) and the
+        // WAL pragma succeed, but ensure_schema's index-on-`nodes` cannot index a view, so
+        // ensure_schema errors — the connect-ok / schema-fail branch (not an open error).
+        let setup = sqlx::SqlitePool::connect(&format!("{db_url}?mode=rwc"))
+            .await
+            .expect("create conflict db");
+        sqlx::query("CREATE VIEW nodes AS SELECT 1 AS x")
+            .execute(&setup)
+            .await
+            .expect("create conflicting view");
+        setup.close().await;
+
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("survives.rs"), "fn survives() {}").expect("write");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run must not fail on a schema error");
+        assert!(
+            handle.store_task.is_none(),
+            "a schema error must disable persistence (no store task)"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:survives.rs"),
+            "a schema error must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
         );
         handle.shutdown().await;
     }
