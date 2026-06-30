@@ -339,6 +339,9 @@ impl Storage for SqliteStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::AgentActivity { .. } | Payload::AgentRoster { .. } => {
+                // Phase-8 agent-layer payloads — persistence lands in P8-3 (no-op here).
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -977,6 +980,66 @@ mod tests {
             1,
             "only structured events persist"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_activity_and_roster_payloads_persist_nothing() {
+        // P8-1 only adds the `Payload::AgentActivity`/`AgentRoster` wire variants plus
+        // a `=> {}` catch-all arm in `persist`; the real `agent_activity`/`agents`
+        // writes land in P8-3. So persisting an agent payload must return `Ok(())` and
+        // write zero rows to every table (the per-event transaction commits empty).
+        use crate::wire::AgentInfo;
+        let (store, _dir) = temp_store().await;
+
+        let activity = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::AgentActivity,
+            payload: Payload::AgentActivity {
+                agent_id: "security-scanner".to_string(),
+                action: "modified".to_string(),
+                node_id: "fn:a.rs:f".to_string(),
+                session_id: "sess-1".to_string(),
+                process_id: Some(48590),
+                ts: None,
+                msg: None,
+            },
+        };
+        store
+            .persist(&activity)
+            .await
+            .expect("agent.activity persist must be a no-op returning Ok(())");
+
+        let roster = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::AgentRoster,
+            payload: Payload::AgentRoster {
+                session_id: "sess-1".to_string(),
+                agents: vec![AgentInfo {
+                    process_id: 48213,
+                    agent_id: "tdd-green".to_string(),
+                    agent_type: "implementation".to_string(),
+                    color: "#2ecc71".to_string(),
+                    status: "active".to_string(),
+                    protocol_version: None,
+                }],
+            },
+        };
+        store
+            .persist(&roster)
+            .await
+            .expect("agent.roster persist must be a no-op returning Ok(())");
+
+        for table in TABLES {
+            assert_eq!(
+                count(&store, table).await,
+                0,
+                "agent payload must write no rows in P8-1, but {table} has rows"
+            );
+        }
     }
 
     #[tokio::test]

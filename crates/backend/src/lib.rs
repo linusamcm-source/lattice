@@ -6,10 +6,11 @@
 //! ## Modules
 //! - [`wire`] — the CLV JSON-over-WebSocket contract: serde [`wire::Node`],
 //!   [`wire::Edge`], and [`wire::EventEnvelope`] types, the payload variants
-//!   (Phase-0 diff set plus the Phase-1 `subtree` lazy-expand reply), and the
+//!   (Phase-0 diff set, the Phase-1 `subtree` lazy-expand reply, and the Phase-8
+//!   `agent.activity` / `agent.roster` agent-layer payloads), and the
 //!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`] / the
-//!   kind-qualified [`wire::typed_edge_id`]) that mirror
-//!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
+//!   kind-qualified [`wire::typed_edge_id`] / the agent [`wire::agent_node_id`])
+//!   that mirror `docs/orignal_specs/DATA_MODEL.md` §A.1–A.5.
 //! - [`clv`] — the read side of the `AGENT_PROTOCOL.md` §2 CLV line protocol:
 //!   [`clv::parse_clv_line`] decodes one `#CLV1`-tagged stdout line into a typed
 //!   [`clv::ClvEvent`] (`activity`/`test`/`status`/`hotedge`), returning [`None`]
