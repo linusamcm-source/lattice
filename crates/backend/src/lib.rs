@@ -33,12 +33,16 @@
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
 //!   `node.*`/`edge.*` patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
 //!   [`graph::Graph::apply_clv`] folds a correlated [`clv::ClvEvent`] onto the live
-//!   graph: a `test`/`status` event recolours the target node's [`wire::NodeStatus`]
-//!   (Phase 5) and a `hotedge` `enter`/`exit` event toggles the target
-//!   [`wire::Edge`] `hot` flag (Phase 6), emitting the matching
-//!   `test.result`/`status.update`/`hot_edge` envelope. An unknown node/edge id, an
-//!   unparsable hot-edge state, a no-change heat transition, or an `activity` event
-//!   is a no-op.
+//!   graph, returning the `Vec` of patch envelopes it produces: a `test`/`status`
+//!   event recolours the target node's [`wire::NodeStatus`] (Phase 5) and a `hotedge`
+//!   `enter`/`exit` event toggles the target [`wire::Edge`] `hot` flag (Phase 6),
+//!   emitting the matching `test.result`/`status.update`/`hot_edge` envelope, while an
+//!   attributed `activity` event (Phase 8 agent layer) upserts a root `agent` vertex
+//!   and an `authored_by` edge from the touched node, updates the per-process
+//!   [`wire::AgentInfo`] roster, and emits `node.upsert`/`edge.upsert`/
+//!   `agent.activity`/`agent.roster`. An unknown node/edge id, an unparsable
+//!   hot-edge state, a no-change heat transition, or an `activity` event missing its
+//!   `agent`/`pid` is a no-op (empty `Vec`).
 //! - [`tracing_layer`] — the Phase-6 runtime tracing emitter (the *write* side of
 //!   the hot-edge seam): [`tracing_layer::HotEdgeLayer`] is a `tracing` layer that
 //!   records an `edge` field off each span and emits a throttled `#CLV1` `hotedge`
@@ -52,9 +56,10 @@
 //!   evidence is the `throttle_bounds_emissions_per_window` throughput-bound test.
 //! - [`collector`] — the Phase-5 CLV collector ([`collector::collect`]): a `tokio`
 //!   task that tails `<root>/.lattice/clv.ndjson`, parses each newly appended line
-//!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
-//!   through [`graph::Graph::apply_clv`] into live node colour, broadcasting the
-//!   resulting patch [`wire::EventEnvelope`]s to connected clients.
+//!   via [`clv::parse_clv_line`], and folds the correlated event through
+//!   [`graph::Graph::apply_clv`], broadcasting **every** resulting patch
+//!   [`wire::EventEnvelope`] (node colour, hot-edge heat, or the Phase-8 agent
+//!   node/edge/roster patches) to connected clients.
 //! - [`storage`] — the Phase-7 persistence seam (`DATA_MODEL.md` §B): a single
 //!   async [`storage::Storage`] trait write-throughs the structured CLV
 //!   [`wire::EventEnvelope`] stream to one of two interchangeable `sqlx` backends —
