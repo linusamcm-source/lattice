@@ -23,7 +23,7 @@ import {
 	type Edge as FlowEdge,
 	type NodeHandle
 } from '@xyflow/svelte';
-import type { Edge, EdgeKind, Node } from './types';
+import type { Edge, EdgeKind, Node, NodeStatus } from './types';
 
 /** Vertical spacing between stacked rows, in pixels. */
 const ROW_HEIGHT = 120;
@@ -51,9 +51,10 @@ const NODE_HANDLES: NodeHandle[] = [
  * Per-node payload carried in a SvelteFlow node's `data`, consumed by the
  * `HierarchyNode` custom node component. `onToggle` is injected by
  * `Graph.svelte` at render time and is therefore not part of this layout type;
- * `onSelect` and `docs`, by contrast, are threaded through {@link buildHierarchy}
- * so `HierarchyNode` can surface a node's documentation (title tooltip) and
- * report selection without `Graph.svelte` re-deriving the data block.
+ * `onSelect`, `docs`, and `status`, by contrast, are threaded through
+ * {@link buildHierarchy} so `HierarchyNode` can surface a node's documentation
+ * (title tooltip), colour it by status, and report selection without
+ * `Graph.svelte` re-deriving the data block.
  */
 export type HierarchyNodeData = {
 	/** Display label (the CLV node's `label`). */
@@ -62,6 +63,12 @@ export type HierarchyNodeData = {
 	expandable: boolean;
 	/** Whether the node is currently expanded (its children are revealed). */
 	expanded: boolean;
+	/**
+	 * The CLV node's live {@link NodeStatus}, copied straight from the store so the
+	 * node recolours (via {@link STATUS_NODE_CLASS}) the moment a `test.result` /
+	 * `status.update` event folds a new status onto it — no extra render wiring.
+	 */
+	status: NodeStatus;
 	/**
 	 * The CLV node's documentation, surfaced as a hover tooltip. Absent when the
 	 * node carries no extracted docs.
@@ -77,6 +84,31 @@ export type HierarchyNodeData = {
 
 /** A positioned SvelteFlow node of the custom `hierarchy` type. */
 export type HierarchyFlowNode = FlowNode<HierarchyNodeData, 'hierarchy'>;
+
+/**
+ * Status → node-styling Tailwind classes, applied by `HierarchyNode` to colour a
+ * node by its live {@link NodeStatus} (SPEC §9.6's visual language):
+ *
+ * - `passing` → green border/tint,
+ * - `failing` → red border/tint,
+ * - `running` → a pulsing animation (the non-colour cue) over a sky tint,
+ * - `stale` → a grey border/tint,
+ * - `error` → a red hatched fill (the `lattice-status-error` rule in `app.css`),
+ * - `unknown` → the neutral default (no colour signal).
+ *
+ * Each entry sets only the border colour, background, and (for `running`/`error`)
+ * the animation / hatch overlay; the layout-independent base classes and the text
+ * colour live on the node element itself so utilities never conflict. Colours come
+ * from Tailwind theme tokens, never hard-coded hex.
+ */
+export const STATUS_NODE_CLASS: Record<NodeStatus, string> = {
+	unknown: 'border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-900',
+	passing: 'border-green-500 bg-green-50 dark:border-green-600 dark:bg-green-950',
+	failing: 'border-red-500 bg-red-50 dark:border-red-600 dark:bg-red-950',
+	running: 'animate-pulse border-sky-500 bg-sky-50 dark:border-sky-600 dark:bg-sky-950',
+	stale: 'border-neutral-400 bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-800',
+	error: 'lattice-status-error border-red-600 bg-red-50 dark:border-red-700 dark:bg-red-950'
+};
 
 function compareId(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
@@ -125,6 +157,7 @@ export function buildHierarchy(
 				label: node.label,
 				expandable: hasChildren(node),
 				expanded: expanded.has(node.id),
+				status: node.status,
 				docs: node.docs,
 				onSelect
 			}

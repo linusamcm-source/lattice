@@ -10,6 +10,11 @@
 //!   deterministic id helpers ([`wire::node_id`] / [`wire::edge_id`] / the
 //!   kind-qualified [`wire::typed_edge_id`]) that mirror
 //!   `docs/orignal_specs/DATA_MODEL.md` §A.1–A.4.
+//! - [`clv`] — the read side of the `AGENT_PROTOCOL.md` §2 CLV line protocol:
+//!   [`clv::parse_clv_line`] decodes one `#CLV1`-tagged stdout line into a typed
+//!   [`clv::ClvEvent`] (`activity`/`test`/`status`/`hotedge`), returning [`None`]
+//!   panic-free for any untagged, non-JSON, or malformed line (the
+//!   ignore-malformed contract).
 //! - [`parser`] — source parsers that lower a single file to the structural
 //!   [`wire::Node`]/[`wire::Edge`] graph contribution. [`parser::parse_source`] is
 //!   the entry point, dispatching on file extension: `syn` for Rust
@@ -26,6 +31,15 @@
 //!   rendering a lazy root-only `snapshot`, serving direct children on `expand`
 //!   ([`graph::Graph::subtree`]), and diffing a re-parsed file into
 //!   `node.*`/`edge.*` patch [`wire::EventEnvelope`]s ([`graph::Graph::apply_parsed`]).
+//!   [`graph::Graph::apply_clv`] (Phase 5) folds a correlated
+//!   [`clv::ClvEvent`] `test`/`status` event onto the target node's
+//!   [`wire::NodeStatus`] colour, emitting the matching `test.result`/`status.update`
+//!   envelope (an unknown node id, or an `activity`/`hotedge` event, is a no-op).
+//! - [`collector`] — the Phase-5 CLV collector ([`collector::collect`]): a `tokio`
+//!   task that tails `<root>/.lattice/clv.ndjson`, parses each newly appended line
+//!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
+//!   through [`graph::Graph::apply_clv`] into live node colour, broadcasting the
+//!   resulting patch [`wire::EventEnvelope`]s to connected clients.
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
@@ -37,9 +51,12 @@
 //!   node's `subtree`.
 //! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
 //!   graph → WebSocket so editing a source file (Rust, Python, or TypeScript)
-//!   updates a connected client's graph live.
+//!   updates a connected client's graph live, and spawns the [`collector`] task so
+//!   tailed CLV `test`/`status` events recolour nodes on that same live graph.
 
 pub mod app;
+pub mod clv;
+pub mod collector;
 pub mod graph;
 pub mod parser;
 pub mod watcher;

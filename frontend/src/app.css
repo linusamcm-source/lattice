@@ -1,1 +1,18 @@
 @import 'tailwindcss';
+
+/*
+ * Hatched fill for a node whose source failed to parse (NodeStatus `error`,
+ * SPEC §9.6). Tailwind has no hatch utility, so this overlays a diagonal stripe
+ * pattern on top of the node's background; the red border/tint comes from the
+ * `STATUS_NODE_CLASS` utilities. Stripe colour uses the Tailwind red theme token
+ * (no hard-coded hex) so it tracks the palette in both light and dark mode.
+ */
+.lattice-status-error {
+	background-image: repeating-linear-gradient(
+		45deg,
+		var(--color-red-400) 0,
+		var(--color-red-400) 2px,
+		transparent 2px,
+		transparent 7px
+	);
+}

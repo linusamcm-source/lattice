@@ -149,6 +149,25 @@ the user filter them by flow class.
   of after the async measurement pass; the real handle bounds take over once a node
   is measured.
 
+## Status colouring (P5-5)
+
+Phase 5 surfaces each node's live `NodeStatus` as colour on the canvas (SPEC §9.6).
+
+- **Threading.** `buildHierarchy` (`src/lib/layout.ts`) copies each CLV node's
+  `status` into its layout `data` (exactly as it threads `docs`), so the colour is
+  derived straight from the store with no extra render wiring.
+- **Mapping.** `STATUS_NODE_CLASS` (`src/lib/layout.ts`) maps each status to the
+  border/background utilities `HierarchyNode.svelte` applies: `passing` → green,
+  `failing` → red, `running` → pulsing (`animate-pulse`, a non-colour cue) sky,
+  `stale` → grey, `error` → a red hatched fill (the `.lattice-status-error`
+  `repeating-linear-gradient` rule in `src/app.css`), and `unknown` → the neutral
+  default. Colours come from Tailwind theme tokens — no hard-coded hex. The node
+  also carries a `data-status` attribute exposing the raw status for tests/styling.
+- **Live recolour.** Because `applyEvent` already folds a `test.result` /
+  `status.update` envelope onto the target node's `status` (P5-1), a delivered
+  failing event flows store → `buildHierarchy` → `HierarchyNode` and recolours the
+  rendered node automatically — no store wiring beyond the status thread.
+
 ## Notes
 
 - Coverage uses the v8 provider and emits `coverage/coverage-final.json`

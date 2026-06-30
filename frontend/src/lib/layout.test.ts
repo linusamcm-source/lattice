@@ -74,6 +74,18 @@ describe('buildHierarchy', () => {
 		const flow = buildHierarchy([lonely], new Set());
 		expect(data(flow[0]).expandable).toBe(false);
 	});
+
+	// P5-5: status threaded into node data so the canvas can colour by status.
+	it('copies a node status into its node data', () => {
+		const failing: Node = { ...file, status: 'failing' };
+		const flow = buildHierarchy([failing], new Set());
+		expect(data(flow[0]).status).toBe('failing');
+	});
+
+	it('threads the default unknown status through to node data', () => {
+		const flow = buildHierarchy([file], new Set());
+		expect(data(flow[0]).status).toBe('unknown');
+	});
 });
 
 // P4-4: edge rendering + kind colour/class + control/data-flow filter.
