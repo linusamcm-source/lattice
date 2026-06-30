@@ -31,9 +31,15 @@
 //!   insert order: `sessions` → `agents` (when pid present) → the event row.
 //! - `hot_edge` persists **only** as the `edges.hot` flag (§B.6 has no hot-edge
 //!   table); the UPDATE is a no-op when the edge row is absent.
-//! - `agent_activity` / `protocol_versions` are **created but never written** in
-//!   Phase 7 — there is no `Payload::AgentActivity`/roster variant, so no such
-//!   envelope reaches `persist`; their writers land in Phase 8.
+//! - `agent_activity` / `protocol_versions` are written by the **Phase-8 agent
+//!   layer**: an `agent.roster` ([`Payload::AgentRoster`]) upserts one **real**
+//!   `agents` row per [`AgentInfo`] (its true `agent_type`/`color`/`status`, keyed by
+//!   `process_id` with `ON CONFLICT(process_id)` so a re-emitted roster flips
+//!   `status`/`updated_at` without duplicating the row — never the `#888888`/agent-id
+//!   placeholders) plus one `protocol_versions` row per process; an `agent.activity`
+//!   ([`Payload::AgentActivity`]) inserts one `agent_activity` row (UUID id), upserting
+//!   its `agents` parent first so the `process_id` `REFERENCES agents(process_id)` FK
+//!   holds even with no prior roster.
 //! - Timestamps are stored as **TEXT rfc3339** (decision-3): a chrono-free format
 //!   that stores byte-identically under both backends.
 //!
@@ -49,7 +55,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use super::{Storage, StorageError};
-use crate::wire::{EventEnvelope, HotEdgeState, Payload};
+use crate::wire::{AgentInfo, EventEnvelope, HotEdgeState, Payload};
 
 /// The §B.6 schema in SQLite dialect, as idempotent `CREATE … IF NOT EXISTS`
 /// statements (decision-2).
@@ -121,7 +127,7 @@ const SCHEMA: &[&str] = &[
         message     TEXT,
         ts          TEXT NOT NULL
     )",
-    // process_id is NULLable (decision-4); table is created but unwritten in Phase 7.
+    // process_id is NULLable (decision-4); written by the Phase-8 agent layer (P8-3).
     "CREATE TABLE IF NOT EXISTS agent_activity (
         id         TEXT PRIMARY KEY,
         process_id INTEGER REFERENCES agents(process_id),
@@ -202,6 +208,9 @@ impl Storage for SqliteStore {
     /// the event has no pid); `status.update` updates `nodes.status`; `hot_edge`
     /// updates `edges.hot` (a no-op when the edge is absent); `node.upsert`/
     /// `edge.upsert` insert-or-replace; `node.remove`/`edge.remove` delete;
+    /// `agent.roster` upserts a **real** `agents` row per [`AgentInfo`] plus a
+    /// `protocol_versions` row per process; `agent.activity` inserts an
+    /// `agent_activity` row (upserting its `agents` parent first for the FK);
     /// `snapshot`/`subtree` (view frames) persist nothing. A `sessions` row is
     /// upserted per event (the DB no-ops a duplicate), and an `agents` row when a
     /// pid is present, before the event row.
@@ -339,8 +348,42 @@ impl Storage for SqliteStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
-            Payload::AgentActivity { .. } | Payload::AgentRoster { .. } => {
-                // Phase-8 agent-layer payloads — persistence lands in P8-3 (no-op here).
+            Payload::AgentActivity {
+                agent_id,
+                action,
+                node_id,
+                session_id,
+                process_id,
+                ts: _,
+                msg: _,
+            } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                // Upsert the agents parent first (placeholder metadata — a later
+                // roster refines it) so the process_id FK holds with no prior roster.
+                if let Some(pid) = *process_id {
+                    upsert_agent(&mut tx, pid, Some(agent_id.as_str()), session_id, &now).await?;
+                }
+                sqlx::query(
+                    "INSERT INTO agent_activity
+                       (id, process_id, session_id, agent_id, action, node_id, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(process_id.map(i64::from))
+                .bind(session_id.as_str())
+                .bind(agent_id.as_str())
+                .bind(action.as_str())
+                .bind(node_id.as_str())
+                .bind(now.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            Payload::AgentRoster { session_id, agents } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                for info in agents {
+                    upsert_roster_agent(&mut tx, info, session_id, &now).await?;
+                    upsert_protocol_version(&mut tx, info, session_id, &now).await?;
+                }
             }
         }
         tx.commit().await?;
@@ -436,6 +479,81 @@ async fn upsert_agent(
     Ok(())
 }
 
+/// Upserts a **real** `agents` row from an [`AgentInfo`] roster entry, enlisting in
+/// the caller's transaction via `conn` (P8-3).
+///
+/// Unlike the bare-pid [`upsert_agent`] (which stamps the `#888888`/agent-id
+/// placeholders), this writes the roster's true `agent_id`/`agent_type`/`color`/
+/// `status`, keyed by `process_id`. `ON CONFLICT(process_id) DO UPDATE` refreshes the
+/// identity/metadata, `session_id`, and `updated_at` on a re-emitted roster (e.g. a
+/// `status` flip), so a process keeps exactly one row — and refines any placeholder
+/// row a prior pid-bearing event seeded. Refreshing `session_id` keeps a reused PID
+/// consistent with its `protocol_versions` row across sessions. The caller must have
+/// upserted the `sessions` row first (FK `agents.session_id`). `now` is the per-event
+/// timestamp the caller computed once.
+async fn upsert_roster_agent(
+    conn: &mut SqliteConnection,
+    info: &AgentInfo,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO agents (process_id, agent_id, agent_type, color, status, session_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(process_id) DO UPDATE SET
+           agent_id = excluded.agent_id,
+           agent_type = excluded.agent_type,
+           color = excluded.color,
+           status = excluded.status,
+           session_id = excluded.session_id,
+           updated_at = excluded.updated_at",
+    )
+    .bind(i64::from(info.process_id))
+    .bind(info.agent_id.as_str())
+    .bind(info.agent_type.as_str())
+    .bind(info.color.as_str())
+    .bind(info.status.as_str())
+    .bind(session_id)
+    .bind(now)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Upserts a `protocol_versions` row for an [`AgentInfo`]'s process, enlisting in the
+/// caller's transaction via `conn` (P8-3).
+///
+/// `version` is the roster's `protocol_version`, defaulting to `"1"` when absent;
+/// `introduced_at` is the per-event `now`. `ON CONFLICT(process_id) DO UPDATE`
+/// refreshes the row on a re-emitted roster, so a process keeps exactly one row. The
+/// caller must have upserted the `sessions` row **and** this process's `agents` row
+/// (via [`upsert_roster_agent`]) first, satisfying the `REFERENCES sessions` and
+/// `REFERENCES agents(process_id)` FKs.
+async fn upsert_protocol_version(
+    conn: &mut SqliteConnection,
+    info: &AgentInfo,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    let version = info.protocol_version.as_deref().unwrap_or("1");
+    sqlx::query(
+        "INSERT INTO protocol_versions (process_id, version, session_id, introduced_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(process_id) DO UPDATE SET
+           version = excluded.version,
+           session_id = excluded.session_id,
+           introduced_at = excluded.introduced_at",
+    )
+    .bind(i64::from(info.process_id))
+    .bind(version)
+    .bind(session_id)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Returns a best-effort RFC3339 UTC timestamp for a TEXT timestamp column
 /// (decision-3).
 ///
@@ -469,7 +587,7 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::wire::{
-        Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
+        AgentInfo, Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
     };
     use sqlx::Row;
 
@@ -568,6 +686,64 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 agent_id: None,
                 ts: "2026-06-30T00:00:00Z".to_string(),
+            },
+        }
+    }
+
+    /// Builds one [`AgentInfo`] roster row with explicit metadata (P8-3 fixtures).
+    fn agent_info(
+        pid: u32,
+        agent_id: &str,
+        agent_type: &str,
+        color: &str,
+        status: &str,
+        protocol_version: Option<&str>,
+    ) -> AgentInfo {
+        AgentInfo {
+            process_id: pid,
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            color: color.to_string(),
+            status: status.to_string(),
+            protocol_version: protocol_version.map(str::to_string),
+        }
+    }
+
+    /// Wraps a set of [`AgentInfo`] rows in an `agent.roster` envelope (P8-3 fixtures).
+    fn agent_roster_env(session: &str, agents: Vec<AgentInfo>) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::AgentRoster,
+            payload: Payload::AgentRoster {
+                session_id: session.to_string(),
+                agents,
+            },
+        }
+    }
+
+    /// Builds an `agent.activity` envelope for `agent_id`/`action`/`node_id` (P8-3).
+    fn agent_activity_env(
+        session: &str,
+        agent_id: &str,
+        action: &str,
+        node_id: &str,
+        pid: Option<u32>,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::AgentActivity,
+            payload: Payload::AgentActivity {
+                agent_id: agent_id.to_string(),
+                action: action.to_string(),
+                node_id: node_id.to_string(),
+                session_id: session.to_string(),
+                process_id: pid,
+                ts: None,
+                msg: None,
             },
         }
     }
@@ -925,29 +1101,392 @@ mod tests {
         }
     }
 
+    // ---- P8-3: persist the agent layer (DATA_MODEL §A.5 / §B.6) ----
+    //
+    // RED-phase contract for the agent-layer writers. P8-3 replaces the no-op
+    // `Payload::AgentActivity | Payload::AgentRoster => {}` arm in `persist` with real
+    // writes: `agent.roster` upserts real `agents` rows (true agent_type/color/status,
+    // NOT the `#888888`/agent_id placeholders) + `protocol_versions` rows; `agent.activity`
+    // inserts an `agent_activity` row (after upserting its `agents` parent for the FK).
+    // These tests reference the existing no-op arm, so they COMPILE on the P8-1 base and
+    // FAIL on assertions (the tables stay empty) until P8-3 lands. Each test asserts a
+    // row COUNT before any `fetch_one` so the RED failure is a clean assertion, not a
+    // panic on a missing row.
+
+    /// P8-3 / AC1: an `agent.roster` writes one **real** `agents` row per `AgentInfo`,
+    /// keyed by `process_id`, carrying the roster's true `agent_type`/`color`/`status`
+    /// — never the `#888888` / agent-id placeholders the bare-pid `upsert_agent`
+    /// stamps. RED until P8-3 replaces the no-op `AgentRoster` arm.
     #[tokio::test]
-    async fn agent_activity_and_protocol_versions_stay_empty() {
+    async fn roster_writes_real_agent_row_per_agent() {
         let (store, _dir) = temp_store().await;
-        // The full set of structured envelopes the collector + parser produce.
+        let roster = agent_roster_env(
+            "sess-1",
+            vec![
+                agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    None,
+                ),
+                agent_info(
+                    48590,
+                    "security-scanner",
+                    "security",
+                    "#e67e22",
+                    "inactive",
+                    None,
+                ),
+            ],
+        );
+        store.persist(&roster).await.expect("roster persist");
+
+        // RED-safe: this fails first (0 != 2) before any row fetch could panic.
+        assert_eq!(
+            count(&store, "agents").await,
+            2,
+            "one agents row per AgentInfo, keyed by process_id"
+        );
+
+        let a = sqlx::query(
+            "SELECT agent_id, agent_type, color, status FROM agents WHERE process_id = ?",
+        )
+        .bind(48213_i64)
+        .fetch_one(&store.pool)
+        .await
+        .expect("agent 48213 row");
+        let agent_id: String = a.get("agent_id");
+        let agent_type: String = a.get("agent_type");
+        let color: String = a.get("color");
+        let status: String = a.get("status");
+        assert_eq!(agent_id, "tdd-green");
+        assert_eq!(agent_type, "implementation");
+        assert_eq!(color, "#2ecc71");
+        assert_eq!(status, "active");
+        // The roster carries REAL metadata, not the bare-pid placeholders.
+        assert_ne!(
+            color, "#888888",
+            "placeholder color leaked into a real roster row"
+        );
+        assert_ne!(
+            agent_type, agent_id,
+            "agent_type must be the real role, not the agent_id placeholder"
+        );
+
+        let b = sqlx::query(
+            "SELECT agent_id, agent_type, color, status FROM agents WHERE process_id = ?",
+        )
+        .bind(48590_i64)
+        .fetch_one(&store.pool)
+        .await
+        .expect("agent 48590 row");
+        let agent_id: String = b.get("agent_id");
+        let agent_type: String = b.get("agent_type");
+        let color: String = b.get("color");
+        let status: String = b.get("status");
+        assert_eq!(agent_id, "security-scanner");
+        assert_eq!(agent_type, "security");
+        assert_eq!(color, "#e67e22");
+        assert_eq!(status, "inactive");
+    }
+
+    /// P8-3 / AC2: re-persisting an `agent.roster` that flips a process to `inactive`
+    /// updates that row's `status` via `ON CONFLICT(process_id)` — exactly one row
+    /// survives for the process (no duplicate), reflecting the new status.
+    #[tokio::test]
+    async fn roster_reupsert_flips_status_on_conflict_no_duplicate() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&agent_roster_env(
+                "sess-1",
+                vec![agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    None,
+                )],
+            ))
+            .await
+            .expect("first roster persist");
+        store
+            .persist(&agent_roster_env(
+                "sess-1",
+                vec![agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "inactive",
+                    None,
+                )],
+            ))
+            .await
+            .expect("second roster persist (status flip)");
+
+        // RED-safe: this fails first (0 != 1) before the status fetch.
+        assert_eq!(
+            count(&store, "agents").await,
+            1,
+            "ON CONFLICT(process_id) keeps exactly one row per process"
+        );
+        let row = sqlx::query("SELECT status, updated_at FROM agents WHERE process_id = ?")
+            .bind(48213_i64)
+            .fetch_one(&store.pool)
+            .await
+            .expect("agent row");
+        let status: String = row.get("status");
+        assert_eq!(
+            status, "inactive",
+            "status must flip to inactive on re-roster"
+        );
+        let updated_at: String = row.get("updated_at");
+        assert!(
+            !updated_at.is_empty(),
+            "updated_at must be refreshed on conflict"
+        );
+    }
+
+    /// P8-3 / AC3: an `agent.roster` writes (or refreshes) one `protocol_versions` row
+    /// per process — `version` from the `AgentInfo` (e.g. `"1"`), FK-valid against the
+    /// `agents` rows the same roster upserts.
+    #[tokio::test]
+    async fn roster_writes_protocol_version_row_per_process() {
+        let (store, _dir) = temp_store().await;
+        let roster = agent_roster_env(
+            "sess-1",
+            vec![
+                agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    Some("1"),
+                ),
+                agent_info(
+                    48590,
+                    "security-scanner",
+                    "security",
+                    "#e67e22",
+                    "inactive",
+                    Some("1"),
+                ),
+            ],
+        );
+        store.persist(&roster).await.expect("roster persist");
+
+        // RED-safe: this fails first (0 != 2) before the version fetch.
+        assert_eq!(
+            count(&store, "protocol_versions").await,
+            2,
+            "one protocol_versions row per process in the roster"
+        );
+        let row =
+            sqlx::query("SELECT version, session_id FROM protocol_versions WHERE process_id = ?")
+                .bind(48213_i64)
+                .fetch_one(&store.pool)
+                .await
+                .expect("protocol_versions row");
+        let version: String = row.get("version");
+        assert_eq!(version, "1");
+        let session_id: String = row.get("session_id");
+        assert_eq!(session_id, "sess-1");
+        // FK integrity: every protocol_versions.process_id has an agents parent.
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM protocol_versions pv
+             LEFT JOIN agents a ON a.process_id = pv.process_id
+             WHERE a.process_id IS NULL",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("orphan count");
+        assert_eq!(orphans, 0, "every protocol_versions row must be FK-valid");
+    }
+
+    /// P8-3 / decision: an `AgentInfo` whose `protocol_version` is `None` still persists a
+    /// `protocol_versions` row with `version == "1"` — exercising the `unwrap_or("1")`
+    /// default in [`upsert_protocol_version`], whose value was previously never asserted.
+    #[tokio::test]
+    async fn roster_without_protocol_version_defaults_version_to_one() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&agent_roster_env(
+                "sess-1",
+                vec![agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    None,
+                )],
+            ))
+            .await
+            .expect("roster persist");
+
+        // RED-safe: fails first (0 != 1) before the version fetch.
+        assert_eq!(
+            count(&store, "protocol_versions").await,
+            1,
+            "one protocol_versions row even when the roster omits protocolVersion"
+        );
+        let version: String =
+            sqlx::query_scalar("SELECT version FROM protocol_versions WHERE process_id = ?")
+                .bind(48213_i64)
+                .fetch_one(&store.pool)
+                .await
+                .expect("protocol_versions version");
+        assert_eq!(version, "1", "a missing protocolVersion defaults to \"1\"");
+    }
+
+    /// P8-3 / AC4: an `agent.activity` envelope writes exactly one `agent_activity` row
+    /// and SUCCEEDS with no prior roster — proving the arm upserts the `agents` parent
+    /// first (else the `process_id` FK rejects the insert). Each event adds one row.
+    #[tokio::test]
+    async fn agent_activity_writes_row_and_upserts_agent_first() {
+        let (store, _dir) = temp_store().await;
+        // No roster persisted first: the activity arm must upsert the agents row itself.
+        store
+            .persist(&agent_activity_env(
+                "sess-1",
+                "security-scanner",
+                "modified",
+                "fn:src/auth/token.rs:verify_token",
+                Some(48590),
+            ))
+            .await
+            .expect("agent.activity persist must satisfy the agents FK on its own");
+
+        // RED-safe: this fails first (0 != 1) before any row fetch.
+        assert_eq!(
+            count(&store, "agent_activity").await,
+            1,
+            "one agent_activity row per agent.activity event"
+        );
+        assert_eq!(
+            count(&store, "agents").await,
+            1,
+            "the activity arm upserts the agents parent (FK) before inserting"
+        );
+        let row = sqlx::query(
+            "SELECT agent_id, action, node_id, process_id, session_id, ts FROM agent_activity",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("agent_activity row");
+        let agent_id: String = row.get("agent_id");
+        assert_eq!(agent_id, "security-scanner");
+        let action: String = row.get("action");
+        assert_eq!(action, "modified");
+        let node_id: String = row.get("node_id");
+        assert_eq!(node_id, "fn:src/auth/token.rs:verify_token");
+        let pid: i64 = row.get("process_id");
+        assert_eq!(pid, 48590);
+        let session_id: String = row.get("session_id");
+        assert_eq!(session_id, "sess-1");
+        let ts: String = row.get("ts");
+        assert!(!ts.is_empty(), "ts must be persisted");
+
+        // Each event increments the row count by exactly one.
+        store
+            .persist(&agent_activity_env(
+                "sess-1",
+                "security-scanner",
+                "modified",
+                "fn:src/auth/token.rs:verify_token",
+                Some(48590),
+            ))
+            .await
+            .expect("second activity persist");
+        assert_eq!(
+            count(&store, "agent_activity").await,
+            2,
+            "row count increments by exactly one per event"
+        );
+    }
+
+    /// P8-3 / decision-4: an `agent.activity` with NO `process_id` inserts exactly one
+    /// `agent_activity` row carrying a NULL `process_id` (the relaxed FK) and creates NO
+    /// `agents` row — the `if let Some(pid)` parent upsert is skipped and the NULL pid is
+    /// bound, neither of which was previously asserted.
+    #[tokio::test]
+    async fn agent_activity_without_pid_writes_null_process_id_and_no_agent() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&agent_activity_env(
+                "sess-1",
+                "security-scanner",
+                "modified",
+                "fn:a.rs:f",
+                None,
+            ))
+            .await
+            .expect("pid-less agent.activity persist");
+
+        assert_eq!(
+            count(&store, "agent_activity").await,
+            1,
+            "one agent_activity row for a pid-less activity"
+        );
+        assert_eq!(
+            count(&store, "agents").await,
+            0,
+            "no agents row is upserted when the activity carries no pid"
+        );
+        let null_pids: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_activity WHERE process_id IS NULL")
+                .fetch_one(&store.pool)
+                .await
+                .expect("null-pid count");
+        assert_eq!(null_pids, 1, "the pid-less row stores a NULL process_id");
+    }
+
+    /// P8-3 / AC5 (retired invariant): Phase 7's
+    /// `agent_activity_and_protocol_versions_stay_empty` asserted these two tables STAY
+    /// EMPTY because no envelope wrote them. P8-3 adds the writers (`agent.activity` →
+    /// `agent_activity`, `agent.roster` → `protocol_versions`), so that stay-empty
+    /// invariant is **intentionally retired** for these two tables — this test now
+    /// asserts the Phase-8 WRITE behaviour from a mixed batch. The pid (48213) is shared
+    /// across the test result, roster, and activity so the roster REFINES the
+    /// placeholder agent the test result seeded.
+    #[tokio::test]
+    async fn agent_activity_and_protocol_versions_written_in_phase_8() {
+        let (store, _dir) = temp_store().await;
         let envelopes = vec![
             test_result_env("sess-1", Some(48213)),
             test_result_env("sess-1", None),
             node_upsert_env("f", NodeStatus::Unknown),
             edge_upsert_env(false),
             hot_edge_env("e:a->b", HotEdgeState::Enter),
+            agent_roster_env(
+                "sess-1",
+                vec![agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    Some("1"),
+                )],
+            ),
+            agent_activity_env("sess-1", "tdd-green", "modified", "fn:a.rs:f", Some(48213)),
         ];
         for env in &envelopes {
-            store.persist(env).await.unwrap();
+            store.persist(env).await.expect("persist");
         }
         assert_eq!(
             count(&store, "agent_activity").await,
-            0,
-            "agent_activity must stay empty in Phase 7"
+            1,
+            "P8-3 writes agent_activity (Phase-7 stay-empty invariant retired)"
         );
         assert_eq!(
             count(&store, "protocol_versions").await,
-            0,
-            "protocol_versions must stay empty in Phase 7"
+            1,
+            "P8-3 writes protocol_versions (Phase-7 stay-empty invariant retired)"
         );
     }
 
@@ -982,64 +1521,54 @@ mod tests {
         );
     }
 
+    /// P8-3 / AC5 (retired invariant): under P8-1 this test asserted the
+    /// `agent.activity` / `agent.roster` arms were a no-op that wrote ZERO rows to every
+    /// table. P8-3 replaces those no-op arms with real writes, so the "persist nothing"
+    /// invariant is **intentionally retired** — this test now asserts the agent payloads
+    /// PERSIST their rows (the direct contradiction of the old name). `protocol_versions`
+    /// is left unasserted here (the roster's `AgentInfo` omits `protocolVersion`); AC3
+    /// pins that table with an explicit version.
     #[tokio::test]
-    async fn agent_activity_and_roster_payloads_persist_nothing() {
-        // P8-1 only adds the `Payload::AgentActivity`/`AgentRoster` wire variants plus
-        // a `=> {}` catch-all arm in `persist`; the real `agent_activity`/`agents`
-        // writes land in P8-3. So persisting an agent payload must return `Ok(())` and
-        // write zero rows to every table (the per-event transaction commits empty).
-        use crate::wire::AgentInfo;
+    async fn agent_activity_and_roster_payloads_persist_rows() {
         let (store, _dir) = temp_store().await;
 
-        let activity = EventEnvelope {
-            v: 1,
-            ts: "2026-06-30T00:00:00Z".to_string(),
-            session_id: "sess-1".to_string(),
-            event_type: EventType::AgentActivity,
-            payload: Payload::AgentActivity {
-                agent_id: "security-scanner".to_string(),
-                action: "modified".to_string(),
-                node_id: "fn:a.rs:f".to_string(),
-                session_id: "sess-1".to_string(),
-                process_id: Some(48590),
-                ts: None,
-                msg: None,
-            },
-        };
         store
-            .persist(&activity)
+            .persist(&agent_activity_env(
+                "sess-1",
+                "security-scanner",
+                "modified",
+                "fn:a.rs:f",
+                Some(48590),
+            ))
             .await
-            .expect("agent.activity persist must be a no-op returning Ok(())");
+            .expect("agent.activity persist");
 
-        let roster = EventEnvelope {
-            v: 1,
-            ts: "2026-06-30T00:00:00Z".to_string(),
-            session_id: "sess-1".to_string(),
-            event_type: EventType::AgentRoster,
-            payload: Payload::AgentRoster {
-                session_id: "sess-1".to_string(),
-                agents: vec![AgentInfo {
-                    process_id: 48213,
-                    agent_id: "tdd-green".to_string(),
-                    agent_type: "implementation".to_string(),
-                    color: "#2ecc71".to_string(),
-                    status: "active".to_string(),
-                    protocol_version: None,
-                }],
-            },
-        };
         store
-            .persist(&roster)
+            .persist(&agent_roster_env(
+                "sess-1",
+                vec![agent_info(
+                    48213,
+                    "tdd-green",
+                    "implementation",
+                    "#2ecc71",
+                    "active",
+                    None,
+                )],
+            ))
             .await
-            .expect("agent.roster persist must be a no-op returning Ok(())");
+            .expect("agent.roster persist");
 
-        for table in TABLES {
-            assert_eq!(
-                count(&store, table).await,
-                0,
-                "agent payload must write no rows in P8-1, but {table} has rows"
-            );
-        }
+        assert_eq!(
+            count(&store, "agent_activity").await,
+            1,
+            "agent.activity now persists an agent_activity row (no-op arm retired)"
+        );
+        // The activity (pid 48590) and the roster (pid 48213) each upsert an agents row.
+        assert_eq!(
+            count(&store, "agents").await,
+            2,
+            "agent.activity + agent.roster each upsert their agents row"
+        );
     }
 
     #[tokio::test]
