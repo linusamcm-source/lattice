@@ -29,7 +29,13 @@
 //! and recovers partial results: every function/variable it can read from the
 //! (possibly partial) tree is still emitted, and when the parse tree's root
 //! reports a syntax error the `file` node's status is set to [`NodeStatus::Error`]
-//! as a coarse "this file has a problem" flag. Recovered siblings stay live.
+//! as a coarse, **file-level** "this file has a problem" flag (the individual
+//! offending tree-sitter `ERROR` node is *not* marked — a future refinement).
+//! Recovered siblings stay live: the [`walk`] has no early return on the error
+//! region, so a `function` declared *before* a broken one is still emitted. This
+//! is the deliberate counterpart to the Rust `syn` path, which is all-or-nothing
+//! (one syntax error discards every sibling, leaving only the file node — see
+//! [`super::parse_rust_source`]).
 
 use tree_sitter::{Language, Node as TsNode, Parser};
 
@@ -965,5 +971,49 @@ mod tests {
             .find(|n| n.id == "var:a.py:f:x")
             .expect("missing var:a.py:f:x");
         assert_eq!(var.signature, None);
+    }
+
+    #[test]
+    fn python_valid_function_before_malformed_still_recovers_sibling() {
+        // `good` is declared FIRST so the trailing ERROR region cannot swallow it;
+        // tree-sitter keeps the valid sibling live while flagging the file Error.
+        // Locks the documented contrast with the all-or-nothing `syn` path.
+        let parsed = parse_python("x.py", "def good():\n    pass\n\ndef (:\n");
+        assert!(
+            ids(&parsed).contains(&"fn:x.py:good"),
+            "valid sibling must survive a later syntax error: {:?}",
+            ids(&parsed)
+        );
+        let file = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "file:x.py")
+            .expect("file node present");
+        assert_eq!(
+            file.status,
+            NodeStatus::Error,
+            "a syntax error must flag the file node Error"
+        );
+    }
+
+    #[test]
+    fn typescript_valid_function_before_malformed_still_recovers_sibling() {
+        // The TypeScript twin: a valid `good` first, a broken declaration after.
+        let parsed = parse_typescript("x.ts", "function good() {}\nfunction (");
+        assert!(
+            ids(&parsed).contains(&"fn:x.ts:good"),
+            "valid sibling must survive a later syntax error: {:?}",
+            ids(&parsed)
+        );
+        let file = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "file:x.ts")
+            .expect("file node present");
+        assert_eq!(
+            file.status,
+            NodeStatus::Error,
+            "a syntax error must flag the file node Error"
+        );
     }
 }
