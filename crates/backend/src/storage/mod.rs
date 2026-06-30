@@ -15,15 +15,18 @@
 //! relational schema (the seven tables of §B.6) is created idempotently by
 //! [`Storage::ensure_schema`].
 //!
-//! This module (story P7-1) lays only the contract: the [`Storage`] trait, the
-//! [`StorageError`] type, the [`Backend`] scheme classifier ([`backend_for_url`]),
-//! and the [`open_store`] factory. The concrete `SqliteStore` / `PostgresStore`
-//! backends that fill [`open_store`]'s arms arrive in later stories; until then a
-//! call to [`open_store`] returns a [`StorageError::Config`] rather than panicking.
+//! Story P7-1 laid the contract: the [`Storage`] trait, the [`StorageError`] type,
+//! the [`Backend`] scheme classifier ([`backend_for_url`]), and the [`open_store`]
+//! factory. Story P7-2 adds the **live SQLite backend** in the [`sqlite`] submodule
+//! ([`sqlite::SqliteStore`]) and wires it into [`open_store`]'s `sqlite:` arm; the
+//! Postgres twin (P7-3) still returns a [`StorageError::Config`] rather than
+//! panicking until implemented.
 //!
 //! The backends use `sqlx`'s **runtime** query API (not the compile-time `query!`
 //! macro), so the build and `just qg` stay hermetic — no `DATABASE_URL` and no live
 //! database are required to compile or test.
+
+mod sqlite;
 
 use crate::wire::EventEnvelope;
 
@@ -149,16 +152,18 @@ pub trait Storage: Send + Sync {
 
 /// Opens the [`Storage`] backend selected by a `LATTICE_DB_URL` (`DATA_MODEL.md` §B).
 ///
-/// Dispatches on [`backend_for_url`]: a `sqlite:` URL opens the SQLite backend and a
-/// `postgres:`/`postgresql:` URL the Postgres backend. The concrete backends are
-/// implemented in later stories (P7-2 / P7-3); until then each arm returns a
-/// [`StorageError::Config`] rather than panicking, so a normal call is always safe.
-/// An unknown or malformed scheme propagates the [`backend_for_url`] error.
+/// Dispatches on [`backend_for_url`]: a `sqlite:` URL opens the **live** SQLite
+/// backend ([`sqlite::SqliteStore`], story P7-2) — connecting the pool with
+/// `PRAGMA foreign_keys = ON` and creating the database file if missing — while a
+/// `postgres:`/`postgresql:` URL is not yet implemented (story P7-3) and returns a
+/// [`StorageError::Config`] rather than panicking. Opening does **not** create the
+/// schema; the caller invokes [`Storage::ensure_schema`] (and
+/// [`Storage::record_session`]) once after opening. A connect failure surfaces as a
+/// [`StorageError::Db`]; an unknown or malformed scheme propagates the
+/// [`backend_for_url`] error.
 pub async fn open_store(url: &str) -> Result<Box<dyn Storage + Send + Sync>, StorageError> {
     match backend_for_url(url)? {
-        Backend::Sqlite => Err(StorageError::Config(
-            "sqlite backend not yet implemented (Phase 7 story P7-2)".to_string(),
-        )),
+        Backend::Sqlite => Ok(Box::new(sqlite::SqliteStore::connect(url).await?)),
         Backend::Postgres => Err(StorageError::Config(
             "postgres backend not yet implemented (Phase 7 story P7-3)".to_string(),
         )),
@@ -223,15 +228,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_store_returns_config_error_for_unimplemented_backends() {
-        // Both real-scheme arms must error (not panic) until P7-2/P7-3 land.
-        for url in ["sqlite:graph.db", "postgres://u@h/db"] {
-            match open_store(url).await {
-                Err(StorageError::Config(_)) => {}
-                Ok(_) => panic!("url {url}: unexpectedly opened a store"),
-                Err(other) => panic!("url {url}: expected Config err, got {other:?}"),
-            }
+    async fn open_store_postgres_arm_still_returns_config_error() {
+        // The Postgres arm must error (not panic) until P7-3 lands.
+        match open_store("postgres://u@h/db").await {
+            Err(StorageError::Config(_)) => {}
+            Ok(_) => panic!("postgres unexpectedly opened a store"),
+            Err(other) => panic!("expected Config err, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_store_opens_live_sqlite_backend() {
+        // The SQLite arm (P7-2) opens a live store and applies the schema, rather
+        // than returning a Config error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}", dir.path().join("open.db").display());
+        let store = open_store(&url).await.expect("open sqlite store");
+        store.ensure_schema().await.expect("ensure schema");
     }
 
     #[tokio::test]

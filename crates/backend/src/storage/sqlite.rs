@@ -1,0 +1,1000 @@
+//! SQLite persistence backend (`DATA_MODEL.md` §B, solo/local).
+//!
+//! [`SqliteStore`] is the file-based [`Storage`](super::Storage) implementation: it
+//! holds a `sqlx::SqlitePool`, creates the §B.6 seven-table schema idempotently
+//! ([`SqliteStore::ensure_schema`]), and write-throughs each structured
+//! [`EventEnvelope`] to its row(s) ([`SqliteStore::persist`]). It is the live half
+//! of the dual-backend design — the Postgres twin (P7-3) shares this schema and
+//! mapping, differing only in dialect (`$N` placeholders, `BIGINT`/`BOOLEAN`).
+//!
+//! **FK parity (decision-5).** The pool opens every connection with
+//! `PRAGMA foreign_keys = ON` (via [`sqlx::sqlite::SqliteConnectOptions::foreign_keys`])
+//! so SQLite enforces the §B.6 `REFERENCES` constraints identically to Postgres;
+//! without it an FK-violating row would insert silently under SQLite.
+//!
+//! **§B.6 reconciliations with the real wire data (decision-4).** The §B.6 DDL
+//! assumes a `pid` and full agent metadata on every event, but the Phase-5/6 wire
+//! payloads frequently omit them, so this backend applies these *noted* §B.6
+//! extensions:
+//! - `test_results.process_id` / `agent_activity.process_id` are **NULLable**
+//!   (relaxing §B.6's `NOT NULL`): a pid-less event persists with `process_id =
+//!   NULL` and **no** `agents` row (a NULL FK is unconstrained, so the
+//!   `REFERENCES agents(process_id)` still holds for the `Some` case).
+//! - On an `agents` upsert (only when a `pid` is present), `agent_type` defaults to
+//!   the event's `agent` id (or `"unknown"`) and `color` to the placeholder
+//!   `"#888888"`, satisfying the `NOT NULL` columns; the Phase-8 roster refines them.
+//! - Event-log row ids (`test_results.id`) have no wire source, so they are minted
+//!   as fresh **UUID v4**s; two events get two distinct ids.
+//! - Event rows reference the **event's own** `session_id` (the payload CLV session,
+//!   §B.2), and a `sessions` row is **lazily upserted per distinct session_id on
+//!   first sight** to satisfy the `REFERENCES sessions(session_id)` FK. Per-event
+//!   insert order: `sessions` → `agents` (when pid present) → the event row.
+//! - `hot_edge` persists **only** as the `edges.hot` flag (§B.6 has no hot-edge
+//!   table); the UPDATE is a no-op when the edge row is absent.
+//! - `agent_activity` / `protocol_versions` are **created but never written** in
+//!   Phase 7 — there is no `Payload::AgentActivity`/roster variant, so no such
+//!   envelope reaches `persist`; their writers land in Phase 8.
+//! - Timestamps are stored as **TEXT rfc3339** (decision-3): a chrono-free format
+//!   that stores byte-identically under both backends.
+//!
+//! Only a typed [`EventEnvelope`] (the collector's parsed output) reaches
+//! [`SqliteStore::persist`] — raw stdout is never persisted (§B.5).
+
+use std::str::FromStr;
+
+use async_trait::async_trait;
+use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{SqliteConnection, SqlitePool};
+use uuid::Uuid;
+
+use super::{Storage, StorageError};
+use crate::wire::{EventEnvelope, HotEdgeState, Payload};
+
+/// The §B.6 schema in SQLite dialect, as idempotent `CREATE … IF NOT EXISTS`
+/// statements (decision-2).
+///
+/// Each entry is run once by [`SqliteStore::ensure_schema`]. The seven tables match
+/// the §B.6 column sets (TEXT for ids/timestamps, INTEGER for the `BIGINT`
+/// `process_id`, INTEGER `0`/`1` for the `BOOLEAN` `hot`), with two **noted §B.6
+/// relaxations** (decision-4): `test_results.process_id` and
+/// `agent_activity.process_id` drop the `NOT NULL` so a pid-less event can persist
+/// with a NULL (unconstrained) FK. The eight indexes are the §B.7 set.
+const SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        repo_path  TEXT NOT NULL,
+        label      TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS agents (
+        process_id INTEGER PRIMARY KEY,
+        agent_id   TEXT NOT NULL,
+        agent_type TEXT NOT NULL,
+        color      TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(session_id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS protocol_versions (
+        process_id    INTEGER PRIMARY KEY REFERENCES agents(process_id),
+        version       TEXT NOT NULL,
+        session_id    TEXT NOT NULL REFERENCES sessions(session_id),
+        introduced_at TEXT NOT NULL,
+        deprecated_at TEXT,
+        features_json TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS nodes (
+        id              TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL REFERENCES sessions(session_id),
+        type            TEXT NOT NULL,
+        label           TEXT NOT NULL,
+        parent_id       TEXT,
+        status          TEXT NOT NULL,
+        docs            TEXT,
+        signature_json  TEXT,
+        meta_json       TEXT,
+        last_process_id INTEGER,
+        last_agent_id   TEXT,
+        updated_at      TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS edges (
+        id         TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(session_id),
+        source     TEXT NOT NULL,
+        target     TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        hot        INTEGER NOT NULL DEFAULT 0
+    )",
+    // process_id is NULLable (decision-4) — relaxes §B.6's NOT NULL so a pid-less
+    // test.result persists with a NULL (unconstrained) FK and no agents row.
+    "CREATE TABLE IF NOT EXISTS test_results (
+        id          TEXT PRIMARY KEY,
+        process_id  INTEGER REFERENCES agents(process_id),
+        session_id  TEXT NOT NULL REFERENCES sessions(session_id),
+        node_id     TEXT NOT NULL,
+        test_id     TEXT NOT NULL,
+        outcome     TEXT NOT NULL,
+        duration_ms INTEGER,
+        agent_id    TEXT,
+        message     TEXT,
+        ts          TEXT NOT NULL
+    )",
+    // process_id is NULLable (decision-4); table is created but unwritten in Phase 7.
+    "CREATE TABLE IF NOT EXISTS agent_activity (
+        id         TEXT PRIMARY KEY,
+        process_id INTEGER REFERENCES agents(process_id),
+        session_id TEXT NOT NULL REFERENCES sessions(session_id),
+        agent_id   TEXT NOT NULL,
+        action     TEXT NOT NULL,
+        node_id    TEXT NOT NULL,
+        ts         TEXT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_nodes_parent_id ON nodes(parent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_nodes_session_type ON nodes(session_id, type)",
+    "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)",
+    "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target)",
+    "CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)",
+    "CREATE INDEX IF NOT EXISTS idx_agents_session_status ON agents(session_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_test_results_node_ts ON test_results(node_id, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_activity_node_ts ON agent_activity(node_id, ts)",
+];
+
+/// The SQLite [`Storage`](super::Storage) backend (`DATA_MODEL.md` §B, solo/local).
+///
+/// Wraps a `sqlx::SqlitePool` opened with `PRAGMA foreign_keys = ON` (decision-5).
+/// Construct it with [`SqliteStore::connect`] (the [`open_store`](super::open_store)
+/// factory's SQLite arm); call [`SqliteStore::ensure_schema`] once before persisting.
+/// All queries use `sqlx`'s runtime API (no `query!` macro), so no `DATABASE_URL` is
+/// needed to build or test.
+pub struct SqliteStore {
+    /// Connection pool; every connection has foreign-key enforcement enabled.
+    pool: SqlitePool,
+}
+
+impl SqliteStore {
+    /// Opens a [`SqliteStore`] from a `sqlite:` URL, creating the database file if
+    /// missing, enabling `PRAGMA foreign_keys = ON` on every connection (decision-5),
+    /// and running in **WAL** journal mode with **NORMAL** synchronous for lower
+    /// per-event write latency (WAL appends sequentially; NORMAL fsyncs only at
+    /// checkpoint — durable enough here, as the in-memory `Graph` is the source of
+    /// truth and crash-replay is Phase 9). WAL creates `-wal`/`-shm` sidecar files
+    /// beside the database file, which is expected.
+    ///
+    /// The URL is parsed by `sqlx`'s [`sqlx::sqlite::SqliteConnectOptions`], which
+    /// accepts the `sqlite:`, `sqlite://`, `sqlite:///abs`, and `sqlite::memory:`
+    /// forms. Does **not** create the schema — call [`SqliteStore::ensure_schema`]
+    /// after opening. Never panics: a malformed URL or connect failure returns a
+    /// [`StorageError::Db`].
+    pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        let options = SqliteConnectOptions::from_str(url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+        let pool = SqlitePoolOptions::new().connect_with(options).await?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl Storage for SqliteStore {
+    /// Creates the §B.6 seven-table schema and §B.7 indexes idempotently by running
+    /// each [`SCHEMA`] `CREATE … IF NOT EXISTS` statement; running it twice is a
+    /// no-op. Called once after [`SqliteStore::connect`].
+    async fn ensure_schema(&self) -> Result<(), StorageError> {
+        for statement in SCHEMA {
+            sqlx::query(statement).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Write-throughs one structured [`EventEnvelope`] per the §B.5 / decision-4
+    /// rules (see the module doc), with **all of an event's writes in one
+    /// transaction**.
+    ///
+    /// Each call opens a single transaction so the event's `sessions`/`agents`/event
+    /// rows commit atomically — no partial-write window if a later statement fails —
+    /// and share one fsync (with WAL + NORMAL synchronous). The per-event timestamp
+    /// is computed once and reused by every write. Dispatches on the [`Payload`]:
+    /// `test.result` inserts a `test_results` row (UUID id, NULL `process_id` when
+    /// the event has no pid); `status.update` updates `nodes.status`; `hot_edge`
+    /// updates `edges.hot` (a no-op when the edge is absent); `node.upsert`/
+    /// `edge.upsert` insert-or-replace; `node.remove`/`edge.remove` delete;
+    /// `snapshot`/`subtree` (view frames) persist nothing. A `sessions` row is
+    /// upserted per event (the DB no-ops a duplicate), and an `agents` row when a
+    /// pid is present, before the event row.
+    async fn persist(&self, env: &EventEnvelope) -> Result<(), StorageError> {
+        // One timestamp per event, reused by every write below (decision-3).
+        let now = now_rfc3339();
+        // One transaction per event: atomic writes + a single fsync.
+        let mut tx = self.pool.begin().await?;
+        match &env.payload {
+            Payload::TestResult {
+                node_id,
+                test_id,
+                outcome,
+                duration_ms,
+                session_id,
+                agent_id,
+                process_id,
+                message,
+            } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                if let Some(pid) = *process_id {
+                    upsert_agent(&mut tx, pid, agent_id.as_deref(), session_id, &now).await?;
+                }
+                sqlx::query(
+                    "INSERT INTO test_results
+                       (id, process_id, session_id, node_id, test_id, outcome, duration_ms, agent_id, message, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(process_id.map(i64::from))
+                .bind(session_id.as_str())
+                .bind(node_id.as_str())
+                .bind(test_id.as_str())
+                .bind(wire_enum_str(outcome))
+                .bind(duration_ms.map(|d| i64::try_from(d).unwrap_or(i64::MAX)))
+                .bind(agent_id.as_deref())
+                .bind(message.as_deref())
+                .bind(now.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            Payload::StatusUpdate {
+                node_id,
+                status,
+                session_id,
+                agent_id,
+                process_id,
+            } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                if let Some(pid) = *process_id {
+                    upsert_agent(&mut tx, pid, agent_id.as_deref(), session_id, &now).await?;
+                }
+                sqlx::query("UPDATE nodes SET status = ?, updated_at = ? WHERE id = ?")
+                    .bind(wire_enum_str(status))
+                    .bind(now.as_str())
+                    .bind(node_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Payload::HotEdge {
+                edge_id,
+                state,
+                process_id,
+                session_id,
+                agent_id,
+                ts: _,
+            } => {
+                upsert_session(&mut tx, session_id, &now).await?;
+                if let Some(pid) = *process_id {
+                    upsert_agent(&mut tx, pid, agent_id.as_deref(), session_id, &now).await?;
+                }
+                sqlx::query("UPDATE edges SET hot = ? WHERE id = ?")
+                    .bind(matches!(state, HotEdgeState::Enter))
+                    .bind(edge_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Payload::NodeUpsert { node } => {
+                upsert_session(&mut tx, &env.session_id, &now).await?;
+                let signature_json = node
+                    .signature
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok());
+                let meta_json = node
+                    .meta
+                    .as_ref()
+                    .and_then(|m| serde_json::to_string(m).ok());
+                sqlx::query(
+                    "INSERT OR REPLACE INTO nodes
+                       (id, session_id, type, label, parent_id, status, docs, signature_json, meta_json, last_process_id, last_agent_id, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(node.id.as_str())
+                .bind(env.session_id.as_str())
+                .bind(wire_enum_str(&node.node_type))
+                .bind(node.label.as_str())
+                .bind(node.parent_id.as_deref())
+                .bind(wire_enum_str(&node.status))
+                .bind(node.docs.as_deref())
+                .bind(signature_json.as_deref())
+                .bind(meta_json.as_deref())
+                .bind(None::<i64>)
+                .bind(None::<&str>)
+                .bind(now.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            Payload::EdgeUpsert { edge } => {
+                upsert_session(&mut tx, &env.session_id, &now).await?;
+                sqlx::query(
+                    "INSERT OR REPLACE INTO edges (id, session_id, source, target, kind, hot)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(edge.id.as_str())
+                .bind(env.session_id.as_str())
+                .bind(edge.source.as_str())
+                .bind(edge.target.as_str())
+                .bind(wire_enum_str(&edge.kind))
+                .bind(edge.hot)
+                .execute(&mut *tx)
+                .await?;
+            }
+            Payload::NodeRemove { id } => {
+                sqlx::query("DELETE FROM nodes WHERE id = ?")
+                    .bind(id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Payload::EdgeRemove { id } => {
+                sqlx::query("DELETE FROM edges WHERE id = ?")
+                    .bind(id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Payload::Snapshot { .. } | Payload::Subtree { .. } => {
+                // View frames (server→client) — persist nothing (§B.5).
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Upserts the run's `sessions` row (`session_id`, `started_at`, `repo_path`)
+    /// with `INSERT OR IGNORE`, so re-recording the same run is a no-op.
+    async fn record_session(&self, session_id: &str, repo_path: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO sessions (session_id, started_at, repo_path) VALUES (?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(now_rfc3339())
+        .bind(repo_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Serialises a small CLV enum (e.g. `NodeType`, `NodeStatus`, `TestOutcome`,
+/// `EdgeKind`) to its canonical wire string for a TEXT column.
+///
+/// Goes through `serde_json` so the persisted value stays in lock-step with the
+/// `wire.rs` serde mapping. Falls back to an empty string if the value does not
+/// serialise to a JSON string (unreachable for these unit enums), never panicking.
+fn wire_enum_str<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => String::new(),
+    }
+}
+
+/// Ensures a `sessions` row for `session_id` exists, enlisting in the caller's
+/// transaction via `conn` (decision-4).
+///
+/// Runs `INSERT OR IGNORE` on **every** event (idempotent — the DB no-ops a
+/// duplicate `session_id`, so no in-memory dedup set is needed; the per-event
+/// transaction makes the repeated statement cheap). An already-recorded run session
+/// (from [`SqliteStore::record_session`], carrying the real `repo_path`) is
+/// preserved; an event-discovered session has no known `repo_path`, so an empty
+/// string satisfies the `NOT NULL` column. Satisfies the event tables'
+/// `REFERENCES sessions(session_id)`. `now` is the per-event timestamp the caller
+/// computed once.
+async fn upsert_session(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO sessions (session_id, started_at, repo_path) VALUES (?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(now)
+    .bind("")
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Upserts an `agents` row for `process_id`, defaulting the metadata the wire omits,
+/// enlisting in the caller's transaction via `conn` (decision-4).
+///
+/// Called only when an event carries a `pid`. `agent_id`/`agent_type` default to the
+/// event's `agent` id (or `"unknown"` when absent), `color` to the placeholder
+/// `"#888888"`, and `status` to `"active"` (§B.3). On a repeat `process_id` the row's
+/// `status`/`updated_at` are refreshed. The caller must have upserted the `sessions`
+/// row first (FK `agents.session_id`). `now` is the per-event timestamp the caller
+/// computed once.
+async fn upsert_agent(
+    conn: &mut SqliteConnection,
+    process_id: u32,
+    agent_id: Option<&str>,
+    session_id: &str,
+    now: &str,
+) -> Result<(), StorageError> {
+    let agent = agent_id.unwrap_or("unknown");
+    sqlx::query(
+        "INSERT INTO agents (process_id, agent_id, agent_type, color, status, session_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+         ON CONFLICT(process_id) DO UPDATE SET status = 'active', updated_at = excluded.updated_at",
+    )
+    .bind(i64::from(process_id))
+    .bind(agent)
+    .bind(agent)
+    .bind("#888888")
+    .bind(session_id)
+    .bind(now)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Returns a best-effort RFC3339 UTC timestamp for a TEXT timestamp column
+/// (decision-3).
+///
+/// A chrono-free copy of `graph::rfc3339_now` (kept local so this story does not
+/// touch `graph.rs`): panic-free total-integer arithmetic via Howard Hinnant's
+/// `civil_from_days`. Phase 7 does not assert on the exact value; it only needs a
+/// stable, byte-identical TEXT form across backends.
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{
+        Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
+    };
+    use sqlx::Row;
+
+    /// Opens a live SQLite store backed by a tempfile (so multiple pool connections
+    /// share state — unlike a per-connection `:memory:` db) with the schema applied.
+    async fn temp_store() -> (SqliteStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}", dir.path().join("lattice.db").display());
+        let store = SqliteStore::connect(&url).await.expect("connect");
+        store.ensure_schema().await.expect("ensure_schema");
+        (store, dir)
+    }
+
+    const TABLES: [&str; 7] = [
+        "sessions",
+        "agents",
+        "protocol_versions",
+        "nodes",
+        "edges",
+        "test_results",
+        "agent_activity",
+    ];
+
+    fn test_result_env(session: &str, pid: Option<u32>) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::TestResult,
+            payload: Payload::TestResult {
+                node_id: "fn:a.rs:f".to_string(),
+                test_id: "auth::case".to_string(),
+                outcome: TestOutcome::Pass,
+                duration_ms: Some(7),
+                session_id: session.to_string(),
+                agent_id: Some("tdd-green".to_string()),
+                process_id: pid,
+                message: Some("ok".to_string()),
+            },
+        }
+    }
+
+    fn node_upsert_env(label: &str, status: NodeStatus) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::NodeUpsert,
+            payload: Payload::NodeUpsert {
+                node: Node {
+                    id: "fn:a.rs:f".to_string(),
+                    node_type: NodeType::Function,
+                    label: label.to_string(),
+                    parent_id: Some("file:a.rs".to_string()),
+                    child_ids: Vec::new(),
+                    status,
+                    docs: Some("docs".to_string()),
+                    signature: Some(Signature {
+                        params: Vec::new(),
+                        returns: "()".to_string(),
+                    }),
+                    meta: None,
+                },
+            },
+        }
+    }
+
+    fn edge_upsert_env(hot: bool) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::EdgeUpsert,
+            payload: Payload::EdgeUpsert {
+                edge: Edge {
+                    id: "e:a->b".to_string(),
+                    source: "fn:a.rs:a".to_string(),
+                    target: "fn:a.rs:b".to_string(),
+                    kind: EdgeKind::Calls,
+                    hot,
+                },
+            },
+        }
+    }
+
+    fn hot_edge_env(edge_id: &str, state: HotEdgeState) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::HotEdge,
+            payload: Payload::HotEdge {
+                edge_id: edge_id.to_string(),
+                state,
+                process_id: None,
+                session_id: "sess-1".to_string(),
+                agent_id: None,
+                ts: "2026-06-30T00:00:00Z".to_string(),
+            },
+        }
+    }
+
+    async fn count(store: &SqliteStore, table: &str) -> i64 {
+        // `table` is a fixed test constant, never user input.
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&store.pool)
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn connect_enables_wal_journal_mode() {
+        // Perf (decision): the pool runs in WAL journal mode. WAL needs a file-based
+        // DB, which `temp_store` provides; querying PRAGMA confirms the mode is live.
+        let (store, _dir) = temp_store().await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&store.pool)
+            .await
+            .expect("journal_mode");
+        assert_eq!(mode, "wal");
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_creates_all_tables_and_indexes_idempotently() {
+        let (store, _dir) = temp_store().await;
+        for table in TABLES {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&store.pool)
+            .await
+            .expect("query table");
+            assert_eq!(n, 1, "missing table {table}");
+        }
+        let indexes = [
+            "idx_nodes_parent_id",
+            "idx_nodes_session_type",
+            "idx_edges_source",
+            "idx_edges_target",
+            "idx_edges_kind",
+            "idx_agents_session_status",
+            "idx_test_results_node_ts",
+            "idx_agent_activity_node_ts",
+        ];
+        for ix in indexes {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(ix)
+            .fetch_one(&store.pool)
+            .await
+            .expect("query index");
+            assert_eq!(n, 1, "missing index {ix}");
+        }
+        // Idempotent: a second call must not error.
+        store
+            .ensure_schema()
+            .await
+            .expect("second ensure_schema is a no-op");
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_on_rejects_orphan_test_result() {
+        let (store, _dir) = temp_store().await;
+        // Isolate the FK to `agents` by giving the row a valid session.
+        sqlx::query(
+            "INSERT INTO sessions (session_id, started_at, repo_path) VALUES ('s', 't', '/r')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed session");
+        // process_id 999999 has no agents parent → FK must reject (PRAGMA foreign_keys=ON).
+        let res = sqlx::query(
+            "INSERT INTO test_results (id, process_id, session_id, node_id, test_id, outcome, ts)
+             VALUES ('x', 999999, 's', 'n', 't', 'pass', 'ts')",
+        )
+        .execute(&store.pool)
+        .await;
+        assert!(res.is_err(), "FK-violating insert should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_result_with_pid_round_trips_and_creates_agent() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&test_result_env("sess-1", Some(48213)))
+            .await
+            .expect("persist");
+
+        let row = sqlx::query(
+            "SELECT id, process_id, session_id, node_id, test_id, outcome, duration_ms, agent_id, message FROM test_results",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("test_results row");
+        let id: String = row.get("id");
+        assert!(Uuid::parse_str(&id).is_ok(), "id is not a UUID: {id}");
+        let pid: i64 = row.get("process_id");
+        assert_eq!(pid, 48213);
+        let session_id: String = row.get("session_id");
+        assert_eq!(session_id, "sess-1");
+        let node_id: String = row.get("node_id");
+        assert_eq!(node_id, "fn:a.rs:f");
+        let test_id: String = row.get("test_id");
+        assert_eq!(test_id, "auth::case");
+        let outcome: String = row.get("outcome");
+        assert_eq!(outcome, "pass");
+        let duration: i64 = row.get("duration_ms");
+        assert_eq!(duration, 7);
+        let agent_id: String = row.get("agent_id");
+        assert_eq!(agent_id, "tdd-green");
+        let message: String = row.get("message");
+        assert_eq!(message, "ok");
+
+        let agent =
+            sqlx::query("SELECT agent_type, color, status FROM agents WHERE process_id = ?")
+                .bind(48213_i64)
+                .fetch_one(&store.pool)
+                .await
+                .expect("agents row");
+        let agent_type: String = agent.get("agent_type");
+        assert_eq!(agent_type, "tdd-green");
+        let color: String = agent.get("color");
+        assert_eq!(color, "#888888");
+        let status: String = agent.get("status");
+        assert_eq!(status, "active");
+    }
+
+    #[tokio::test]
+    async fn test_result_without_pid_persists_null_and_no_agent() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&test_result_env("sess-1", None))
+            .await
+            .expect("persist");
+
+        let row = sqlx::query("SELECT process_id FROM test_results")
+            .fetch_one(&store.pool)
+            .await
+            .expect("test_results row");
+        let pid: Option<i64> = row.get("process_id");
+        assert_eq!(pid, None, "pid-less event must store NULL process_id");
+        assert_eq!(
+            count(&store, "agents").await,
+            0,
+            "no agents row for pid-less event"
+        );
+        assert_eq!(count(&store, "test_results").await, 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_sessions_upserted_once_and_ids_distinct() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&test_result_env("sess-1", None))
+            .await
+            .unwrap();
+        store
+            .persist(&test_result_env("sess-1", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "sessions").await,
+            1,
+            "same session upserted once"
+        );
+
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM test_results ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .expect("ids");
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "two events must get distinct UUIDs");
+
+        store
+            .persist(&test_result_env("sess-2", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "sessions").await,
+            2,
+            "distinct session adds a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_update_sets_node_status() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&node_upsert_env("f", NodeStatus::Unknown))
+            .await
+            .unwrap();
+        let su = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::StatusUpdate,
+            payload: Payload::StatusUpdate {
+                node_id: "fn:a.rs:f".to_string(),
+                status: NodeStatus::Failing,
+                session_id: "sess-1".to_string(),
+                agent_id: None,
+                process_id: None,
+            },
+        };
+        store.persist(&su).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM nodes WHERE id = 'fn:a.rs:f'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("status");
+        assert_eq!(status, "failing");
+    }
+
+    #[tokio::test]
+    async fn hot_edge_updates_edge_and_is_noop_when_absent() {
+        let (store, _dir) = temp_store().await;
+        // No-op when the edge row is absent: must not error or create a row.
+        store
+            .persist(&hot_edge_env("e:a->b", HotEdgeState::Enter))
+            .await
+            .expect("hot_edge no-op");
+        assert_eq!(
+            count(&store, "edges").await,
+            0,
+            "hot_edge must not create an edge"
+        );
+
+        store.persist(&edge_upsert_env(false)).await.unwrap();
+        store
+            .persist(&hot_edge_env("e:a->b", HotEdgeState::Enter))
+            .await
+            .unwrap();
+        let hot: bool = sqlx::query_scalar("SELECT hot FROM edges WHERE id = 'e:a->b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("hot");
+        assert!(hot, "edge should be hot after enter");
+
+        store
+            .persist(&hot_edge_env("e:a->b", HotEdgeState::Exit))
+            .await
+            .unwrap();
+        let hot: bool = sqlx::query_scalar("SELECT hot FROM edges WHERE id = 'e:a->b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("hot");
+        assert!(!hot, "edge should be cold after exit");
+    }
+
+    #[tokio::test]
+    async fn node_and_edge_upsert_replace_and_remove() {
+        let (store, _dir) = temp_store().await;
+        store
+            .persist(&node_upsert_env("f", NodeStatus::Unknown))
+            .await
+            .unwrap();
+        store
+            .persist(&node_upsert_env("g", NodeStatus::Passing))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "nodes").await,
+            1,
+            "upsert replaces, not duplicates"
+        );
+        let row = sqlx::query("SELECT label, status, type FROM nodes WHERE id = 'fn:a.rs:f'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("node row");
+        let label: String = row.get("label");
+        assert_eq!(label, "g");
+        let status: String = row.get("status");
+        assert_eq!(status, "passing");
+        let node_type: String = row.get("type");
+        assert_eq!(node_type, "function");
+
+        store.persist(&edge_upsert_env(false)).await.unwrap();
+        store.persist(&edge_upsert_env(true)).await.unwrap();
+        assert_eq!(count(&store, "edges").await, 1);
+
+        let remove_node = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::NodeRemove,
+            payload: Payload::NodeRemove {
+                id: "fn:a.rs:f".to_string(),
+            },
+        };
+        store.persist(&remove_node).await.unwrap();
+        assert_eq!(count(&store, "nodes").await, 0);
+
+        let remove_edge = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::EdgeRemove,
+            payload: Payload::EdgeRemove {
+                id: "e:a->b".to_string(),
+            },
+        };
+        store.persist(&remove_edge).await.unwrap();
+        assert_eq!(count(&store, "edges").await, 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_subtree_persist_nothing() {
+        let (store, _dir) = temp_store().await;
+        let node = Node {
+            id: "file:a.rs".to_string(),
+            node_type: NodeType::File,
+            label: "a.rs".to_string(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            status: NodeStatus::Unknown,
+            docs: None,
+            signature: None,
+            meta: None,
+        };
+        let edge = Edge {
+            id: "e:a->b".to_string(),
+            source: "a".to_string(),
+            target: "b".to_string(),
+            kind: EdgeKind::Contains,
+            hot: false,
+        };
+        let snapshot = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::Snapshot,
+            payload: Payload::Snapshot {
+                nodes: vec![node.clone()],
+                edges: vec![edge.clone()],
+            },
+        };
+        let subtree = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::Subtree,
+            payload: Payload::Subtree {
+                parent_id: "file:a.rs".to_string(),
+                nodes: vec![node],
+                edges: vec![edge],
+            },
+        };
+        store.persist(&snapshot).await.unwrap();
+        store.persist(&subtree).await.unwrap();
+        for table in TABLES {
+            assert_eq!(count(&store, table).await, 0, "view frame wrote to {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_activity_and_protocol_versions_stay_empty() {
+        let (store, _dir) = temp_store().await;
+        // The full set of structured envelopes the collector + parser produce.
+        let envelopes = vec![
+            test_result_env("sess-1", Some(48213)),
+            test_result_env("sess-1", None),
+            node_upsert_env("f", NodeStatus::Unknown),
+            edge_upsert_env(false),
+            hot_edge_env("e:a->b", HotEdgeState::Enter),
+        ];
+        for env in &envelopes {
+            store.persist(env).await.unwrap();
+        }
+        assert_eq!(
+            count(&store, "agent_activity").await,
+            0,
+            "agent_activity must stay empty in Phase 7"
+        );
+        assert_eq!(
+            count(&store, "protocol_versions").await,
+            0,
+            "protocol_versions must stay empty in Phase 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_stdout_is_never_persisted() {
+        // `persist` accepts only a typed `EventEnvelope` (the collector's parsed
+        // output); a raw stdout line never reaches it. View frames write nothing, so
+        // only structured, persistable events produce rows.
+        let (store, _dir) = temp_store().await;
+        let snapshot = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::Snapshot,
+            payload: Payload::Snapshot {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+        };
+        store.persist(&snapshot).await.unwrap();
+        for table in TABLES {
+            assert_eq!(count(&store, table).await, 0, "view frame wrote to {table}");
+        }
+        store
+            .persist(&test_result_env("sess-1", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "test_results").await,
+            1,
+            "only structured events persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_session_writes_one_row() {
+        let (store, _dir) = temp_store().await;
+        store.record_session("run-1", "/repo").await.unwrap();
+        let repo: String =
+            sqlx::query_scalar("SELECT repo_path FROM sessions WHERE session_id = 'run-1'")
+                .fetch_one(&store.pool)
+                .await
+                .expect("repo_path");
+        assert_eq!(repo, "/repo");
+        // Idempotent re-record.
+        store.record_session("run-1", "/repo").await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE session_id = 'run-1'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 1);
+    }
+}
