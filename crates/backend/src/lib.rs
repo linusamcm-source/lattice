@@ -35,6 +35,11 @@
 //!   [`clv::ClvEvent`] `test`/`status` event onto the target node's
 //!   [`wire::NodeStatus`] colour, emitting the matching `test.result`/`status.update`
 //!   envelope (an unknown node id, or an `activity`/`hotedge` event, is a no-op).
+//! - [`collector`] — the Phase-5 CLV collector ([`collector::collect`]): a `tokio`
+//!   task that tails `<root>/.lattice/clv.ndjson`, parses each newly appended line
+//!   via [`clv::parse_clv_line`], and folds the correlated `test`/`status` events
+//!   through [`graph::Graph::apply_clv`] into live node colour, broadcasting the
+//!   resulting patch [`wire::EventEnvelope`]s to connected clients.
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
@@ -46,10 +51,12 @@
 //!   node's `subtree`.
 //! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
 //!   graph → WebSocket so editing a source file (Rust, Python, or TypeScript)
-//!   updates a connected client's graph live.
+//!   updates a connected client's graph live, and spawns the [`collector`] task so
+//!   tailed CLV `test`/`status` events recolour nodes on that same live graph.
 
 pub mod app;
 pub mod clv;
+pub mod collector;
 pub mod graph;
 pub mod parser;
 pub mod watcher;

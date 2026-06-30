@@ -8,6 +8,13 @@
 //! patch [`EventEnvelope`]s — so editing a file updates the live graph a connected
 //! client renders (the Phase-0 headline behaviour, `BUILD_PLAN.md` Phase 0).
 //!
+//! Alongside the watcher pump, [`run`] spawns the Phase-5 CLV collector
+//! ([`collect`](crate::collector::collect)), which tails
+//! `<root>/.lattice/clv.ndjson` and folds each correlated `test`/`status` event
+//! onto its node's colour — so a failing test reddens its node within ~1s on the
+//! same live graph the watcher feeds. [`RunHandle::shutdown`] aborts the watcher,
+//! the pump, and the collector.
+//!
 //! File paths are normalised to repo-relative form (matching `DATA_MODEL.md` §A.1
 //! ids such as `fn:a.rs:alpha`) by stripping the **canonicalised** repository
 //! root; this also neutralises the macOS `/var` → `/private/var` tempdir symlink
@@ -21,6 +28,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
+use crate::collector::collect;
 use crate::graph::Graph;
 use crate::parser::parse_source;
 use crate::watcher::{is_source_file, watch};
@@ -40,14 +48,17 @@ pub struct RunHandle {
     server: BoundServer,
     watcher_task: JoinHandle<()>,
     pump_task: JoinHandle<()>,
+    collector_task: JoinHandle<()>,
 }
 
 impl RunHandle {
-    /// Stops the WebSocket server and the watcher pump and waits for teardown.
+    /// Stops the WebSocket server, the watcher pump, and the CLV collector and
+    /// waits for teardown.
     pub async fn shutdown(self) {
         self.server.shutdown().await;
         self.watcher_task.abort();
         self.pump_task.abort();
+        self.collector_task.abort();
     }
 }
 
@@ -143,11 +154,16 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
         }
     });
 
+    // CLV collector: tail `<root>/.lattice/clv.ndjson` and fold each correlated
+    // test/status event onto its node's colour, broadcasting the patch envelope.
+    let collector_task = tokio::spawn(collect(root.clone(), Arc::clone(&graph), events_tx.clone()));
+
     Ok(RunHandle {
         addr,
         server,
         watcher_task,
         pump_task,
+        collector_task,
     })
 }
 
@@ -155,8 +171,10 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
 mod tests {
     use super::*;
     use crate::watcher::DEBOUNCE;
-    use crate::wire::{EventType, NodeStatus, Payload};
+    use crate::wire::{EventType, Node, NodeStatus, Payload, TestOutcome};
     use futures_util::{SinkExt, StreamExt};
+    use std::io::Write;
+    use std::path::Path;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -422,5 +440,247 @@ mod tests {
             other => panic!("expected snapshot, got {other:?}"),
         }
         handle.shutdown().await;
+    }
+
+    /// Appends one CLV line (terminated with `\n`) to `<root>/.lattice/clv.ndjson`,
+    /// creating the `.lattice` directory and sink file if absent — mirroring an
+    /// external emitter (a `PostToolUse` hook or test reporter) writing the sink.
+    fn append_sink_line(root: &Path, line: &str) {
+        let dir = root.join(".lattice");
+        std::fs::create_dir_all(&dir).expect("create .lattice dir");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("clv.ndjson"))
+            .expect("open sink for append");
+        writeln!(file, "{line}").expect("append sink line");
+    }
+
+    /// Writes raw bytes to the sink with **no** added newline — used to split one
+    /// logical line across two writes for the partial-line test.
+    fn append_sink_raw(root: &Path, bytes: &str) {
+        let dir = root.join(".lattice");
+        std::fs::create_dir_all(&dir).expect("create .lattice dir");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("clv.ndjson"))
+            .expect("open sink for append");
+        file.write_all(bytes.as_bytes()).expect("append sink bytes");
+    }
+
+    /// Reads envelopes until a `test.result` for `node_id` arrives (or times out).
+    async fn next_test_result_for(ws: &mut ClientWs, node_id: &str) -> EventEnvelope {
+        loop {
+            let env = next_envelope(ws).await;
+            if env.event_type == EventType::TestResult {
+                if let Payload::TestResult { node_id: nid, .. } = &env.payload {
+                    if nid == node_id {
+                        return env;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends an `expand` for `file_id` and returns the subtree's child nodes,
+    /// skipping any patch envelopes that arrive before the subtree reply.
+    async fn expand_subtree_nodes(ws: &mut ClientWs, file_id: &str) -> Vec<Node> {
+        ws.send(Message::text(format!(
+            "{{\"type\":\"expand\",\"nodeId\":\"{file_id}\"}}"
+        )))
+        .await
+        .expect("send expand");
+        loop {
+            let env = next_envelope(ws).await;
+            if let Payload::Subtree {
+                parent_id, nodes, ..
+            } = env.payload
+            {
+                if parent_id == file_id {
+                    return nodes;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn appending_a_failing_test_line_recolours_the_node() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await; // drain the root snapshot
+
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","pid":1,"node":"fn:a.rs:f","outcome":"fail"}"#,
+        );
+
+        // The collector delivers a test.result for fn:a.rs:f within ~1-2s.
+        let env = next_test_result_for(&mut ws, "fn:a.rs:f").await;
+        assert_eq!(env.event_type, EventType::TestResult);
+
+        // A fresh subtree reflects the stored Failing colour.
+        let nodes = expand_subtree_nodes(&mut ws, "file:a.rs").await;
+        let f = nodes
+            .iter()
+            .find(|n| n.id == "fn:a.rs:f")
+            .expect("function child present");
+        assert_eq!(f.status, NodeStatus::Failing);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sink_absent_at_startup_then_created_still_delivers() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        // Deliberately do NOT create `.lattice` — the collector must tolerate it.
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Creating the sink and appending later still delivers the event.
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"}"#,
+        );
+        let env = next_test_result_for(&mut ws, "fn:a.rs:f").await;
+        assert_eq!(env.event_type, EventType::TestResult);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_line_is_parsed_only_after_its_newline() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Write the line without its trailing newline: it must NOT parse yet.
+        append_sink_raw(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"#,
+        );
+        // Several poll cycles pass with no envelope (the buffered partial waits).
+        assert!(
+            timeout(Duration::from_millis(900), ws.next())
+                .await
+                .is_err(),
+            "no envelope must arrive before the newline closes the line"
+        );
+
+        // Completing the line delivers the event exactly once.
+        append_sink_raw(dir.path(), "\"}\n");
+        let env = next_test_result_for(&mut ws, "fn:a.rs:f").await;
+        assert_eq!(env.event_type, EventType::TestResult);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_lines_are_skipped_and_tailing_continues() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // An untagged line and a malformed `#CLV1` line: both produce no envelope.
+        append_sink_line(dir.path(), "PASS app/foo.test.ts");
+        append_sink_line(dir.path(), "#CLV1 {");
+        // A subsequent valid line is still delivered — the tailer did not stop.
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"}"#,
+        );
+
+        let env = next_test_result_for(&mut ws, "fn:a.rs:f").await;
+        assert_eq!(env.event_type, EventType::TestResult);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_sessions_colour_their_own_nodes_independently() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}\nfn g() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Interleaved sessions writing the same sink, each to its own node id.
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"}"#,
+        );
+        append_sink_line(
+            dir.path(),
+            r#"#CLV1 {"event":"test","session":"s2","node":"fn:a.rs:g","outcome":"pass"}"#,
+        );
+
+        // Both events are delivered, each carrying its own node id and outcome.
+        let mut saw_f = false;
+        let mut saw_g = false;
+        while !(saw_f && saw_g) {
+            let env = next_envelope(&mut ws).await;
+            if let Payload::TestResult {
+                node_id, outcome, ..
+            } = &env.payload
+            {
+                if node_id == "fn:a.rs:f" && *outcome == TestOutcome::Fail {
+                    saw_f = true;
+                }
+                if node_id == "fn:a.rs:g" && *outcome == TestOutcome::Pass {
+                    saw_g = true;
+                }
+            }
+        }
+
+        // A fresh subtree colours f Failing and g Passing — no cross-contamination.
+        let nodes = expand_subtree_nodes(&mut ws, "file:a.rs").await;
+        let f = nodes
+            .iter()
+            .find(|n| n.id == "fn:a.rs:f")
+            .expect("f present");
+        let g = nodes
+            .iter()
+            .find(|n| n.id == "fn:a.rs:g")
+            .expect("g present");
+        assert_eq!(f.status, NodeStatus::Failing);
+        assert_eq!(g.status, NodeStatus::Passing);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_tears_down_collector_without_hanging() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Shutdown must abort the collector promptly — it never hangs on the poll
+        // loop, proving the collector task is aborted (not leaked).
+        timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown completes promptly, aborting the collector");
     }
 }
