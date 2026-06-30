@@ -456,3 +456,99 @@ describe('applyEvent (test.result / status.update)', () => {
 		expect(base.nodes.get(fnNode.id)?.status).toBe(before);
 	});
 });
+
+// --- P6-1: hot_edge wire + reducer fixtures ---
+
+function hotEdgeEnv(edgeId: string, state: 'enter' | 'exit'): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:08.000Z',
+		sessionId: 'sess-test',
+		type: 'hot_edge',
+		payload: { edgeId, state, sessionId: 'sess-test', ts: '2026-06-27T00:00:08.000Z' }
+	};
+}
+
+describe('parseEnvelope (hot_edge)', () => {
+	it('parses a well-formed hot_edge enter envelope (non-null, typed)', () => {
+		const env = parseEnvelope(JSON.stringify(hotEdgeEnv(containsEdge.id, 'enter')));
+		expect(env?.type).toBe('hot_edge');
+	});
+
+	it('parses a well-formed hot_edge exit envelope (non-null)', () => {
+		expect(parseEnvelope(JSON.stringify(hotEdgeEnv(containsEdge.id, 'exit')))?.type).toBe(
+			'hot_edge'
+		);
+	});
+
+	it('returns null for a hot_edge missing a string edgeId', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: '',
+					type: 'hot_edge',
+					payload: { state: 'enter', sessionId: '' }
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for a hot_edge whose edgeId is a non-string (AC5 non-string clause)', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: '',
+					type: 'hot_edge',
+					payload: { edgeId: 42, state: 'enter', sessionId: '' }
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for a hot_edge whose state is neither enter nor exit', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: '',
+					type: 'hot_edge',
+					payload: { edgeId: containsEdge.id, state: 'blink', sessionId: '' }
+				})
+			)
+		).toBeNull();
+	});
+});
+
+describe('applyEvent (hot_edge)', () => {
+	it('sets an existing edge hot=true on an enter event', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, hotEdgeEnv(containsEdge.id, 'enter'));
+		expect(state.edges.get(containsEdge.id)?.hot).toBe(true);
+	});
+
+	it('clears an existing edge hot=false on an exit event', () => {
+		let state = applyEvent(initialState(), snapshotEnv);
+		state = applyEvent(state, hotEdgeEnv(containsEdge.id, 'enter'));
+		state = applyEvent(state, hotEdgeEnv(containsEdge.id, 'exit'));
+		expect(state.edges.get(containsEdge.id)?.hot).toBe(false);
+	});
+
+	it('is a no-op for a hot_edge whose edge is absent (same state object)', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, hotEdgeEnv('e:ghost->none', 'enter'));
+		expect(state).toBe(base);
+		expect(state.edges.has('e:ghost->none')).toBe(false);
+	});
+
+	it('does not mutate the input state on a hot_edge enter', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const before = base.edges.get(containsEdge.id)?.hot;
+		applyEvent(base, hotEdgeEnv(containsEdge.id, 'enter'));
+		expect(base.edges.get(containsEdge.id)?.hot).toBe(before);
+	});
+});

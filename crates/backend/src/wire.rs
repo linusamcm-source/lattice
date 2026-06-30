@@ -10,14 +10,17 @@
 //! - §A.4 — [`EventEnvelope`] (`{ v, ts, sessionId, type, payload }`), tagged by
 //!   [`EventType`].
 //! - §A.5 — the test/status CLV event payloads [`Payload::TestResult`] and
-//!   [`Payload::StatusUpdate`].
+//!   [`Payload::StatusUpdate`], and the Phase-6 runtime-tracer `hot_edge` payload
+//!   [`Payload::HotEdge`] (carrying [`HotEdgeState`]).
 //!
 //! It also pins the wire payload contract as the typed [`Payload`] variants: the
 //! Phase-0 `snapshot`/`node.upsert`/`node.remove`/`edge.upsert`/`edge.remove`
 //! diff set, plus the Phase-1 lazy-hierarchy `subtree` reply (the direct children
-//! of an expanded node — see [`Payload::Subtree`]) and the Phase-5 §A.5
+//! of an expanded node — see [`Payload::Subtree`]), the Phase-5 §A.5
 //! `test.result` / `status.update` payloads ([`Payload::TestResult`],
-//! [`Payload::StatusUpdate`]). Per `AGENT_PROTOCOL.md` §5 the
+//! [`Payload::StatusUpdate`]), and the Phase-6 §A.5 `hot_edge` payload
+//! ([`Payload::HotEdge`], toggling an [`Edge::hot`] flag via [`HotEdgeState`]).
+//! Per `AGENT_PROTOCOL.md` §5 the
 //! protocol is identified on the CLV stdio channel by the `#CLV1` sentinel (see
 //! [`crate::protocol_sentinel`]).
 //!
@@ -111,6 +114,21 @@ pub enum TestOutcome {
     Skip,
     /// The test is currently executing.
     Running,
+}
+
+/// Transition of a runtime call edge between hot and cold (`DATA_MODEL.md` §A.5
+/// `hot_edge.state`).
+///
+/// Serialises lowercase to the exact CLV strings (`"enter"`/`"exit"`) and is the
+/// `state` field of [`Payload::HotEdge`]. Per §A.5, `enter` sets the target
+/// [`Edge::hot`] to `true` (the edge is on the executing stack); `exit` clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HotEdgeState {
+    /// The call edge went hot — execution entered the callee (`hot:true`).
+    Enter,
+    /// The call edge went cold — execution left the callee (`hot:false`).
+    Exit,
 }
 
 /// Kind of relation an [`Edge`] expresses (`DATA_MODEL.md` §A.3 `kind`).
@@ -402,6 +420,36 @@ pub enum Payload {
         /// OS process id of the producer, when known.
         #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
         process_id: Option<u32>,
+    },
+    /// `hot_edge` — a runtime call edge going hot or cold (`DATA_MODEL.md` §A.5).
+    ///
+    /// Declared **after** [`Payload::StatusUpdate`]: under this `#[serde(untagged)]`
+    /// enum a variant resolves by its required fields, and `hot_edge` is the only
+    /// variant requiring both `edgeId` and `state`. A `hot_edge` object carries no
+    /// `nodeId`/`testId`, so it cannot mis-match [`Payload::TestResult`] or
+    /// [`Payload::StatusUpdate`]; conversely a status/test object carries no
+    /// `edgeId`, so it falls through this variant. The required `edgeId` is the
+    /// disambiguator. Per §A.5, [`HotEdgeState::Enter`] sets the target edge's
+    /// [`Edge::hot`] flag and [`HotEdgeState::Exit`] clears it.
+    HotEdge {
+        /// Id of the call [`Edge`] whose `hot` flag this event toggles.
+        #[serde(rename = "edgeId")]
+        edge_id: String,
+        /// Whether the edge entered (hot) or exited (cold) the executing stack;
+        /// its presence (with `edgeId`) disambiguates this variant under the
+        /// untagged decode.
+        state: HotEdgeState,
+        /// OS process id of the producer, when known.
+        #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
+        process_id: Option<u32>,
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Id of the agent that produced the event, when attributed.
+        #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// ISO-8601 timestamp of the transition.
+        ts: String,
     },
 }
 
@@ -940,6 +988,23 @@ mod tests {
         }
     }
 
+    fn hot_edge_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.500Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::HotEdge,
+            payload: Payload::HotEdge {
+                edge_id: "e:authenticate->verify_token".to_string(),
+                state: HotEdgeState::Enter,
+                process_id: Some(48213),
+                session_id: "sess-abc123".to_string(),
+                agent_id: Some("tdd-green".to_string()),
+                ts: "2026-06-27T10:32:01.500Z".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn test_outcome_serializes_snake_case() {
         let cases = [
@@ -996,6 +1061,132 @@ mod tests {
         let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
         assert_eq!(back.event_type, EventType::StatusUpdate);
+    }
+
+    #[test]
+    fn hot_edge_state_serializes_lowercase() {
+        let cases = [(HotEdgeState::Enter, "enter"), (HotEdgeState::Exit, "exit")];
+        for (variant, want) in cases {
+            assert_eq!(
+                serde_json::to_value(variant).expect("serialize"),
+                Value::from(want)
+            );
+        }
+    }
+
+    #[test]
+    fn hot_edge_envelope_round_trips_with_edge_id_and_state() {
+        let env = hot_edge_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"hot_edge\""),
+            "missing hot_edge envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"edgeId\":\"e:authenticate->verify_token\""),
+            "missing camelCase edgeId: {json}"
+        );
+        assert!(
+            json.contains("\"state\":\"enter\""),
+            "missing lowercase state: {json}"
+        );
+        // camelCase / skip idioms must match §A.5 spelling.
+        assert!(
+            json.contains("\"processId\":48213"),
+            "missing camelCase processId: {json}"
+        );
+        assert!(
+            json.contains("\"agentId\":\"tdd-green\""),
+            "missing camelCase agentId: {json}"
+        );
+        assert!(
+            !json.contains("\"edge_id\"") && !json.contains("\"process_id\""),
+            "snake_case key leaked: {json}"
+        );
+
+        // payload.edgeId / payload.state assert against the §A.5 example values.
+        let value = serde_json::to_value(&env).expect("serialize value");
+        let payload = &value["payload"];
+        assert_eq!(
+            payload["edgeId"],
+            Value::from("e:authenticate->verify_token")
+        );
+        assert_eq!(payload["state"], Value::from("enter"));
+
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::HotEdge);
+        assert!(
+            matches!(back.payload, Payload::HotEdge { .. }),
+            "hot_edge mis-decoded as {:?}",
+            back.payload
+        );
+    }
+
+    #[test]
+    fn hot_edge_process_and_agent_ids_are_omitted_when_absent() {
+        let env = EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.500Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::HotEdge,
+            payload: Payload::HotEdge {
+                edge_id: "e:a->b".to_string(),
+                state: HotEdgeState::Exit,
+                process_id: None,
+                session_id: "sess-abc123".to_string(),
+                agent_id: None,
+                ts: "2026-06-27T10:32:01.500Z".to_string(),
+            },
+        };
+        let value = serde_json::to_value(&env).expect("serialize");
+        let payload = value["payload"].as_object().expect("payload object");
+        assert!(
+            !payload.contains_key("processId"),
+            "processId should be omitted when None: {value}"
+        );
+        assert!(
+            !payload.contains_key("agentId"),
+            "agentId should be omitted when None: {value}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&value.to_string()).expect("deserialize");
+        assert_eq!(env, back);
+    }
+
+    #[test]
+    fn untagged_decode_disambiguates_hot_edge_from_status_and_test() {
+        // A `hot_edge` payload object resolves to Payload::HotEdge via its required
+        // `edgeId` + `state` fields — it must NOT mis-decode as anything else.
+        let he: Payload = serde_json::from_str(
+            r#"{"edgeId":"e:a->b","state":"enter","sessionId":"s1","ts":"2026-06-27T10:32:01.500Z"}"#,
+        )
+        .expect("decode hot_edge payload object");
+        match he {
+            Payload::HotEdge { edge_id, state, .. } => {
+                assert_eq!(edge_id, "e:a->b");
+                assert_eq!(state, HotEdgeState::Enter);
+            }
+            other => panic!("hot_edge mis-decoded as {other:?}"),
+        }
+
+        // A `status.update` object (no `edgeId`) must still resolve to StatusUpdate.
+        let su: Payload =
+            serde_json::from_str(r#"{"nodeId":"fn:a.rs:f","status":"passing","sessionId":"s1"}"#)
+                .expect("decode status.update payload object");
+        assert!(
+            matches!(su, Payload::StatusUpdate { .. }),
+            "status.update mis-decoded as {su:?}"
+        );
+
+        // A `test.result` object (no `edgeId`) must still resolve to TestResult.
+        let tr: Payload = serde_json::from_str(
+            r#"{"nodeId":"fn:a.rs:f","testId":"t1","outcome":"fail","sessionId":"s1"}"#,
+        )
+        .expect("decode test.result payload object");
+        assert!(
+            matches!(tr, Payload::TestResult { .. }),
+            "test.result mis-decoded as {tr:?}"
+        );
     }
 
     #[test]
