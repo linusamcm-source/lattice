@@ -9,11 +9,15 @@
 //! - §A.3 — [`Edge`] (typed relation between nodes).
 //! - §A.4 — [`EventEnvelope`] (`{ v, ts, sessionId, type, payload }`), tagged by
 //!   [`EventType`].
+//! - §A.5 — the test/status CLV event payloads [`Payload::TestResult`] and
+//!   [`Payload::StatusUpdate`].
 //!
 //! It also pins the wire payload contract as the typed [`Payload`] variants: the
 //! Phase-0 `snapshot`/`node.upsert`/`node.remove`/`edge.upsert`/`edge.remove`
 //! diff set, plus the Phase-1 lazy-hierarchy `subtree` reply (the direct children
-//! of an expanded node — see [`Payload::Subtree`]). Per `AGENT_PROTOCOL.md` §5 the
+//! of an expanded node — see [`Payload::Subtree`]) and the Phase-5 §A.5
+//! `test.result` / `status.update` payloads ([`Payload::TestResult`],
+//! [`Payload::StatusUpdate`]). Per `AGENT_PROTOCOL.md` §5 the
 //! protocol is identified on the CLV stdio channel by the `#CLV1` sentinel (see
 //! [`crate::protocol_sentinel`]).
 //!
@@ -88,6 +92,25 @@ pub enum NodeStatus {
     Stale,
     /// Could not be analysed (e.g. the source file failed to parse).
     Error,
+}
+
+/// Outcome of a single test run (`DATA_MODEL.md` §A.5 `test.result.outcome`).
+///
+/// Serialises snake_case to the exact CLV strings (`"pass"`/`"fail"`/`"skip"`/
+/// `"running"`) and is the `outcome` field of [`Payload::TestResult`]. The graph
+/// layer maps it onto a [`NodeStatus`] colour (`fail`→`Failing`, `pass`→`Passing`,
+/// `skip`→`Stale`, `running`→`Running`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestOutcome {
+    /// The test passed.
+    Pass,
+    /// The test failed.
+    Fail,
+    /// The test was skipped / ignored.
+    Skip,
+    /// The test is currently executing.
+    Running,
 }
 
 /// Kind of relation an [`Edge`] expresses (`DATA_MODEL.md` §A.3 `kind`).
@@ -268,6 +291,10 @@ pub struct Edge {
 /// identical `{ "id": … }` shape — on the wire they are told apart solely by the
 /// envelope `type`, so an untagged decode of a bare `{ "id": … }` resolves to
 /// [`Payload::NodeRemove`]; always read [`EventEnvelope::event_type`] to know which.
+/// For the same reason the Phase-5 [`Payload::TestResult`] is declared **before**
+/// [`Payload::StatusUpdate`]: a `test.result` object carries every field
+/// `StatusUpdate` requires, so the `testId`-bearing variant is tried first or a
+/// test result would silently mis-decode as a status update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
@@ -315,6 +342,66 @@ pub enum Payload {
     EdgeRemove {
         /// Id of the edge to remove.
         id: String,
+    },
+    /// `test.result` — a test outcome for a node (`DATA_MODEL.md` §A.5).
+    ///
+    /// Declared **after** the Phase-0/1 variants and **before**
+    /// [`Payload::StatusUpdate`], for the same load-bearing reason the
+    /// [`Payload::Subtree`]-before-[`Payload::Snapshot`] note above describes: this
+    /// enum is `#[serde(untagged)]` and a struct variant ignores unknown fields. A
+    /// `test.result` object `{nodeId,testId,outcome,sessionId,…}` carries every
+    /// field [`Payload::StatusUpdate`] requires, so were `StatusUpdate` declared
+    /// first an untagged decode would resolve a test result as a status update and
+    /// silently drop `testId`/`outcome`/`durationMs`. The required `testId` — absent
+    /// on `StatusUpdate` — is the disambiguator: a `status.update` object (no
+    /// `testId`) fails this variant and falls through to [`Payload::StatusUpdate`].
+    TestResult {
+        /// Id of the node the test covers.
+        #[serde(rename = "nodeId")]
+        node_id: String,
+        /// Stable test identifier; its presence disambiguates this variant from
+        /// [`Payload::StatusUpdate`] under the untagged decode.
+        #[serde(rename = "testId")]
+        test_id: String,
+        /// Pass / fail / skip / running outcome.
+        outcome: TestOutcome,
+        /// Wall-clock test duration in milliseconds, when measured.
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Id of the agent that produced the result, when attributed.
+        #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// OS process id of the producer, when known.
+        #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
+        process_id: Option<u32>,
+        /// Optional human-readable failure / skip detail.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// `status.update` — set a node's live [`NodeStatus`] (`DATA_MODEL.md` §A.5).
+    ///
+    /// Declared **after** [`Payload::TestResult`]: a `status.update` object carries
+    /// no `testId`, so it fails the `testId`-required `TestResult` variant and
+    /// resolves here. See the [`Payload::TestResult`] note for the full
+    /// untagged-ordering rationale.
+    StatusUpdate {
+        /// Id of the node whose status changes.
+        #[serde(rename = "nodeId")]
+        node_id: String,
+        /// The node's new live status.
+        status: NodeStatus,
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Id of the agent that produced the update, when attributed.
+        #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// OS process id of the producer, when known.
+        #[serde(rename = "processId", skip_serializing_if = "Option::is_none")]
+        process_id: Option<u32>,
     },
 }
 
@@ -816,5 +903,144 @@ mod tests {
             let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(env, back);
         }
+    }
+
+    fn test_result_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.123Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::TestResult,
+            payload: Payload::TestResult {
+                node_id: "fn:a.rs:f".to_string(),
+                test_id: "auth::test_valid".to_string(),
+                outcome: TestOutcome::Fail,
+                duration_ms: Some(14),
+                session_id: "sess-abc123".to_string(),
+                agent_id: Some("tdd-red".to_string()),
+                process_id: Some(48213),
+                message: Some("expected Ok, got Err".to_string()),
+            },
+        }
+    }
+
+    fn status_update_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.123Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::StatusUpdate,
+            payload: Payload::StatusUpdate {
+                node_id: "fn:a.rs:f".to_string(),
+                status: NodeStatus::Failing,
+                session_id: "sess-abc123".to_string(),
+                agent_id: None,
+                process_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_outcome_serializes_snake_case() {
+        let cases = [
+            (TestOutcome::Pass, "pass"),
+            (TestOutcome::Fail, "fail"),
+            (TestOutcome::Skip, "skip"),
+            (TestOutcome::Running, "running"),
+        ];
+        for (variant, want) in cases {
+            assert_eq!(
+                serde_json::to_value(variant).expect("serialize"),
+                Value::from(want)
+            );
+        }
+    }
+
+    #[test]
+    fn test_result_envelope_round_trips_with_node_id_key() {
+        let env = test_result_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"test.result\""),
+            "missing test.result envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"nodeId\":\"fn:a.rs:f\""),
+            "missing camelCase nodeId: {json}"
+        );
+        assert!(
+            json.contains("\"outcome\":\"fail\""),
+            "missing snake_case outcome: {json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::TestResult);
+    }
+
+    #[test]
+    fn status_update_envelope_round_trips_with_node_id_and_status() {
+        let env = status_update_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"status.update\""),
+            "missing status.update envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"nodeId\":\"fn:a.rs:f\""),
+            "missing camelCase nodeId: {json}"
+        );
+        assert!(
+            json.contains("\"status\":\"failing\""),
+            "missing status value: {json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::StatusUpdate);
+    }
+
+    #[test]
+    fn untagged_decode_disambiguates_test_result_and_status_update() {
+        // A `test.result` payload object resolves to Payload::TestResult with its
+        // `testId` intact — it must NOT mis-decode as a status update.
+        let tr: Payload = serde_json::from_str(
+            r#"{"nodeId":"fn:a.rs:f","testId":"t1","outcome":"fail","sessionId":"s1"}"#,
+        )
+        .expect("decode test.result payload object");
+        match tr {
+            Payload::TestResult {
+                node_id,
+                test_id,
+                outcome,
+                ..
+            } => {
+                assert_eq!(node_id, "fn:a.rs:f");
+                assert_eq!(test_id, "t1");
+                assert_eq!(outcome, TestOutcome::Fail);
+            }
+            other => panic!("test.result mis-decoded as {other:?}"),
+        }
+
+        // A `status.update` payload object (no `testId`) falls through to
+        // Payload::StatusUpdate.
+        let su: Payload =
+            serde_json::from_str(r#"{"nodeId":"fn:a.rs:f","status":"passing","sessionId":"s1"}"#)
+                .expect("decode status.update payload object");
+        match su {
+            Payload::StatusUpdate {
+                node_id, status, ..
+            } => {
+                assert_eq!(node_id, "fn:a.rs:f");
+                assert_eq!(status, NodeStatus::Passing);
+            }
+            other => panic!("status.update mis-decoded as {other:?}"),
+        }
+
+        // A bare `{ "id": … }` still decodes to Payload::NodeRemove (unchanged).
+        let rm: Payload =
+            serde_json::from_str(r#"{"id":"fn:src/x.rs:foo"}"#).expect("decode bare id object");
+        assert!(
+            matches!(rm, Payload::NodeRemove { .. }),
+            "bare id mis-decoded as {rm:?}"
+        );
     }
 }

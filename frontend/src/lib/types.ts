@@ -1,6 +1,6 @@
 /**
- * CLV wire schema — TypeScript mirror of `docs/orignal_specs/DATA_MODEL.md` §A.2–A.4
- * plus the Phase 0 wire payload contract.
+ * CLV wire schema — TypeScript mirror of `docs/orignal_specs/DATA_MODEL.md` §A.2–A.5
+ * plus the Phase 0 wire payload contract and the Phase 5 `test.result`/`status.update` event payloads.
  *
  * This is the single, `any`-free source of truth the WebSocket boundary parses into.
  * JSON keys are camelCase exactly as they arrive on the wire (`parentId`, `childIds`,
@@ -130,6 +130,34 @@ export interface SubtreePayload {
 	edges: Edge[];
 }
 
+/** Outcome of a single test run (DATA_MODEL §A.5 `test.result.outcome`). */
+export type TestOutcome = 'pass' | 'fail' | 'skip' | 'running';
+
+/**
+ * Phase 5 `test.result` payload (DATA_MODEL §A.5) — a test outcome for a node.
+ * `testId` is required: it disambiguates this from {@link StatusUpdatePayload} on
+ * the untagged Rust wire. Optional fields are absent when not measured/attributed.
+ */
+export interface TestResultPayload {
+	nodeId: string;
+	testId: string;
+	outcome: TestOutcome;
+	durationMs?: number;
+	sessionId: string;
+	agentId?: string;
+	processId?: number;
+	message?: string;
+}
+
+/** Phase 5 `status.update` payload (DATA_MODEL §A.5) — set a node's live status. */
+export interface StatusUpdatePayload {
+	nodeId: string;
+	status: NodeStatus;
+	sessionId: string;
+	agentId?: string;
+	processId?: number;
+}
+
 /** Fields shared by every {@link EventEnvelope} variant (DATA_MODEL §A.4). */
 export interface EnvelopeBase {
 	v: 1;
@@ -148,7 +176,9 @@ export type EventEnvelope =
 	| (EnvelopeBase & { type: 'node.remove'; payload: NodeRemovePayload })
 	| (EnvelopeBase & { type: 'edge.upsert'; payload: EdgeUpsertPayload })
 	| (EnvelopeBase & { type: 'edge.remove'; payload: EdgeRemovePayload })
-	| (EnvelopeBase & { type: 'subtree'; payload: SubtreePayload });
+	| (EnvelopeBase & { type: 'subtree'; payload: SubtreePayload })
+	| (EnvelopeBase & { type: 'test.result'; payload: TestResultPayload })
+	| (EnvelopeBase & { type: 'status.update'; payload: StatusUpdatePayload });
 
 /** The set of envelope `type` discriminants this Phase 0 client understands. */
 export type EventType = EventEnvelope['type'];

@@ -12,7 +12,7 @@ import {
 	nodes,
 	edges
 } from './ws';
-import type { Node, Edge, EventEnvelope } from './types';
+import type { Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
 
 const fileNode: Node = {
 	id: 'file:src/x.rs',
@@ -348,5 +348,111 @@ describe('requestExpand', () => {
 		requestExpand(socket, 'file:a.rs');
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send).toHaveBeenCalledWith('{"type":"expand","nodeId":"file:a.rs"}');
+	});
+});
+
+// --- P5-1: test.result / status.update wire + reducer fixtures ---
+
+function testResultEnv(nodeId: string, outcome: TestOutcome): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:06.000Z',
+		sessionId: 'sess-test',
+		type: 'test.result',
+		payload: { nodeId, testId: 'x::t1', outcome, sessionId: 'sess-test' }
+	};
+}
+
+function statusUpdateEnv(nodeId: string, status: NodeStatus): EventEnvelope {
+	return {
+		v: 1,
+		ts: '2026-06-27T00:00:07.000Z',
+		sessionId: 'sess-test',
+		type: 'status.update',
+		payload: { nodeId, status, sessionId: 'sess-test' }
+	};
+}
+
+describe('parseEnvelope (test.result / status.update)', () => {
+	it('parses a valid test.result envelope (non-null, typed)', () => {
+		const env = parseEnvelope(JSON.stringify(testResultEnv('fn:src/x.rs:alpha', 'fail')));
+		expect(env?.type).toBe('test.result');
+	});
+
+	it('parses a valid status.update envelope (non-null)', () => {
+		const env = parseEnvelope(JSON.stringify(statusUpdateEnv('fn:src/x.rs:alpha', 'passing')));
+		expect(env?.type).toBe('status.update');
+	});
+
+	it('returns null for a test.result missing a string nodeId', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: '',
+					type: 'test.result',
+					payload: { testId: 't', outcome: 'fail', sessionId: '' }
+				})
+			)
+		).toBeNull();
+	});
+
+	it('still returns null for a genuinely unknown type', () => {
+		expect(
+			parseEnvelope(JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'bogus', payload: {} }))
+		).toBeNull();
+	});
+});
+
+describe('applyEvent (test.result / status.update)', () => {
+	it('sets an existing node status to failing on a fail outcome', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, testResultEnv(fnNode.id, 'fail'));
+		expect(state.nodes.get(fnNode.id)?.status).toBe('failing');
+	});
+
+	it('sets an existing node status to passing on a pass outcome', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, testResultEnv(fnNode.id, 'pass'));
+		expect(state.nodes.get(fnNode.id)?.status).toBe('passing');
+	});
+
+	it('maps skip to stale and running to running', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		expect(applyEvent(base, testResultEnv(fnNode.id, 'skip')).nodes.get(fnNode.id)?.status).toBe(
+			'stale'
+		);
+		expect(applyEvent(base, testResultEnv(fnNode.id, 'running')).nodes.get(fnNode.id)?.status).toBe(
+			'running'
+		);
+	});
+
+	it('applies a status.update to an existing node', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, statusUpdateEnv(fnNode.id, 'running'));
+		expect(state.nodes.get(fnNode.id)?.status).toBe('running');
+	});
+
+	it('is a no-op for a test.result whose node is absent (no phantom node)', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, testResultEnv('fn:src/x.rs:ghost', 'fail'));
+		expect(state.nodes.has('fn:src/x.rs:ghost')).toBe(false);
+		expect(state.nodes.size).toBe(2);
+		expect(state).toBe(base);
+	});
+
+	it('is a no-op for a status.update whose node is absent', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const state = applyEvent(base, statusUpdateEnv('fn:src/x.rs:ghost', 'failing'));
+		expect(state.nodes.has('fn:src/x.rs:ghost')).toBe(false);
+		expect(state).toBe(base);
+	});
+
+	it('does not mutate the input state on a test.result', () => {
+		const base = applyEvent(initialState(), snapshotEnv);
+		const before = base.nodes.get(fnNode.id)?.status;
+		applyEvent(base, testResultEnv(fnNode.id, 'fail'));
+		expect(base.nodes.get(fnNode.id)?.status).toBe(before);
 	});
 });
