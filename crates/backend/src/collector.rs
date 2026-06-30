@@ -9,7 +9,11 @@
 //! [`Graph::apply_clv`], and **every** patch envelope it returns is broadcast on
 //! `events_tx` so connected clients update — a `test`/`status` recolour, a `hotedge`
 //! heat toggle, or (Phase 8) the agent node/edge upserts plus
-//! `agent.activity`/`agent.roster` of an `activity` event. It is wired into [`run`](crate::app::run)
+//! `agent.activity`/`agent.roster` of an `activity` event. Because the collector has
+//! no process-exit signal, every tick also runs [`Graph::expire_idle`]: a process
+//! quiet for longer than [`ROSTER_IDLE_MS`](crate::graph::ROSTER_IDLE_MS) is timed
+//! out to `inactive` and its `agent.roster` re-broadcast — even on an otherwise idle
+//! sink — closing the roster lifecycle. It is wired into [`run`](crate::app::run)
 //! alongside the watcher pump and torn down by
 //! [`RunHandle::shutdown`](crate::app::RunHandle::shutdown).
 //!
@@ -74,10 +78,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// live node colour and broadcasting the resulting patch.
 ///
 /// Runs until the task is aborted (by [`RunHandle::shutdown`](crate::app::RunHandle::shutdown)).
-/// Each [`POLL_INTERVAL`] tick it reads newly appended complete lines, parses them
-/// with [`parse_clv_line`], and for every parsed event locks `graph` and calls
-/// [`Graph::apply_clv`]; **every** [`EventEnvelope`] in the returned vector is sent on
-/// `events_tx` for the WebSocket layer to fan out. The file may be absent at startup and created later;
+/// Each [`POLL_INTERVAL`] it runs one [`tick`] with a fresh
+/// [`monotonic_now_ms`](crate::graph::monotonic_now_ms) reading: [`tick`] reads newly
+/// appended complete lines, parses them with [`parse_clv_line`], and for every parsed
+/// event locks `graph` and calls [`Graph::apply_clv`] — **every** [`EventEnvelope`] in
+/// the returned vector is sent on `events_tx` for the WebSocket layer to fan out — then
+/// sweeps idle processes via [`Graph::expire_idle`]. The file may be absent at startup and created later;
 /// a truncation/rotation resets the read offset. Malformed or untagged lines parse
 /// to [`None`] and are skipped silently — the tail continues. Panic-free: every I/O
 /// error simply ends the current poll and the loop retries on the next tick.
@@ -90,8 +96,43 @@ pub async fn collect(
     let mut offset: u64 = 0;
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        poll_once(&sink, &mut offset, &mut buffer, &graph, &events_tx).await;
+        tick(
+            &sink,
+            &mut offset,
+            &mut buffer,
+            &graph,
+            &events_tx,
+            crate::graph::monotonic_now_ms(),
+        )
+        .await;
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Runs one collector iteration: drain new sink lines, then expire idle processes.
+///
+/// The per-tick body of [`collect`]'s loop, split out so the idle-timeout sweep runs
+/// on **every** tick regardless of sink growth. First [`poll_once`] drains and folds
+/// any newly appended lines; then `graph` is locked and [`Graph::expire_idle`] is
+/// called with `now_ms` — flipping any process quiet for longer than
+/// [`ROSTER_IDLE_MS`](crate::graph::ROSTER_IDLE_MS) to `inactive` — and every
+/// returned `agent.roster` envelope is broadcast on `events_tx`. Crucially this is
+/// **not** gated behind [`poll_once`]'s no-growth early return, so a process that
+/// goes quiet on an otherwise idle sink is still timed out. [`collect`] passes a real
+/// [`monotonic_now_ms`](crate::graph::monotonic_now_ms) reading each iteration; tests
+/// inject `now_ms`. Panic-free: a send to a closed channel is ignored.
+async fn tick(
+    sink: &Path,
+    offset: &mut u64,
+    buffer: &mut Vec<u8>,
+    graph: &Arc<Mutex<Graph>>,
+    events_tx: &broadcast::Sender<EventEnvelope>,
+    now_ms: u64,
+) {
+    poll_once(sink, offset, buffer, graph, events_tx).await;
+    let expired = graph.lock().await.expire_idle(now_ms);
+    for envelope in expired {
+        let _ = events_tx.send(envelope);
     }
 }
 
@@ -362,6 +403,82 @@ mod tests {
             4,
             "exactly the four activity envelopes must be broadcast, got {types:?}"
         );
+    }
+
+    /// P8-4: the per-tick collector body must drive `Graph::expire_idle` on
+    /// **every** tick, independently of sink growth — so a process that has gone
+    /// idle is flipped to `inactive` and its `agent.roster` broadcast even when NO
+    /// new lines arrived. This is the seam that proves expiry is driven from the
+    /// `collect` loop and is NOT gated behind `poll_once`'s no-growth early return.
+    ///
+    /// Pinned contract for the GREEN engineer — the loop body is extracted into:
+    /// ```ignore
+    /// async fn tick(
+    ///     sink: &Path,
+    ///     offset: &mut u64,
+    ///     buffer: &mut Vec<u8>,
+    ///     graph: &Arc<Mutex<Graph>>,
+    ///     events_tx: &broadcast::Sender<EventEnvelope>,
+    ///     now_ms: u64,
+    /// )
+    /// ```
+    /// which runs `poll_once(..)` then locks `graph`, calls `expire_idle(now_ms)`,
+    /// and broadcasts every returned envelope. `collect`'s loop calls `tick(..)`
+    /// each iteration with a real monotonic-millisecond now. RED until `tick`,
+    /// `Graph::expire_idle`, and `Graph::apply_clv_at` exist.
+    #[tokio::test]
+    async fn tick_expires_idle_process_on_a_quiet_sink() {
+        let dir = tempdir().expect("tempdir");
+        // Never created → a genuinely quiet sink: poll_once finds no growth.
+        let sink = dir.path().join(".lattice/clv.ndjson");
+
+        // Seed a graph with one active process whose last_seen is t0.
+        let t0: u64 = 1_000;
+        let mut g = Graph::new();
+        let _ = g.apply_parsed(parse_rust_source("a.rs", "fn f() {}"));
+        let _ = g.apply_clv_at(
+            &crate::clv::ClvEvent::Activity {
+                session: "s1".to_string(),
+                pid: Some(48213),
+                agent: Some("tdd-green".to_string()),
+                msg: None,
+                node: "fn:a.rs:f".to_string(),
+                action: "modified".to_string(),
+            },
+            t0,
+        );
+        let graph = Arc::new(Mutex::new(g));
+        let (tx, mut rx) = broadcast::channel::<EventEnvelope>(16);
+
+        // One tick at a time past the idle window, with a quiet sink: poll_once
+        // returns early (no growth), but expire_idle still runs and broadcasts the
+        // roster marking the idle process inactive.
+        let now = t0 + crate::graph::ROSTER_IDLE_MS + 1;
+        let mut offset = 0;
+        let mut buffer = Vec::new();
+        tick(&sink, &mut offset, &mut buffer, &graph, &tx, now).await;
+
+        let env = rx
+            .try_recv()
+            .expect("the expiry roster must be broadcast on a quiet sink");
+        assert_eq!(
+            env.event_type,
+            EventType::AgentRoster,
+            "the broadcast envelope is an agent.roster, got {env:?}"
+        );
+        match env.payload {
+            Payload::AgentRoster { agents, .. } => {
+                let row = agents
+                    .iter()
+                    .find(|a| a.process_id == 48213)
+                    .unwrap_or_else(|| panic!("expected a roster row for 48213, got {agents:?}"));
+                assert_eq!(
+                    row.status, "inactive",
+                    "the idle process is flipped to inactive on the tick"
+                );
+            }
+            other => panic!("expected AgentRoster, got {other:?}"),
+        }
     }
 
     #[tokio::test]

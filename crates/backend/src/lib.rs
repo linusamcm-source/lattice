@@ -40,9 +40,12 @@
 //!   attributed `activity` event (Phase 8 agent layer) upserts a root `agent` vertex
 //!   and an `authored_by` edge from the touched node, updates the per-process
 //!   [`wire::AgentInfo`] roster, and emits `node.upsert`/`edge.upsert`/
-//!   `agent.activity`/`agent.roster`. An unknown node/edge id, an unparsable
-//!   hot-edge state, a no-change heat transition, or an `activity` event missing its
-//!   `agent`/`pid` is a no-op (empty `Vec`).
+//!   `agent.activity`/`agent.roster`. A quiet process is later timed out to
+//!   `inactive` by [`graph::Graph::expire_idle`] once it has been silent for the
+//!   `ROSTER_IDLE_MS` window, re-emitting the roster only when a status actually
+//!   changes (Phase 8). An unknown node/edge id, an unparsable hot-edge state, a
+//!   no-change heat transition, or an `activity` event missing its `agent`/`pid` is
+//!   a no-op (empty `Vec`).
 //! - [`tracing_layer`] — the Phase-6 runtime tracing emitter (the *write* side of
 //!   the hot-edge seam): [`tracing_layer::HotEdgeLayer`] is a `tracing` layer that
 //!   records an `edge` field off each span and emits a throttled `#CLV1` `hotedge`
@@ -59,7 +62,9 @@
 //!   via [`clv::parse_clv_line`], and folds the correlated event through
 //!   [`graph::Graph::apply_clv`], broadcasting **every** resulting patch
 //!   [`wire::EventEnvelope`] (node colour, hot-edge heat, or the Phase-8 agent
-//!   node/edge/roster patches) to connected clients.
+//!   node/edge/roster patches) to connected clients. Each tick also sweeps idle
+//!   processes to `inactive` via [`graph::Graph::expire_idle`], independent of sink
+//!   growth, so a quiet agent's roster status still closes out.
 //! - [`storage`] — the Phase-7 persistence seam (`DATA_MODEL.md` §B): a single
 //!   async [`storage::Storage`] trait write-throughs the structured CLV
 //!   [`wire::EventEnvelope`] stream to one of two interchangeable `sqlx` backends —

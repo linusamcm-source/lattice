@@ -24,6 +24,11 @@
 //! per-process [`AgentInfo`](crate::wire::AgentInfo) roster, and emits
 //! `node.upsert`/`edge.upsert`/`agent.activity`/`agent.roster` — though the
 //! `agent.roster` is coalesced away on a no-change repeat (same pid, same identity).
+//! Because there is no process-exit signal, a process's `status` lifecycle is closed
+//! by an **idle timeout**: each activity stamps the process's `last_seen` (via
+//! [`Graph::apply_clv_at`]), and [`Graph::expire_idle`] flips any process quiet for
+//! longer than [`ROSTER_IDLE_MS`] to `inactive`, re-broadcasting one `agent.roster`
+//! only when a row changed.
 //! An unknown node/edge id, an unparsable `hotedge` state, a no-change heat
 //! transition, or an `activity` event missing its `agent`/`pid` yields an empty
 //! `Vec` (a no-op).
@@ -52,6 +57,17 @@ const PROTOCOL_VERSION: u32 = 1;
 /// Session id used when a [`Graph`] is created without an explicit one.
 const DEFAULT_SESSION_ID: &str = "sess-local";
 
+/// Idle window, in milliseconds, after which a quiet process is timed out.
+///
+/// The collector has no process-exit signal, so a roster row's `"inactive"`
+/// state is an **idle timeout**: [`Graph::expire_idle`] flips any still-`"active"`
+/// process whose most recent activity is *strictly older* than this window to
+/// `"inactive"`. A process touched exactly `ROSTER_IDLE_MS` ago is still live (the
+/// comparison is strict); one touched a millisecond longer ago is timed out. The
+/// `now`/`last_seen` clock is the monotonic millisecond domain of
+/// [`monotonic_now_ms`].
+pub const ROSTER_IDLE_MS: u64 = 5_000;
+
 /// The in-memory structural graph and the diff that emits CLV patch events.
 ///
 /// Holds the current [`Node`]s and [`Edge`]s keyed by their deterministic ids,
@@ -78,6 +94,14 @@ pub struct Graph {
     /// `activity` event upserts the row for its pid, and [`Graph::apply_clv`]
     /// snapshots every row into the emitted `agent.roster` envelope.
     roster: HashMap<u32, AgentInfo>,
+    /// Last-seen monotonic timestamp (ms) per tracked **process id** (Phase 8).
+    ///
+    /// [`Graph::apply_clv_at`] records `now_ms` here on every `activity` carrying a
+    /// pid, so [`Graph::expire_idle`] can time out a process that has gone quiet:
+    /// a roster row whose `last_seen` is strictly older than [`ROSTER_IDLE_MS`] is
+    /// flipped to `"inactive"`. Same monotonic-millisecond domain as
+    /// [`monotonic_now_ms`].
+    last_seen: HashMap<u32, u64>,
 }
 
 impl Default for Graph {
@@ -101,6 +125,7 @@ impl Graph {
             file_nodes: HashMap::new(),
             file_edges: HashMap::new(),
             roster: HashMap::new(),
+            last_seen: HashMap::new(),
         }
     }
 
@@ -253,6 +278,25 @@ impl Graph {
 
     /// Applies one correlated CLV event and returns every patch it produces.
     ///
+    /// The live-overlay entry point: delegates to [`Graph::apply_clv_at`] with a
+    /// fresh [`monotonic_now_ms`] reading, so an `activity` touch stamps its
+    /// process's `last_seen` on the same monotonic clock [`Graph::expire_idle`]
+    /// later reads. See [`Graph::apply_clv_at`] for the full event-folding contract;
+    /// this thin wrapper exists only so the production tail takes the real clock
+    /// while tests inject `now_ms`. Panic-free.
+    pub fn apply_clv(&mut self, event: &ClvEvent) -> Vec<EventEnvelope> {
+        self.apply_clv_at(event, monotonic_now_ms())
+    }
+
+    /// Applies one correlated CLV event with the supplied monotonic clock reading.
+    ///
+    /// The timestamped seam behind [`Graph::apply_clv`]: identical event-folding
+    /// behaviour, but `now_ms` (a [`monotonic_now_ms`]-domain millisecond reading) is
+    /// injectable so the roster idle timer is deterministically testable. Before the
+    /// event is folded, an [`ClvEvent::Activity`] carrying a `pid` records
+    /// `last_seen[pid] = now_ms`, the liveness stamp [`Graph::expire_idle`] later
+    /// compares against [`ROSTER_IDLE_MS`].
+    ///
     /// Maps an [`AGENT_PROTOCOL.md` §2](crate::clv) [`ClvEvent`] onto the live graph,
     /// returning a [`Vec`] of [`EventEnvelope`]s for the WebSocket layer to broadcast.
     /// A `Test`/`Status`/`HotEdge` event yields a **one-element** vector (or an empty
@@ -300,7 +344,21 @@ impl Graph {
     /// ([`Graph::apply_parsed`] relies on) is left intact, so colouring a node,
     /// heating an edge, or attributing an activity then re-parsing its source keeps
     /// the structural diff correct. Panic-free.
-    pub fn apply_clv(&mut self, event: &ClvEvent) -> Vec<EventEnvelope> {
+    pub fn apply_clv_at(&mut self, event: &ClvEvent, now_ms: u64) -> Vec<EventEnvelope> {
+        // Stamp process liveness before folding, so a quiet process can later be
+        // timed out by `expire_idle`. Only an *attributed* (agent + pid) activity is
+        // tracked — the same condition under which `apply_activity` rosters the
+        // process — so an agent-less or pid-less line never leaves an orphan
+        // last-seen entry that no roster row reads. Other events do not refresh the
+        // last-seen clock.
+        if let ClvEvent::Activity {
+            pid: Some(pid),
+            agent: Some(_),
+            ..
+        } = event
+        {
+            self.last_seen.insert(*pid, now_ms);
+        }
         match event {
             ClvEvent::Test {
                 node,
@@ -532,18 +590,57 @@ impl Graph {
             },
         ));
         if !roster_unchanged {
-            let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
-            agents.sort_by_key(|a| a.process_id);
-            events.push(self.envelope(
-                EventType::AgentRoster,
-                Payload::AgentRoster {
-                    session_id: session.to_string(),
-                    agents,
-                },
-            ));
+            events.push(self.roster_envelope(session.to_string()));
         }
 
         events
+    }
+
+    /// Times out every quiet process and returns the rebuilt roster on any change.
+    ///
+    /// The collector has no process-exit signal, so `"inactive"` is an **idle
+    /// timeout**: this flips every still-`"active"` roster row whose `last_seen`
+    /// (recorded by [`Graph::apply_clv_at`]) is **strictly older** than
+    /// [`ROSTER_IDLE_MS`] relative to `now_ms` to `"inactive"`. A process touched
+    /// exactly one window ago is *not* expired (the comparison is strict). When at
+    /// least one row changed it returns **exactly one** full `agent.roster` snapshot
+    /// envelope (every row, sorted by pid); when nothing changed — including a repeat
+    /// call after a process is already `"inactive"` — it returns an empty vector and
+    /// broadcasts nothing. `now_ms` shares the monotonic-millisecond domain of
+    /// [`monotonic_now_ms`]; a `last_seen` ahead of `now_ms` is treated as age zero
+    /// (saturating), so it is panic-free.
+    pub fn expire_idle(&mut self, now_ms: u64) -> Vec<EventEnvelope> {
+        let mut changed = false;
+        for (pid, info) in self.roster.iter_mut() {
+            if info.status != "active" {
+                continue;
+            }
+            let last_seen = self.last_seen.get(pid).copied().unwrap_or(0);
+            if now_ms.saturating_sub(last_seen) > ROSTER_IDLE_MS {
+                info.status = "inactive".to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            vec![self.roster_envelope(self.session_id.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Builds one full `agent.roster` snapshot envelope stamped with `session_id`.
+    ///
+    /// Clones every [`AgentInfo`] roster row and sorts it by `process_id` for a
+    /// stable order, then wraps it in an [`EventType::AgentRoster`] envelope. Shared
+    /// by [`Graph::apply_activity`] (a new/changed process) and [`Graph::expire_idle`]
+    /// (a timed-out process) so both paths broadcast an identical full-roster shape.
+    fn roster_envelope(&self, session_id: String) -> EventEnvelope {
+        let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
+        agents.sort_by_key(|a| a.process_id);
+        self.envelope(
+            EventType::AgentRoster,
+            Payload::AgentRoster { session_id, agents },
+        )
     }
 
     /// Wraps `payload` in an [`EventEnvelope`] stamped now with this graph's session.
@@ -646,6 +743,22 @@ fn rfc3339_now() -> String {
     let year = yoe + era * 400 + i64::from(month <= 2);
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Returns milliseconds elapsed on a process-monotonic clock.
+///
+/// The real-clock source for the roster idle timer: [`Graph::apply_clv`] stamps a
+/// process's `last_seen` with this, and the collector's tick passes it to
+/// [`Graph::expire_idle`], so both sit in one monotonic domain immune to wall-clock
+/// jumps. The zero point is a process-start [`std::time::Instant`] anchor captured
+/// once on first call; tests bypass this and inject `now_ms` directly via
+/// [`Graph::apply_clv_at`]/[`Graph::expire_idle`]. Panic-free.
+pub(crate) fn monotonic_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    // Process-start anchor: the monotonic zero point shared by every reading.
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 #[cfg(test)]
@@ -1401,6 +1514,159 @@ mod tests {
         assert!(
             !edges.iter().any(|e| e.kind == EdgeKind::AuthoredBy),
             "snapshot must omit the authored_by edge (its source is a non-root function): {edges:?}"
+        );
+    }
+
+    // ---- P8-4: roster idle-timeout → `inactive`, plus respawn ----------------
+    //
+    // The collector has no process-exit signal, so `inactive` is an idle-timeout.
+    // P8-4 records a per-pid `last_seen` on each activity and adds
+    // `Graph::expire_idle(now_ms)`, which flips any still-`active` process whose
+    // last activity is **strictly older** than the named window `ROSTER_IDLE_MS`
+    // to `status: "inactive"` and returns the full `agent.roster` snapshot —
+    // exactly one envelope, and **only** when at least one row changed.
+    //
+    // Time is injectable so these tests are deterministic with NO real sleeps:
+    //   * `Graph::apply_clv_at(&event, now_ms) -> Vec<EventEnvelope>` records the
+    //     activity's `last_seen = now_ms` (production `apply_clv` delegates with a
+    //     real monotonic now), and
+    //   * `Graph::expire_idle(now_ms) -> Vec<EventEnvelope>` compares against an
+    //     injected `now_ms` (same monotonic-millisecond domain).
+    //
+    // RED until P8-4 lands: `ROSTER_IDLE_MS`, `Graph::apply_clv_at`, and
+    // `Graph::expire_idle` do not yet exist, so this module fails to compile.
+
+    /// Finds the roster row for `pid` in `agents`, panicking if it is absent.
+    fn roster_row(agents: &[AgentInfo], pid: u32) -> &AgentInfo {
+        agents
+            .iter()
+            .find(|a| a.process_id == pid)
+            .unwrap_or_else(|| panic!("expected a roster row for pid {pid}, got {agents:?}"))
+    }
+
+    #[test]
+    fn expire_idle_flips_a_stale_process_to_inactive_then_coalesces() {
+        let mut graph = Graph::new();
+        // Record an activity at t0, establishing last_seen[48213] = t0.
+        let t0: u64 = 1_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213), t0);
+
+        // At t0 + window + 1 the process is strictly older than the idle window,
+        // so expire_idle flips it to inactive and emits exactly one agent.roster.
+        let now = t0 + super::ROSTER_IDLE_MS + 1;
+        let expired: Vec<EventEnvelope> = graph.expire_idle(now);
+        let rosters = expired
+            .iter()
+            .filter(|e| e.event_type == EventType::AgentRoster)
+            .count();
+        assert_eq!(
+            rosters, 1,
+            "exactly one agent.roster on the first expiry, got {expired:?}"
+        );
+        let agents = roster_agents(&expired);
+        assert_eq!(
+            roster_row(&agents, 48213).status,
+            "inactive",
+            "the stale process is marked inactive, got {agents:?}"
+        );
+
+        // Calling again with no further change yields an EMPTY vec — no roster
+        // envelope is emitted when nothing changed (already inactive).
+        let again: Vec<EventEnvelope> = graph.expire_idle(now);
+        assert!(
+            again.is_empty(),
+            "a second expiry with no change emits nothing, got {again:?}"
+        );
+    }
+
+    #[test]
+    fn expire_idle_marks_only_the_idle_process_inactive() {
+        let mut graph = Graph::new();
+        // pid 100 last touched at t_old; pid 200 last touched a full window later.
+        let t_old: u64 = 1_000;
+        let t_fresh: u64 = t_old + super::ROSTER_IDLE_MS;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "agent-old", 100), t_old);
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:foo", "agent-new", 200),
+            t_fresh,
+        );
+
+        // `now` is one tick past the window for pid 100 (age = window + 1) but
+        // only 1 ms past pid 200's touch (age = 1, well within the window).
+        let now = t_fresh + 1;
+        let expired: Vec<EventEnvelope> = graph.expire_idle(now);
+        let agents = roster_agents(&expired);
+        assert_eq!(
+            roster_row(&agents, 100).status,
+            "inactive",
+            "the idle process flips to inactive, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 200).status,
+            "active",
+            "the fresh process stays active, got {agents:?}"
+        );
+    }
+
+    #[test]
+    fn expire_idle_then_new_pid_same_agent_keeps_old_inactive_and_new_active() {
+        let mut graph = Graph::new();
+        // The original process touches a node, then goes idle and is expired.
+        let t0: u64 = 1_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 111), t0);
+        let now = t0 + super::ROSTER_IDLE_MS + 1;
+        let _ = graph.expire_idle(now); // pid 111 → inactive
+
+        // Respawn: a NEW pid under the SAME agentId emits a fresh activity at `now`.
+        // Its roster carries BOTH pids under the one agentId — the old one still
+        // inactive, the new one active.
+        let respawn: Vec<EventEnvelope> =
+            graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 222), now);
+        let agents = roster_agents(&respawn);
+        let rows = agents.iter().filter(|a| a.agent_id == "tdd-green").count();
+        assert_eq!(
+            rows, 2,
+            "both pids tracked under one agentId, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 111).status,
+            "inactive",
+            "the expired original pid stays inactive, got {agents:?}"
+        );
+        assert_eq!(
+            roster_row(&agents, 222).status,
+            "active",
+            "the respawned pid is active, got {agents:?}"
+        );
+    }
+
+    #[test]
+    fn an_activity_records_last_seen_so_expiry_respects_the_window() {
+        let mut graph = Graph::new();
+        // The activity must record last_seen = t0 (not 0); otherwise the boundary
+        // check below would see a huge age and expire prematurely.
+        let t0: u64 = 5_000;
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:foo", "tdd-green", 333), t0);
+
+        // Just after the activity, and again at exactly t0 + window, the process is
+        // NOT strictly older than the window, so expiry is a no-op (empty vec).
+        assert!(
+            graph.expire_idle(t0 + 1).is_empty(),
+            "just after the activity the process is not idle"
+        );
+        let boundary = graph.expire_idle(t0 + super::ROSTER_IDLE_MS);
+        assert!(
+            boundary.is_empty(),
+            "at the window boundary the process is not yet idle, got {boundary:?}"
+        );
+
+        // One millisecond past the window it is strictly older and expires.
+        let past = graph.expire_idle(t0 + super::ROSTER_IDLE_MS + 1);
+        let agents = roster_agents(&past);
+        assert_eq!(
+            roster_row(&agents, 333).status,
+            "inactive",
+            "one ms past the window the process expires, got {agents:?}"
         );
     }
 }
