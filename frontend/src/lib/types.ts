@@ -1,7 +1,8 @@
 /**
  * CLV wire schema — TypeScript mirror of `docs/orignal_specs/DATA_MODEL.md` §A.2–A.5
  * plus the Phase 0 wire payload contract, the Phase 5 `test.result`/`status.update`
- * event payloads, and the Phase 6 `hot_edge` runtime-call-path payload.
+ * event payloads, the Phase 6 `hot_edge` runtime-call-path payload, and the Phase 8
+ * `agent.roster`/`agent.activity` agent-layer payloads.
  *
  * This is the single, `any`-free source of truth the WebSocket boundary parses into.
  * JSON keys are camelCase exactly as they arrive on the wire (`parentId`, `childIds`,
@@ -174,6 +175,46 @@ export interface HotEdgePayload {
 	ts: string;
 }
 
+/**
+ * Phase 8 `agent.roster` row (DATA_MODEL §A.5) — one tracked agent in a session.
+ * Carries identity (`agentId`/`agentType`), OS `processId`, display `color`, live
+ * `status`, and an optional CLV `protocolVersion`. Field spelling mirrors the Rust
+ * `AgentInfo` wire struct (camelCase) exactly; `protocolVersion` is absent when
+ * not reported.
+ */
+export interface AgentInfo {
+	processId: number;
+	agentId: string;
+	agentType: string;
+	color: string;
+	status: string;
+	protocolVersion?: string;
+}
+
+/**
+ * Phase 8 `agent.activity` payload (DATA_MODEL §A.5) — one action an agent took on
+ * a node. `agentId`, `action`, and `nodeId` are required; `processId`/`ts`/`msg`
+ * are absent when not attributed. Field spelling mirrors the Rust wire exactly.
+ */
+export interface AgentActivityPayload {
+	agentId: string;
+	action: string;
+	nodeId: string;
+	sessionId: string;
+	processId?: number;
+	ts?: string;
+	msg?: string;
+}
+
+/**
+ * Phase 8 `agent.roster` payload (DATA_MODEL §A.5) — the live set of tracked
+ * agents in a session. The reducer keys the roster by {@link AgentInfo.processId}.
+ */
+export interface AgentRosterPayload {
+	sessionId: string;
+	agents: AgentInfo[];
+}
+
 /** Fields shared by every {@link EventEnvelope} variant (DATA_MODEL §A.4). */
 export interface EnvelopeBase {
 	v: 1;
@@ -195,7 +236,9 @@ export type EventEnvelope =
 	| (EnvelopeBase & { type: 'subtree'; payload: SubtreePayload })
 	| (EnvelopeBase & { type: 'test.result'; payload: TestResultPayload })
 	| (EnvelopeBase & { type: 'status.update'; payload: StatusUpdatePayload })
-	| (EnvelopeBase & { type: 'hot_edge'; payload: HotEdgePayload });
+	| (EnvelopeBase & { type: 'hot_edge'; payload: HotEdgePayload })
+	| (EnvelopeBase & { type: 'agent.roster'; payload: AgentRosterPayload })
+	| (EnvelopeBase & { type: 'agent.activity'; payload: AgentActivityPayload });
 
 /** The set of envelope `type` discriminants this Phase 0 client understands. */
 export type EventType = EventEnvelope['type'];
