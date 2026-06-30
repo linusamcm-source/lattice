@@ -592,12 +592,25 @@ pub fn edge_id(src_symbol: &str, dst_symbol: &str) -> String {
 /// [`node_id`]/[`edge_id`]; the `agent` token matches [`NodeType::Agent`]'s
 /// [`NodeType::id_prefix`], so an agent vertex keeps a stable identity across runs.
 ///
+/// **Security:** an `agentId` is attacker-influenced (it arrives on the CLV wire),
+/// so a raw `:` inside it would add a structural delimiter to the
+/// `type:path:symbol` node-id namespace, letting a crafted id spoof a file/function
+/// vertex or collide with an `authored_by` edge-id segment. The id segment is
+/// therefore percent-encoded so it carries no raw structural `:`. The encoding is
+/// **injective**: the escape char `%` is escaped first (`%` → `%25`), then `:` →
+/// `%3A`. Escaping `:` alone would be lossy — `"a:b"` and `"a%3Ab"` would *both*
+/// map to `agent:a%3Ab`, letting one agent hijack another agent's vertex; escaping
+/// `%` first keeps every distinct id distinct. Colon-free, `%`-free ids pass
+/// through unchanged.
+///
 /// ```
 /// use lattice_backend::wire::agent_node_id;
 /// assert_eq!(agent_node_id("security-scanner"), "agent:security-scanner");
+/// assert_eq!(agent_node_id("a:b"), "agent:a%3Ab");
+/// assert_ne!(agent_node_id("a:b"), agent_node_id("a%3Ab"));
 /// ```
 pub fn agent_node_id(agent_id: &str) -> String {
-    format!("agent:{agent_id}")
+    format!("agent:{}", agent_id.replace('%', "%25").replace(':', "%3A"))
 }
 
 /// Builds a deterministic, **kind-qualified** edge id, unique per
@@ -1624,5 +1637,64 @@ mod tests {
     fn protocol_sentinel_unchanged_by_phase_8() {
         // P8-1 must not bump the CLV sentinel.
         assert_eq!(crate::protocol_sentinel(), "#CLV1");
+    }
+
+    #[test]
+    fn agent_node_id_escapes_colon_to_prevent_namespace_spoof() {
+        // SECURITY (carried from the P8-1 review): an agentId is attacker-influenced
+        // (it arrives on the wire). A raw `:` inside it adds a structural delimiter to
+        // `agent:<agentId>`, letting a crafted agentId spoof the `type:path:symbol`
+        // node-id namespace — e.g. an agent vertex masquerading as a file/function id,
+        // or colliding with an authored_by edge id segment. agent_node_id must escape
+        // (or reject) the `:` so the agent-id segment carries no raw structural colon.
+        // RED until P8-2 adds the escaping/validation; today it is a bare
+        // `format!("agent:{agent_id}")` that passes the colon straight through.
+        let cases = ["fn:src/secret.rs:steal", "file:src/x.rs", "a:b"];
+        for input in cases {
+            let id = agent_node_id(input);
+            assert!(
+                id.starts_with("agent:"),
+                "agent prefix must be preserved for {input:?}, got {id:?}"
+            );
+            let segment = id
+                .strip_prefix("agent:")
+                .expect("agent prefix is always present");
+            assert!(
+                !segment.contains(':'),
+                "agentId {input:?} must be escaped so its node-id segment has no raw ':', got {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_node_id_is_injective_under_percent_and_colon_escaping() {
+        // SECURITY (P8-2 review): escaping `:`→`%3A` alone is non-injective — it
+        // collides `"a:b"` with `"a%3Ab"`, letting one agent hijack another's vertex.
+        // The escape char `%` must be escaped first so distinct ids stay distinct.
+        assert_ne!(
+            agent_node_id("a:b"),
+            agent_node_id("a%3Ab"),
+            "a colon-bearing id must not collide with its already-escaped spelling"
+        );
+        // A `%` in the input is preserved distinctly (escaped to `%25`), not dropped.
+        assert_eq!(agent_node_id("a%3Ab"), "agent:a%253Ab");
+        assert_ne!(
+            agent_node_id("100%"),
+            agent_node_id("100%25"),
+            "raw `%` and the literal text `%25` must map to distinct vertices"
+        );
+        // Colon-free, %-free ids (incl. the P8-1 fixtures and the empty id) are
+        // passed through verbatim so the P8-1 contract stays intact.
+        for (input, want) in [
+            ("tdd-green", "agent:tdd-green"),
+            ("security-scanner", "agent:security-scanner"),
+            ("", "agent:"),
+        ] {
+            assert_eq!(
+                agent_node_id(input),
+                want,
+                "unchanged passthrough for {input:?}"
+            );
+        }
     }
 }

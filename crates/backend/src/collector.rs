@@ -5,9 +5,11 @@
 //! that **tails** the per-repo sink file `<root>/.lattice/clv.ndjson` — one
 //! `#CLV1 {json}` line per event, appended by an external emitter (a Claude Code
 //! `PostToolUse` hook or a test reporter). Each newly appended complete line is
-//! parsed via [`parse_clv_line`], folded onto its node's colour through
-//! [`Graph::apply_clv`], and — when that yields a patch — broadcast on `events_tx`
-//! so connected clients recolour. It is wired into [`run`](crate::app::run)
+//! parsed via [`parse_clv_line`], folded onto the live graph through
+//! [`Graph::apply_clv`], and **every** patch envelope it returns is broadcast on
+//! `events_tx` so connected clients update — a `test`/`status` recolour, a `hotedge`
+//! heat toggle, or (Phase 8) the agent node/edge upserts plus
+//! `agent.activity`/`agent.roster` of an `activity` event. It is wired into [`run`](crate::app::run)
 //! alongside the watcher pump and torn down by
 //! [`RunHandle::shutdown`](crate::app::RunHandle::shutdown).
 //!
@@ -74,8 +76,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Runs until the task is aborted (by [`RunHandle::shutdown`](crate::app::RunHandle::shutdown)).
 /// Each [`POLL_INTERVAL`] tick it reads newly appended complete lines, parses them
 /// with [`parse_clv_line`], and for every parsed event locks `graph` and calls
-/// [`Graph::apply_clv`]; a returned [`EventEnvelope`] is sent on `events_tx` for the
-/// WebSocket layer to fan out. The file may be absent at startup and created later;
+/// [`Graph::apply_clv`]; **every** [`EventEnvelope`] in the returned vector is sent on
+/// `events_tx` for the WebSocket layer to fan out. The file may be absent at startup and created later;
 /// a truncation/rotation resets the read offset. Malformed or untagged lines parse
 /// to [`None`] and are skipped silently — the tail continues. Panic-free: every I/O
 /// error simply ends the current poll and the loop retries on the next tick.
@@ -141,8 +143,12 @@ async fn poll_once(
         let text = String::from_utf8_lossy(&line);
         let trimmed = text.trim_end_matches(['\n', '\r']);
         if let Some(event) = parse_clv_line(trimmed) {
-            let envelope = graph.lock().await.apply_clv(&event);
-            if let Some(envelope) = envelope {
+            // `apply_clv` returns every patch one event produces (a `test`/`status`/
+            // `hotedge` event yields at most one; an `activity` event yields the
+            // agent node/edge upserts plus `agent.activity`/`agent.roster`). Broadcast
+            // them all so connected clients see the full effect.
+            let envelopes = graph.lock().await.apply_clv(&event);
+            for envelope in envelopes {
                 let _ = events_tx.send(envelope);
             }
         }
@@ -307,6 +313,55 @@ mod tests {
             }
             other => panic!("expected TestResult, got {other:?}"),
         }
+    }
+
+    /// P8-2: a single `activity` line must broadcast **every** envelope
+    /// `apply_clv` returns — the agent `node.upsert`, the `authored_by`
+    /// `edge.upsert`, the `agent.activity`, and the `agent.roster`. RED until
+    /// `poll_once` iterates the widened `Vec<EventEnvelope>` and the agent-layer
+    /// side effects exist; today the activity arm is a no-op so nothing is sent.
+    #[tokio::test]
+    async fn poll_once_broadcasts_every_envelope_from_an_activity() {
+        let dir = tempdir().expect("tempdir");
+        let sink = dir.path().join(".lattice/clv.ndjson");
+        let graph = graph_with_function();
+        let (tx, mut rx) = broadcast::channel::<EventEnvelope>(16);
+
+        append_raw(
+            &sink,
+            "#CLV1 {\"event\":\"activity\",\"agent\":\"tdd-green\",\"session\":\"s1\",\"pid\":48213,\"node\":\"fn:a.rs:f\",\"action\":\"modified\"}\n",
+        );
+
+        let mut offset = 0;
+        let mut buffer = Vec::new();
+        poll_once(&sink, &mut offset, &mut buffer, &graph, &tx).await;
+
+        // Drain every broadcast envelope and collect the event types observed.
+        let mut types = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            types.push(env.event_type);
+        }
+        assert!(
+            types.contains(&EventType::NodeUpsert),
+            "agent node.upsert must be broadcast, got {types:?}"
+        );
+        assert!(
+            types.contains(&EventType::EdgeUpsert),
+            "authored_by edge.upsert must be broadcast, got {types:?}"
+        );
+        assert!(
+            types.contains(&EventType::AgentActivity),
+            "agent.activity must be broadcast, got {types:?}"
+        );
+        assert!(
+            types.contains(&EventType::AgentRoster),
+            "agent.roster must be broadcast, got {types:?}"
+        );
+        assert_eq!(
+            types.len(),
+            4,
+            "exactly the four activity envelopes must be broadcast, got {types:?}"
+        );
     }
 
     #[tokio::test]
