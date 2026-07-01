@@ -11,9 +11,19 @@ import {
 	graphStore,
 	nodes,
 	edges,
-	agents
+	agents,
+	metrics
 } from './ws';
-import type { AgentInfo, Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
+import type {
+	AgentInfo,
+	Node,
+	Edge,
+	EventEnvelope,
+	NodeStatus,
+	TestOutcome,
+	MetricsUpdatePayload,
+	FileParseLatency
+} from './types';
 
 const fileNode: Node = {
 	id: 'file:src/x.rs',
@@ -748,5 +758,224 @@ describe('agent structure rides existing node/edge channels', () => {
 		expect(get(edges).some((e) => e.id === authoredByEdge.id && e.kind === 'authored_by')).toBe(
 			true
 		);
+	});
+});
+
+// --- P9-5: metrics.update wire + reducer + derived-store fixtures ---
+//
+// Field names + values mirror the P9-3 Rust wire contract exactly
+// (crates/backend/src/wire.rs `Payload::MetricsUpdate` + DATA_MODEL.md §A.5):
+//   {sessionId, ts, nodeCount, edgeCount, memoryBytes, eventsPerSecMilli,
+//    parseLatency: [{filePath, durationUs}]}  — all camelCase.
+// RED until P9-5 adds the `metrics.update` union arm, the `MetricsUpdatePayload`/
+// `FileParseLatency` interfaces, `GraphState.metrics` (seeded null by `initialState`),
+// the reducer branch, and the derived `metrics` store. No `any`: the payload is a
+// typed CLV `MetricsUpdatePayload`.
+
+const loginLatency: FileParseLatency = { filePath: 'src/auth/login.rs', durationUs: 812 };
+
+const metricsPayload: MetricsUpdatePayload = {
+	sessionId: 'sess-abc123',
+	ts: '2026-06-27T10:32:01.500Z',
+	nodeCount: 128,
+	edgeCount: 342,
+	memoryBytes: 1048576,
+	eventsPerSecMilli: 4200,
+	parseLatency: [loginLatency]
+};
+
+function metricsUpdateEnv(payload: MetricsUpdatePayload): EventEnvelope {
+	return {
+		v: 1,
+		ts: payload.ts,
+		sessionId: payload.sessionId,
+		type: 'metrics.update',
+		payload
+	};
+}
+
+describe('parseEnvelope (metrics.update)', () => {
+	it('parses a well-formed metrics.update envelope (non-null, typed)', () => {
+		const env = parseEnvelope(JSON.stringify(metricsUpdateEnv(metricsPayload)));
+		expect(env?.type).toBe('metrics.update');
+	});
+
+	it('returns null for a metrics.update missing nodeCount', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						sessionId: 'sess-abc123',
+						ts: '',
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200,
+						parseLatency: []
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for a metrics.update missing sessionId', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						ts: '',
+						nodeCount: 128,
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200,
+						parseLatency: []
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for a metrics.update missing ts', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						sessionId: 'sess-abc123',
+						nodeCount: 128,
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200,
+						parseLatency: []
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null for a metrics.update missing parseLatency', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						sessionId: 'sess-abc123',
+						ts: '',
+						nodeCount: 128,
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null when parseLatency is not an array', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						sessionId: 'sess-abc123',
+						ts: '',
+						nodeCount: 128,
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200,
+						parseLatency: 'not-an-array'
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('returns null when a parseLatency row is not { filePath, durationUs }', () => {
+		expect(
+			parseEnvelope(
+				JSON.stringify({
+					v: 1,
+					ts: '',
+					sessionId: 'sess-abc123',
+					type: 'metrics.update',
+					payload: {
+						sessionId: 'sess-abc123',
+						ts: '',
+						nodeCount: 128,
+						edgeCount: 342,
+						memoryBytes: 1048576,
+						eventsPerSecMilli: 4200,
+						parseLatency: [{ filePath: 'src/auth/login.rs' }]
+					}
+				})
+			)
+		).toBeNull();
+	});
+
+	it('never throws on a malformed metrics payload (returns null)', () => {
+		expect(() =>
+			parseEnvelope(
+				JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'metrics.update', payload: 7 })
+			)
+		).not.toThrow();
+		expect(
+			parseEnvelope(
+				JSON.stringify({ v: 1, ts: '', sessionId: '', type: 'metrics.update', payload: 7 })
+			)
+		).toBeNull();
+	});
+});
+
+describe('applyEvent (metrics.update)', () => {
+	it('stores the metrics payload on GraphState.metrics', () => {
+		const state = applyEvent(initialState(), metricsUpdateEnv(metricsPayload));
+		expect(state.metrics).toEqual(metricsPayload);
+	});
+
+	it('replaces the stored metrics on a later metrics.update', () => {
+		const first = applyEvent(initialState(), metricsUpdateEnv(metricsPayload));
+		const next: MetricsUpdatePayload = { ...metricsPayload, nodeCount: 200, edgeCount: 500 };
+		const second = applyEvent(first, metricsUpdateEnv(next));
+		expect(second.metrics?.nodeCount).toBe(200);
+		expect(second.metrics?.edgeCount).toBe(500);
+	});
+
+	it('seeds GraphState.metrics as null in initialState', () => {
+		expect(initialState().metrics).toBeNull();
+	});
+
+	it('is pure: the input state is unchanged and a fresh state is returned', () => {
+		const base = initialState();
+		const state = applyEvent(base, metricsUpdateEnv(metricsPayload));
+		expect(base.metrics).toBeNull();
+		expect(state).not.toBe(base);
+	});
+});
+
+describe('metrics store ingest', () => {
+	it('emits null before any metrics.update', () => {
+		expect(get(metrics)).toBeNull();
+	});
+
+	it('emits the current metrics after ingesting a metrics.update', () => {
+		ingest(metricsUpdateEnv(metricsPayload));
+		expect(get(metrics)?.nodeCount).toBe(128);
+		expect(get(metrics)?.parseLatency[0]?.filePath).toBe('src/auth/login.rs');
 	});
 });

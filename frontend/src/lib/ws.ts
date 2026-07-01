@@ -16,8 +16,11 @@
  * toggles an edge's `hot` flag. The Phase-8 agent layer rides the same store: an
  * `agent.roster` rebuilds the {@link GraphState.agents} roster (keyed by
  * `processId`) while agent structure (`agent` nodes, `authored_by` edges) folds
- * through the existing `node.upsert`/`edge.upsert` channels. Subtrees are fetched
- * only via {@link requestExpand} and discarded via {@link collapse}.
+ * through the existing `node.upsert`/`edge.upsert` channels. The Phase-9
+ * `metrics.update` event stores the latest self-observability snapshot in
+ * {@link GraphState.metrics}, surfaced via the derived {@link metrics} store that
+ * `MetricsPanel` renders. Subtrees are fetched only via {@link requestExpand} and
+ * discarded via {@link collapse}.
  * Auto-reconnect is deliberately out of scope for Phase 0 (it lands in Phase 9).
  *
  * @module
@@ -30,6 +33,7 @@ import type {
 	AgentInfo,
 	EventEnvelope,
 	EventType,
+	MetricsUpdatePayload,
 	NodeStatus,
 	TestOutcome
 } from './types';
@@ -44,11 +48,13 @@ export interface GraphState {
 	edges: Map<string, Edge>;
 	/** The Phase-8 agent roster, keyed by stringified `processId`. */
 	agents: Map<string, AgentInfo>;
+	/** The latest Phase-9 `metrics.update` snapshot, or `null` before the first one. */
+	metrics: MetricsUpdatePayload | null;
 }
 
 /** Construct an empty {@link GraphState}. */
 export function initialState(): GraphState {
-	return { nodes: new Map(), edges: new Map(), agents: new Map() };
+	return { nodes: new Map(), edges: new Map(), agents: new Map(), metrics: null };
 }
 
 /**
@@ -68,7 +74,8 @@ const TEST_OUTCOME_STATUS: Record<TestOutcome, NodeStatus> = {
  * (`test.result`/`status.update`) and edge-targeted (`hot_edge`) events whose
  * target id is absent are no-ops that return the same state. `agent.roster`
  * replaces the `agents` roster (keyed by `processId`); `agent.activity` carries no
- * graph delta and is a no-op. Unknown event types (which the typed union already
+ * graph delta and is a no-op; `metrics.update` stores the latest self-observability
+ * snapshot in `metrics`. Unknown event types (which the typed union already
  * excludes) leave the state unchanged.
  *
  * @param state - the current graph state.
@@ -80,27 +87,27 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 		case 'snapshot': {
 			const nextNodes = new Map(envelope.payload.nodes.map((n) => [n.id, n]));
 			const nextEdges = new Map(envelope.payload.edges.map((e) => [e.id, e]));
-			return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
+			return { nodes: nextNodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'node.upsert': {
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(envelope.payload.node.id, envelope.payload.node);
-			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'node.remove': {
 			const nextNodes = new Map(state.nodes);
 			nextNodes.delete(envelope.payload.id);
-			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'edge.upsert': {
 			const nextEdges = new Map(state.edges);
 			nextEdges.set(envelope.payload.edge.id, envelope.payload.edge);
-			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'edge.remove': {
 			const nextEdges = new Map(state.edges);
 			nextEdges.delete(envelope.payload.id);
-			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'subtree': {
 			// Lazy `expand` reply: merge the parent's direct children into the
@@ -110,7 +117,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			for (const node of envelope.payload.nodes) nextNodes.set(node.id, node);
 			const nextEdges = new Map(state.edges);
 			for (const edge of envelope.payload.edges) nextEdges.set(edge.id, edge);
-			return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
+			return { nodes: nextNodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'test.result': {
 			// Fold a test outcome onto the target node's colour; an absent node id is a
@@ -119,7 +126,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!node) return state;
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(node.id, { ...node, status: TEST_OUTCOME_STATUS[envelope.payload.outcome] });
-			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'status.update': {
 			// Apply an explicit status to the target node; an absent id is a no-op.
@@ -127,7 +134,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!node) return state;
 			const nextNodes = new Map(state.nodes);
 			nextNodes.set(node.id, { ...node, status: envelope.payload.status });
-			return { nodes: nextNodes, edges: state.edges, agents: state.agents };
+			return { nodes: nextNodes, edges: state.edges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'hot_edge': {
 			// Toggle the target edge's `hot` flag (`enter`->true, `exit`->false); an
@@ -136,7 +143,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			if (!edge) return state;
 			const nextEdges = new Map(state.edges);
 			nextEdges.set(edge.id, { ...edge, hot: envelope.payload.state === 'enter' });
-			return { nodes: state.nodes, edges: nextEdges, agents: state.agents };
+			return { nodes: state.nodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 		}
 		case 'agent.roster': {
 			// Rebuild the agent roster from the payload, keyed by stringified
@@ -157,7 +164,7 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 				if (agent.protocolVersion !== undefined) info.protocolVersion = agent.protocolVersion;
 				nextAgents.set(String(agent.processId), info);
 			}
-			return { nodes: state.nodes, edges: state.edges, agents: nextAgents };
+			return { nodes: state.nodes, edges: state.edges, agents: nextAgents, metrics: state.metrics };
 		}
 		case 'agent.activity':
 			// An activity carries no roster delta (node attribution rides the
@@ -165,6 +172,16 @@ export function applyEvent(state: GraphState, envelope: EventEnvelope): GraphSta
 			// graph is unchanged — a no-op that returns the same state, matching the
 			// other no-op branches.
 			return state;
+		case 'metrics.update':
+			// Store the latest self-observability snapshot; the node/edge/agent maps
+			// pass through untouched. A fresh state object is returned (input never
+			// mutated) so the reducer stays pure and the derived `metrics` store fires.
+			return {
+				nodes: state.nodes,
+				edges: state.edges,
+				agents: state.agents,
+				metrics: envelope.payload
+			};
 	}
 }
 
@@ -179,7 +196,8 @@ const KNOWN_EVENT_TYPES: ReadonlySet<EventType> = new Set([
 	'status.update',
 	'hot_edge',
 	'agent.roster',
-	'agent.activity'
+	'agent.activity',
+	'metrics.update'
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -202,12 +220,25 @@ function isAgentInfo(value: unknown): value is AgentInfo {
 }
 
 /**
+ * Shape-check a single `metrics.update` parse-latency row: a string `filePath`
+ * and a numeric `durationUs` (mirroring the Rust `FileParseLatency` struct).
+ */
+function isFileParseLatency(value: unknown): boolean {
+	return (
+		isRecord(value) && typeof value.filePath === 'string' && typeof value.durationUs === 'number'
+	);
+}
+
+/**
  * Shape-check the payload for the targeted event types. `test.result` and
  * `status.update` must carry a string `nodeId` (plus a string `outcome`/`status`
  * respectively); `hot_edge` must carry a string `edgeId` and an `enter`/`exit`
  * `state`; `agent.roster` must carry an `agents` array of well-formed
  * {@link AgentInfo} rows; `agent.activity` must carry string `agentId`/`action`/
- * `nodeId`; all other types are accepted as-is. Never widens to `any`.
+ * `nodeId`; `metrics.update` must carry string `sessionId`/`ts`, numeric
+ * `nodeCount`/`edgeCount`/`memoryBytes`/`eventsPerSecMilli`, and a `parseLatency`
+ * array of well-formed `{filePath,durationUs}` rows; all other types are accepted
+ * as-is. Never widens to `any`.
  */
 function isValidPayload(type: EventType, payload: Record<string, unknown>): boolean {
 	switch (type) {
@@ -227,6 +258,17 @@ function isValidPayload(type: EventType, payload: Record<string, unknown>): bool
 				typeof payload.agentId === 'string' &&
 				typeof payload.action === 'string' &&
 				typeof payload.nodeId === 'string'
+			);
+		case 'metrics.update':
+			return (
+				typeof payload.sessionId === 'string' &&
+				typeof payload.ts === 'string' &&
+				typeof payload.nodeCount === 'number' &&
+				typeof payload.edgeCount === 'number' &&
+				typeof payload.memoryBytes === 'number' &&
+				typeof payload.eventsPerSecMilli === 'number' &&
+				Array.isArray(payload.parseLatency) &&
+				payload.parseLatency.every(isFileParseLatency)
 			);
 		default:
 			return true;
@@ -275,6 +317,15 @@ export const edges: Readable<Edge[]> = derived(graphStore, ($g) => Array.from($g
 /** Derived list of the current Phase-8 agent roster (insertion order). */
 export const agents: Readable<AgentInfo[]> = derived(graphStore, ($g) =>
 	Array.from($g.agents.values())
+);
+
+/**
+ * Derived Phase-9 self-observability snapshot — the latest `metrics.update`
+ * payload, or `null` before the first one arrives. `MetricsPanel` binds this.
+ */
+export const metrics: Readable<MetricsUpdatePayload | null> = derived(
+	graphStore,
+	($g) => $g.metrics
 );
 
 /**
@@ -360,5 +411,5 @@ export function collapse(state: GraphState, nodeId: string): GraphState {
 	for (const [id, edge] of state.edges) {
 		if (!removed.has(edge.source) && !removed.has(edge.target)) nextEdges.set(id, edge);
 	}
-	return { nodes: nextNodes, edges: nextEdges, agents: state.agents };
+	return { nodes: nextNodes, edges: nextEdges, agents: state.agents, metrics: state.metrics };
 }

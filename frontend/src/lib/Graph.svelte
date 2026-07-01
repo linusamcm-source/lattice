@@ -36,6 +36,11 @@
 	(`agentsForNode`), or clears the highlight when the node has no author. The
 	highlight is also dropped when the agent layer is toggled off.
 
+	P9-5 adds a self-observability **Metrics** toggle (default off) that mounts a
+	`MetricsPanel` beside the roster/sidebar, rendering the latest `metrics.update`
+	snapshot (node/edge counts, memory, events/sec, per-file parse latency) from the
+	derived `metrics` store.
+
 	@component
 -->
 <script lang="ts">
@@ -47,11 +52,12 @@
 		type Edge as FlowEdge
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { nodes, edges, agents, graphStore, requestExpand, collapse } from './ws';
+	import { nodes, edges, agents, metrics, graphStore, requestExpand, collapse } from './ws';
 	import { buildHierarchy, buildEdges, nodesAuthoredBy, agentsForNode } from './layout';
 	import HierarchyNode from './HierarchyNode.svelte';
 	import Sidebar from './Sidebar.svelte';
 	import RosterPanel from './RosterPanel.svelte';
+	import MetricsPanel from './MetricsPanel.svelte';
 
 	/** Public props for the lazy hierarchy canvas. */
 	interface GraphProps {
@@ -88,6 +94,8 @@
 	let dataFlow = $state(true);
 	/** Whether the Phase-8 agent layer (agent nodes + `authored_by` edges) is shown. Default off. */
 	let showAgents = $state(false);
+	/** Whether the Phase-9 self-observability metrics panel is shown. Default off. */
+	let showMetrics = $state(false);
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
 
@@ -212,6 +220,10 @@
 					<input type="checkbox" class="accent-violet-500" bind:checked={showAgents} />
 					Agent layer
 				</label>
+				<label class="flex items-center gap-2">
+					<input type="checkbox" class="accent-emerald-500" bind:checked={showMetrics} />
+					Metrics
+				</label>
 			</fieldset>
 		{/if}
 	</div>
@@ -222,6 +234,9 @@
 			authoredCount={authoredNodeIds.size}
 			onSelect={selectAgent}
 		/>
+	{/if}
+	{#if showMetrics}
+		<MetricsPanel metrics={$metrics} />
 	{/if}
 	<Sidebar selected={selectedNode} />
 </div>
