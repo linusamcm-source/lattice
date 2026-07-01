@@ -28,7 +28,10 @@
 //! by an **idle timeout**: each activity stamps the process's `last_seen` (via
 //! [`Graph::apply_clv_at`]), and [`Graph::expire_idle`] flips any process quiet for
 //! longer than [`ROSTER_IDLE_MS`] to `inactive`, re-broadcasting one `agent.roster`
-//! only when a row changed.
+//! only when a row changed. To keep the roster bounded on a long run,
+//! [`Graph::reclaim_inactive`] then garbage-collects any process that has stayed
+//! `inactive` beyond the longer [`RETENTION_MS`] window, removing it from both the
+//! `roster` and `last_seen` maps; both sweeps are driven every collector tick.
 //! An unknown node/edge id, an unparsable `hotedge` state, a no-change heat
 //! transition, or an `activity` event missing its `agent`/`pid` yields an empty
 //! `Vec` (a no-op).
@@ -87,6 +90,21 @@ const DEFAULT_SESSION_ID: &str = "sess-local";
 /// `now`/`last_seen` clock is the monotonic millisecond domain of
 /// [`monotonic_now_ms`].
 pub const ROSTER_IDLE_MS: u64 = 5_000;
+
+/// Retention window, in milliseconds, after which an `"inactive"` process is
+/// **reclaimed** — removed from both `roster` and `last_seen`.
+///
+/// [`Graph::expire_idle`] only *flips* a quiet process to `"inactive"`; the
+/// [`AgentInfo`] row and its `last_seen` entry then linger forever, so a long run
+/// that spawns many short-lived pids grows both maps without bound. This is the
+/// longer horizon after which [`Graph::reclaim_inactive`] drops such a row: a
+/// process is reclaimed once its `last_seen` age exceeds this window **and** its
+/// status is already `"inactive"`. It is **strictly greater than**
+/// [`ROSTER_IDLE_MS`] so a just-timed-out process stays visible for a grace period
+/// (a client still sees it as `"inactive"`) before it is garbage-collected; a
+/// reclaimed pid does not resurrect unless fresh activity arrives. Same monotonic
+/// millisecond domain as [`monotonic_now_ms`].
+pub const RETENTION_MS: u64 = 60_000;
 
 /// The in-memory structural graph and the diff that emits CLV patch events.
 ///
@@ -759,13 +777,52 @@ impl Graph {
         }
     }
 
+    /// Reclaims every long-idle `"inactive"` process, returning the rebuilt roster.
+    ///
+    /// The garbage-collection half of the roster lifecycle (Phase 9 deferral #1):
+    /// [`Graph::expire_idle`] flips a quiet process to `"inactive"` but never removes
+    /// it, so `roster`/`last_seen` are insert-only and grow without bound on a long
+    /// run. This **removes from both maps** every process whose status is already
+    /// `"inactive"` **and** whose `last_seen` age (`now_ms - last_seen`, saturating)
+    /// is **strictly greater** than [`RETENTION_MS`]. Active processes and
+    /// recently-inactive ones (still within the retention window) are left untouched,
+    /// so a just-timed-out row stays visible for its grace period. Reclaim **never
+    /// flips** status — that stays [`Graph::expire_idle`]'s job — and is driven from
+    /// the collector tick (right after `expire_idle`), **not** from `expire_idle`
+    /// itself, so the P8-4 idle-timeout tests are unaffected. A reclaimed pid does not
+    /// resurrect unless new activity re-inserts it. Returns **one** full `agent.roster`
+    /// snapshot envelope when at least one row was removed and an empty vector
+    /// otherwise (a no-op broadcasts nothing). `now_ms` shares the
+    /// monotonic-millisecond domain of [`monotonic_now_ms`]; panic-free.
+    pub fn reclaim_inactive(&mut self, now_ms: u64) -> Vec<EventEnvelope> {
+        let stale: Vec<u32> = self
+            .roster
+            .iter()
+            .filter(|(pid, info)| {
+                info.status == "inactive"
+                    && now_ms.saturating_sub(self.last_seen.get(pid).copied().unwrap_or(0))
+                        > RETENTION_MS
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        for pid in stale {
+            self.roster.remove(&pid);
+            self.last_seen.remove(&pid);
+        }
+        vec![self.roster_envelope(self.session_id.clone())]
+    }
+
     /// Builds one full `agent.roster` snapshot envelope stamped with `session_id`.
     ///
     /// Clones every [`AgentInfo`] roster row and sorts it by `process_id` for a
     /// stable order, then wraps it in an [`EventType::AgentRoster`] envelope. Shared
     /// by [`Graph::apply_activity`] (a new/changed process), [`Graph::expire_idle`]
-    /// (a timed-out process) and [`Graph::roster_snapshot`] (the connect/resync
-    /// trailer) so every path broadcasts an identical full-roster shape.
+    /// (a timed-out process), [`Graph::reclaim_inactive`] (a reclaimed process) and
+    /// [`Graph::roster_snapshot`] (the connect/resync trailer) so every path
+    /// broadcasts an identical full-roster shape.
     fn roster_envelope(&self, session_id: String) -> EventEnvelope {
         let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
         agents.sort_by_key(|a| a.process_id);
@@ -1997,6 +2054,105 @@ mod tests {
             roster_row(&agents, 333).status,
             "inactive",
             "one ms past the window the process expires, got {agents:?}"
+        );
+    }
+
+    // ---- P9-8: roster retention reclaim (removal from both maps) -------------
+    //
+    // P8-4 made `expire_idle` flip a quiet process to `inactive`, but `roster` and
+    // `last_seen` are insert-only — a long-dead pid lingers forever. P9-8 adds a
+    // longer **retention window** `RETENTION_MS` (strictly greater than the P8-4
+    // idle window `ROSTER_IDLE_MS`) and `Graph::reclaim_inactive(now)`, which
+    // **removes** from *both* `roster` and `last_seen` every process whose
+    // `last_seen` is older than `RETENTION_MS` *and* whose status is already
+    // `inactive`. Reclaim never flips (that stays `expire_idle`'s job) and lives
+    // only on the collector tick, so the P8-4 tests above are untouched.
+    //
+    // Time is injected (`apply_clv_at` / `expire_idle` / `reclaim_inactive` all take
+    // an explicit `now_ms`), so this is deterministic with NO real sleeps.
+    //
+    // RED until P9-8 lands: `super::RETENTION_MS` and `Graph::reclaim_inactive` do
+    // not yet exist, so this module fails to compile (E0425 / E0599).
+
+    #[test]
+    fn reclaim_inactive_removes_only_long_idle_inactive_processes_from_both_maps() {
+        // The retention window must be a genuinely longer horizon than the idle
+        // window: a process is flipped `inactive` at `ROSTER_IDLE_MS`, but only
+        // reclaimed (removed) once it has been quiet for the longer `RETENTION_MS`.
+        let idle = super::ROSTER_IDLE_MS;
+        let retention = super::RETENTION_MS;
+        assert!(
+            retention > idle,
+            "RETENTION_MS ({retention}) must be strictly greater than ROSTER_IDLE_MS ({idle})"
+        );
+
+        let mut graph = Graph::new();
+        // A reference `now` comfortably larger than the retention window so the
+        // per-pid `last_seen` timestamps below never underflow.
+        let now = retention + idle + 1_000;
+
+        // pid 100 — long-idle: last activity older than the retention window
+        // (age = retention + 1). It becomes `inactive` and is reclaimed.
+        let t_gone = now - retention - 1;
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:foo", "agent-gone", 100),
+            t_gone,
+        );
+        // pid 200 — recently-inactive: quiet long enough to be flipped `inactive`
+        // (age = idle + 1 > idle) but still within the retention window
+        // (age = idle + 1 <= retention, since retention > idle), so NOT reclaimed.
+        let t_recent = now - idle - 1;
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:bar", "agent-recent", 200),
+            t_recent,
+        );
+        // pid 300 — active: touched at `now` (age 0), never flipped, never reclaimed.
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:baz", "agent-live", 300), now);
+
+        // Flip the two quiet processes to `inactive` (100 and 200); 300 stays active.
+        let _ = graph.expire_idle(now);
+        assert_eq!(
+            graph.roster.get(&100).map(|a| a.status.as_str()),
+            Some("inactive"),
+            "precondition: pid 100 is inactive before reclaim, got {:?}",
+            graph.roster.get(&100)
+        );
+        assert_eq!(
+            graph.roster.get(&200).map(|a| a.status.as_str()),
+            Some("inactive"),
+            "precondition: pid 200 is inactive before reclaim, got {:?}",
+            graph.roster.get(&200)
+        );
+
+        // Reclaim: only pid 100 (inactive AND older than the retention window) is
+        // dropped from BOTH maps; 200 (recently-inactive) and 300 (active) remain.
+        let _ = graph.reclaim_inactive(now);
+
+        assert!(
+            !graph.roster.contains_key(&100),
+            "long-idle inactive pid 100 must be removed from the roster"
+        );
+        assert!(
+            !graph.last_seen.contains_key(&100),
+            "long-idle inactive pid 100 must be removed from last_seen too"
+        );
+        assert!(
+            graph.roster.contains_key(&200),
+            "recently-inactive pid 200 (within retention) must NOT be reclaimed"
+        );
+        assert!(
+            graph.last_seen.contains_key(&200),
+            "recently-inactive pid 200's last_seen must remain"
+        );
+        assert_eq!(
+            graph.roster.get(&300).map(|a| a.status.as_str()),
+            Some("active"),
+            "active pid 300 must be left intact, got {:?}",
+            graph.roster.get(&300)
+        );
+        assert!(
+            graph.last_seen.contains_key(&300),
+            "active pid 300's last_seen must remain"
         );
     }
 
