@@ -109,6 +109,39 @@ The binary is `lattice` (crate `lattice-backend`): `cargo run -p lattice-backend
 
 ---
 
+## Install & run
+
+Lattice ships as a **single self-contained binary**: `lattice` serves the SvelteFlow UI itself, so
+you point it at a repo, open the printed address, and watch the live graph — no separate frontend
+process, no Vite. The `--release` build embeds the built SvelteKit bundle into the binary.
+
+**Install from source.** Build the frontend bundle first (the release binary embeds it), then
+`cargo install` compiles and drops the `lattice` binary on your `PATH`:
+
+```bash
+npm --prefix frontend run build      # produce frontend/build/ (embedded at compile time)
+cargo install --path crates/backend  # compile in release + install the `lattice` binary
+```
+
+`just release` does the same build without installing (frontend bundle → `target/release/lattice`).
+
+**Or download a release binary.** Tagged `v*` releases publish cross-platform binaries
+(Linux / macOS / Windows) to [GitHub Releases](https://github.com/linusamcm-source/lattice/releases)
+via CI; download the one for your platform and put it on your `PATH`.
+
+**Run it.** Point `lattice` at any repository and open the address it prints
+(default `http://127.0.0.1:7000`):
+
+```bash
+lattice <dir>          # watch <dir> (default: the current directory)
+# → prints the bound address, e.g. http://127.0.0.1:7000
+# open that address in a browser to see the live graph.
+```
+
+`LATTICE_ADDR` overrides the listen address.
+
+---
+
 ## Commands
 
 ### Backend (`just`, from repo root)

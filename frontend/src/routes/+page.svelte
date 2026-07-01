@@ -2,11 +2,12 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import Graph from '$lib/Graph.svelte';
-	import { connect, type WsClient } from '$lib/ws';
+	import { connect, deriveWsUrl, type WsClient } from '$lib/ws';
 
-	/** Dev WebSocket endpoint. Uses 127.0.0.1 (not `localhost`) to match the
-	 * backend's IPv4 bind — `localhost` can resolve to IPv6 `::1` and fail. */
-	const WS_URL = 'ws://127.0.0.1:7000';
+	/** WebSocket endpoint derived from the serving origin so the bundle the `lattice`
+	 * binary serves reconnects to whatever host/port served it; off-browser (SSR) it
+	 * falls back to the dev default (`ws://127.0.0.1:7000`). */
+	const WS_URL = deriveWsUrl(typeof window !== 'undefined' ? window.location : undefined);
 
 	// The stable resilient client handle. Held (not its one-shot `socket`) so expansions
 	// always reach the current live socket even after an auto-reconnect swaps it out.

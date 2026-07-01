@@ -1,0 +1,4 @@
+# Keeps `frontend/build/` present in git so the `rust-embed` derive in
+# `crates/backend/src/ws.rs` finds its embed folder at compile time (P10-1).
+# The real bundle (`npm run build`) overwrites this directory's contents; those
+# generated assets stay git-ignored (see `.gitignore`).

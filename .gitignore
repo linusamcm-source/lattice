@@ -8,3 +8,9 @@ node_modules/
 .team-sprint/
 .env
 graphify-out/
+
+# Generated SvelteKit bundle embedded by the `lattice` binary (P10-1). The build
+# output is produced by `npm --prefix frontend run build` and must not be committed;
+# only the `.gitkeep` is tracked so the rust-embed folder exists at compile time.
+/frontend/build/*
+!/frontend/build/.gitkeep
