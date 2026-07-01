@@ -763,8 +763,9 @@ impl Graph {
     ///
     /// Clones every [`AgentInfo`] roster row and sorts it by `process_id` for a
     /// stable order, then wraps it in an [`EventType::AgentRoster`] envelope. Shared
-    /// by [`Graph::apply_activity`] (a new/changed process) and [`Graph::expire_idle`]
-    /// (a timed-out process) so both paths broadcast an identical full-roster shape.
+    /// by [`Graph::apply_activity`] (a new/changed process), [`Graph::expire_idle`]
+    /// (a timed-out process) and [`Graph::roster_snapshot`] (the connect/resync
+    /// trailer) so every path broadcasts an identical full-roster shape.
     fn roster_envelope(&self, session_id: String) -> EventEnvelope {
         let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
         agents.sort_by_key(|a| a.process_id);
@@ -772,6 +773,23 @@ impl Graph {
             EventType::AgentRoster,
             Payload::AgentRoster { session_id, agents },
         )
+    }
+
+    /// Returns the current roster as an `agent.roster` envelope, or `None` when empty.
+    ///
+    /// The connect/resync trailer accessor (Design Decision #4, P9-7): a `snapshot`
+    /// is root-only and never carries agent-layer state, so a client connecting or
+    /// resyncing mid-run would see agent nodes but an empty roster. This exposes the
+    /// live [`Graph::roster`] as one full [`EventType::AgentRoster`] envelope (built
+    /// via [`Graph::roster_envelope`], stamped with the graph's `session_id`) for
+    /// [`handle_connection`](crate::ws) to send **after** the snapshot. Returns
+    /// `None` when the roster is empty, so an empty-roster connect emits no spurious
+    /// trailing `agent.roster`. Read-only and panic-free.
+    pub fn roster_snapshot(&self) -> Option<EventEnvelope> {
+        if self.roster.is_empty() {
+            return None;
+        }
+        Some(self.roster_envelope(self.session_id.clone()))
     }
 
     /// Records `micros` as the most-recent parse latency for repo-relative `path`.
@@ -1653,6 +1671,49 @@ mod tests {
             .find(|a| a.agent_id == "tdd-green" && a.process_id == 48213)
             .unwrap_or_else(|| panic!("expected a roster row for tdd-green/48213, got {agents:?}"));
         assert_eq!(row.status, "active", "the touched process is marked active");
+    }
+
+    // ---- P9-7: Graph::roster_snapshot() accessor for connect/resync trailer ----
+    //
+    // These pin the new `pub fn Graph::roster_snapshot(&self) -> Option<EventEnvelope>`
+    // accessor the ws.rs connect/resync trailer is built from (Design Decision #4).
+    // RED until P9-7 lands: `roster_snapshot` does not yet exist, so the two calls
+    // below are E0599 method-not-found errors and the whole test binary fails to
+    // compile.
+
+    /// An empty roster must yield `None` — no spurious empty `agent.roster`.
+    #[test]
+    fn roster_snapshot_is_none_when_the_roster_is_empty() {
+        let graph = Graph::new();
+        assert!(
+            graph.roster_snapshot().is_none(),
+            "an empty roster must yield no agent.roster envelope"
+        );
+    }
+
+    /// After seeding the roster via the Phase-8 activity path, `roster_snapshot`
+    /// returns `Some(agent.roster)` listing the seeded process.
+    #[test]
+    fn roster_snapshot_carries_the_seeded_roster() {
+        let mut graph = Graph::new();
+        // Seed the roster via the Phase-8 activity path (`apply_clv`).
+        let _ = graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        let env = graph
+            .roster_snapshot()
+            .expect("a non-empty roster yields an agent.roster envelope");
+        assert_eq!(
+            env.event_type,
+            EventType::AgentRoster,
+            "roster_snapshot wraps an agent.roster envelope, got {env:?}"
+        );
+        let agents = roster_agents(std::slice::from_ref(&env));
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.agent_id == "tdd-green" && a.process_id == 48213),
+            "roster_snapshot lists the seeded process, got {agents:?}"
+        );
     }
 
     #[test]
