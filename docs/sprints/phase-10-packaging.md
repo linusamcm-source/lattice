@@ -39,19 +39,23 @@ runs as a separate Vite process — Phase 10 closes that gap.
 
 ## Design decisions (deliberate, grounded)
 
-1. **Single-port HTTP + WS via minimal request discrimination — no framework swap.** Because the
-   server is raw `tokio-tungstenite` on one `TcpListener`, P10-1 keeps that model: on each accepted
-   connection, read the HTTP request head; if it carries `Upgrade: websocket` route to the existing
-   `accept_async` WS path unchanged, otherwise serve the embedded static asset for the request path
-   (with `index.html` as the SPA fallback for unknown paths). This avoids adding `axum`/`hyper` and
-   keeps the one-port "download-and-run" model. The frontend is embedded at compile time via
-   `rust-embed` so the binary is self-contained.
-2. **Frontend build feeds the embed via a documented build step, not a git-committed `build/`.** The
-   embedded assets come from `frontend/build/`, produced by `npm --prefix frontend run build`. A
-   `build.rs` (or the justfile/CI) runs the frontend build before `cargo build` so the embed picks up
-   fresh assets; `frontend/build/` stays git-ignored. `rust-embed`'s `debug-embed`-off default reads
-   from disk in dev and embeds in `--release`, so `cargo install`/release builds are self-contained
-   while dev stays fast.
+1. **Single-port HTTP + WS via NON-DESTRUCTIVE discrimination — no framework swap.** Because the
+   server is raw `tokio-tungstenite` on one `TcpListener` and `accept_async(stream)` (`ws.rs:137`)
+   **consumes** the stream to read the client's upgrade request, P10-1 must inspect the request head
+   **without consuming it**: `tokio::net::TcpStream::peek()` into a bounded buffer, then — if the head
+   contains `Upgrade: websocket` — pass the **intact** stream to the existing `accept_async` path
+   unchanged (so every Phase-0…9 WS test still passes); otherwise serve the embedded static asset for
+   the request path, with `index.html` as the SPA fallback for extension-less routes. This avoids
+   adding `axum`/`hyper` and keeps the one-port "download-and-run" model. (Adversarial review H-2.)
+2. **The embed folder must EXIST at compile time; assets are built into it.** `rust-embed`'s derive
+   **panics at compile time** (even in debug) if the `#[folder]` path is absent (adversarial review
+   H-1), so a committed `frontend/build/.gitkeep` guarantees the dir exists for a fresh `cargo build`/
+   `just qg`/worktree; `build.rs` also creates it defensively. `.gitignore` ignores `frontend/build/*`
+   but **un-ignores** `.gitkeep`. Assets come from `npm --prefix frontend run build`. Pin the folder
+   with `$CARGO_MANIFEST_DIR` via rust-embed's `interpolate-folder-path` feature so it resolves to the
+   crate manifest dir (not the binary's runtime cwd — adversarial review M-1) in both debug and
+   release. `--release` embeds the assets, so `cargo install`/release binaries are self-contained; a
+   fresh checkout with only `.gitkeep` compiles + runs (WS works; UI 404s until built).
 3. **Client derives the WS URL from `window.location`.** So the same embedded bundle works whether
    served by the binary (any host/port) or the Vite dev server; falls back to the dev default only
    when opened from Vite.
@@ -65,15 +69,20 @@ runs as a separate Vite process — Phase 10 closes that gap.
 ## Story P10-1: Serve the embedded SvelteKit UI from the `lattice` binary (single port)
 
 Make `lattice <dir>` serve the UI so a browser at the bound address shows a live graph with no Vite
-process. Embed `frontend/build/` via `rust-embed`; in the connection handler (`ws.rs`) discriminate
-HTTP vs WS: a request with `Upgrade: websocket` takes the existing `accept_async` path unchanged; any
-other GET serves the embedded asset for the path (MIME by extension), falling back to `index.html`
-for SPA routes; unknown asset under a real extension → 404. Change the frontend `WS_URL` to derive
-from `window.location` (`ws://<host>:<port>/` from `location.host`), keeping a dev fallback. Add a
-`build.rs` (or justfile step) note so the embed sees a built frontend.
+process. Embed `frontend/build/` via `rust-embed` (`interpolate-folder-path` + `$CARGO_MANIFEST_DIR`,
+Design Decision #2); in the connection handler (`ws.rs`) discriminate HTTP vs WS **non-destructively**
+via `TcpStream::peek()` (Design Decision #1): a head with `Upgrade: websocket` hands the **intact**
+stream to the existing `accept_async` path unchanged; any other GET serves the embedded asset for the
+path (MIME by extension), falling back to `index.html` for extension-less SPA routes; a missing asset
+with a real extension → 404. Commit `frontend/build/.gitkeep` (+ `.gitignore` un-ignore) and a
+`build.rs` that ensures the dir exists so the derive never panics on a fresh checkout. Set
+`adapter({ fallback: 'index.html' })` in `frontend/svelte.config.js` so `npm run build` emits
+`frontend/build/index.html` (adversarial review M-2). Change the frontend `WS_URL` to derive from
+`window.location` — scheme from `location.protocol` (`wss:`→`wss://`, else `ws://`) + `location.host`
+(adversarial review L-1) — keeping the dev fallback.
 
 ### Depends On: none
-### Touches: crates/backend/src/ws.rs, crates/backend/Cargo.toml, crates/backend/src/lib.rs, frontend/src/routes/+page.svelte, frontend/src/lib/ws.ts, build.rs
+### Touches: crates/backend/src/ws.rs, crates/backend/Cargo.toml, crates/backend/src/lib.rs, crates/backend/build.rs, frontend/src/routes/+page.svelte, frontend/src/lib/ws.ts, frontend/svelte.config.js, frontend/build/.gitkeep, .gitignore
 
 ### Acceptance Criteria
 - With an embedded (or dev-dir) `index.html`, an HTTP `GET /` to the bound address returns `200` with
@@ -86,12 +95,14 @@ from `window.location` (`ws://<host>:<port>/` from `location.host`), keeping a d
   passes.
 - The static-serving path is panic-free on a malformed/oversized HTTP request head (bounded read;
   never `unwrap`/`panic` on client bytes) — asserted by feeding a garbage/oversized request head.
-- The frontend derives its WS URL from `window.location` (a unit test asserts the derivation yields
-  `ws://<host>/` for a given `location`, and the dev fallback when `location` is absent); `npm run
-  check`/`npm run test` stay green.
-- `just qg` is green (backend), and the embed does not break a normal `cargo build` when
-  `frontend/build/` is absent (dev reads from disk / a clear build-time message), so contributors
-  aren't blocked.
+- The frontend derives its WS URL from `window.location` — a unit test asserts `wss://host/` for an
+  `https:` location and `ws://host/` for `http:`, plus the dev fallback when `location` is absent;
+  `npm run check`/`npm run test` stay green. `frontend/svelte.config.js` sets
+  `adapter({ fallback: 'index.html' })` and `npm run build` emits `frontend/build/index.html`.
+- **A fresh checkout compiles** with only the committed `frontend/build/.gitkeep` present (no built
+  frontend): `cargo build` + `just qg` succeed (the `rust-embed` folder exists, so the derive does
+  not panic — adversarial review H-1); at runtime the WS path works and unbuilt UI assets return 404,
+  so contributors are not blocked. `frontend/build/*` is git-ignored except `.gitkeep`.
 
 ### Definition of Done
 - New `#[cfg(test)]` cases in `ws.rs` (HTTP GET index/asset/SPA-fallback/404, WS-still-works,
@@ -115,10 +126,12 @@ job), no long-lived secrets beyond the automatic `GITHUB_TOKEN`.
 ### Touches: .github/workflows/release.yml
 
 ### Acceptance Criteria
-- `.github/workflows/release.yml` triggers on `push: tags: ['v*']`, has a **frontend-build** step
-  (`npm ci` + `npm run build` in `frontend/`) preceding the Rust build, and a **matrix** over
-  `ubuntu-latest`/`macos-latest`/`windows-latest` running `cargo build --release` for the `lattice`
-  binary.
+- `.github/workflows/release.yml` triggers on `push: tags: ['v*']` and runs a **matrix** over
+  `ubuntu-latest`/`macos-latest`/`windows-latest`. Because Actions matrix jobs do **not** share a
+  filesystem and `rust-embed` (release) embeds relative to `Cargo.toml`, **each** matrix job runs
+  `npm ci` + `npm run build` in `frontend/` **before** `cargo build --release` for the `lattice`
+  binary — so `frontend/build/` exists in every runner's checkout (adversarial review M-3; no
+  cross-job artifact passing of the build dir).
 - A publish job creates/updates the GitHub Release for the tag and uploads each platform artifact
   (named with the target triple/OS), using only `GITHUB_TOKEN` with job-scoped `contents: write`.
 - Every `uses:` action is pinned to a full 40-char commit SHA (no `@v4`/`@main`); the workflow sets a
