@@ -8,6 +8,7 @@ import {
 	connect,
 	collapse,
 	descendantIds,
+	deriveWsUrl,
 	requestExpand,
 	graphStore,
 	nodes,
@@ -1484,5 +1485,28 @@ describe('P9-6 reconnect keeps the open set consistent (no stale expanded id)', 
 		vi.advanceTimersByTime(BACKOFF.baseMs);
 		inst[2].emit('open');
 		expect(inst[2].sends).toEqual([SNAPSHOT_FRAME]);
+	});
+});
+
+// P10-1 (RED) — the served bundle must connect back to whatever host/port served
+// it, so the WS URL is derived from `window.location` rather than hardcoded. The
+// dev fallback (Vite, or SSR where `location` is absent) stays `ws://127.0.0.1:7000`.
+describe('deriveWsUrl', () => {
+	it('maps an https location to a wss origin with a trailing slash', () => {
+		expect(deriveWsUrl({ protocol: 'https:', host: 'x.example:8443' })).toBe(
+			'wss://x.example:8443/'
+		);
+	});
+
+	it('maps an http location to a ws origin with a trailing slash', () => {
+		expect(deriveWsUrl({ protocol: 'http:', host: '127.0.0.1:7000' })).toBe('ws://127.0.0.1:7000/');
+	});
+
+	it('falls back to the dev default when no location is supplied', () => {
+		expect(deriveWsUrl(undefined)).toBe('ws://127.0.0.1:7000');
+	});
+
+	it('falls back to the dev default when the host is empty', () => {
+		expect(deriveWsUrl({ protocol: 'http:', host: '' })).toBe('ws://127.0.0.1:7000');
 	});
 });

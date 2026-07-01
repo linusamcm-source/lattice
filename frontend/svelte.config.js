@@ -5,7 +5,9 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 const config = {
 	preprocess: vitePreprocess(),
 	kit: {
-		adapter: adapter()
+		// SPA fallback: emit `build/index.html` so the `lattice` binary (Phase 10) can
+		// serve it as the catch-all for client-side routes it doesn't have an asset for.
+		adapter: adapter({ fallback: 'index.html' })
 	}
 };
 

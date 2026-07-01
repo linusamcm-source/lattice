@@ -39,6 +39,10 @@
  * lifecycle listeners are bound under a per-socket `AbortController`, aborted on
  * swap, so a stale socket's late terminal event can't drive a second reconnect.
  *
+ * The Phase-10 {@link deriveWsUrl} helper computes the socket URL from the page
+ * `location`, so the bundle the `lattice` binary serves reconnects to whatever
+ * host/port served it, falling back to the dev default off-browser.
+ *
  * @module
  */
 
@@ -405,6 +409,34 @@ const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000, jitter: () => Math.random(
 
 /** The canonical resync frame sent first on every (re-)open. */
 const SNAPSHOT_REQUEST = JSON.stringify({ type: 'snapshot' });
+
+/**
+ * The dev/SSR WebSocket fallback. Uses `127.0.0.1` (not `localhost`) to match the
+ * backend's IPv4 bind — `localhost` can resolve to IPv6 `::1` and fail.
+ */
+const DEV_WS_URL = 'ws://127.0.0.1:7000';
+
+/**
+ * Derive the WebSocket URL to connect to from a page location.
+ *
+ * When the `lattice` binary serves the built UI on its own host/port (Phase 10),
+ * the client must reconnect to *that* origin rather than a hardcoded address, so
+ * the same bundle works wherever it is served. The scheme is upgraded to `wss:`
+ * for an `https:` page and `ws:` otherwise, and `location.host` (host + port)
+ * supplies the authority — yielding `ws(s)://<host>/`.
+ *
+ * When `loc` is absent (SSR, or the Vite dev server before hydration) or carries
+ * no `host`, the dev fallback {@link DEV_WS_URL} (`ws://127.0.0.1:7000`) is
+ * returned so `just dev`/`npm run dev` still reaches the standalone backend.
+ *
+ * @param loc - the page location (`window.location`), or `undefined` off-browser.
+ * @returns the WebSocket URL to pass to {@link connect}.
+ */
+export function deriveWsUrl(loc?: { protocol: string; host: string }): string {
+	if (!loc || !loc.host) return DEV_WS_URL;
+	const scheme = loc.protocol === 'https:' ? 'wss://' : 'ws://';
+	return `${scheme}${loc.host}/`;
+}
 
 /**
  * Open a resilient WebSocket to `url` and stream incoming CLV envelopes into the

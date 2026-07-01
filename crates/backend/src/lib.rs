@@ -86,11 +86,18 @@
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
 //!   within [`watcher::DEBOUNCE`] and bounding sustained churn via a
 //!   [`watcher::MAX_DEBOUNCE`] cap.
-//! - [`ws`] — a `tokio-tungstenite` WebSocket server ([`ws::serve`]) that sends
-//!   each connecting client the current [`graph::Graph`] root-only `snapshot` and
-//!   then streams broadcast [`wire::EventEnvelope`]s, replying to a client
-//!   snapshot request with a fresh snapshot and to an `expand` request with the
-//!   node's `subtree`.
+//! - [`ws`] — the single-port server ([`ws::serve`]) that serves **both** the UI
+//!   and the live graph, so the `lattice` binary needs no separate frontend process
+//!   (Phase-10 packaging). Each connection is discriminated non-destructively by a
+//!   bounded head `peek`: a `Upgrade: websocket` request takes the unchanged
+//!   WebSocket path — sending the connecting client the current [`graph::Graph`]
+//!   root-only `snapshot` then streaming broadcast [`wire::EventEnvelope`]s, and
+//!   replying to a client snapshot request with a fresh snapshot and to an `expand`
+//!   request with the node's `subtree` — while every other `GET` is answered by the
+//!   HTTP static handler, serving the SvelteKit bundle embedded via `rust-embed`
+//!   (`frontend/build/`, MIME by extension, `index.html` SPA fallback, `404` for a
+//!   missing real-extension asset, `400`/panic-free on a malformed or oversized
+//!   head).
 //! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
 //!   graph → WebSocket so editing a source file (Rust, Python, or TypeScript)
 //!   updates a connected client's graph live, and spawns the [`collector`] task so
