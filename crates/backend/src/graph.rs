@@ -28,7 +28,10 @@
 //! by an **idle timeout**: each activity stamps the process's `last_seen` (via
 //! [`Graph::apply_clv_at`]), and [`Graph::expire_idle`] flips any process quiet for
 //! longer than [`ROSTER_IDLE_MS`] to `inactive`, re-broadcasting one `agent.roster`
-//! only when a row changed.
+//! only when a row changed. To keep the roster bounded on a long run,
+//! [`Graph::reclaim_inactive`] then garbage-collects any process that has stayed
+//! `inactive` beyond the longer [`RETENTION_MS`] window, removing it from both the
+//! `roster` and `last_seen` maps; both sweeps are driven every collector tick.
 //! An unknown node/edge id, an unparsable `hotedge` state, a no-change heat
 //! transition, or an `activity` event missing its `agent`/`pid` yields an empty
 //! `Vec` (a no-op).
@@ -39,6 +42,26 @@
 //! and [`Graph::subtree`] wraps them in a `subtree` envelope replying to an
 //! `expand` request.
 //!
+//! Crash-rebuild warm start (Phase 9). [`Graph::from_records`] rehydrates a graph
+//! from a [`Storage`](crate::storage::Storage) backend's persisted `nodes`/`edges`,
+//! re-deriving the unpersisted `child_ids` from the loaded `contains` edges (canonically
+//! sorted via the shared [`crate::wire::derive_child_ids`], so the result is independent
+//! of the loaded edge order) and rebuilding the `file_nodes`/`file_edges` diff
+//! bookkeeping — excluding the agent-layer overlays (`agent` vertices and `authored_by`
+//! edges) exactly as the live path does — so a follow-up [`Graph::apply_parsed`] of an
+//! unchanged file reconciles to a no-op with no spurious removals. The agent roster is
+//! **not** restored (no table) — it repopulates from live activity.
+//!
+//! Self-observability (Phase 9). [`Graph::record_parse_latency`] stamps each file's
+//! most-recent parse `duration_us` into a map bounded by the distinct-file count, and
+//! [`Graph::metrics_payload`] renders a **clock-free, deterministic** `metrics.update`
+//! [`Payload`] (live node/edge counts, a pure `memoryBytes` estimate, the passed-in
+//! events/sec, and the per-file latencies); [`Graph::metrics_envelope`] is the public
+//! wrapper that stamps the envelope's `v`/`ts`/`sessionId`. To keep the metrics emitter
+//! off the graph mutex's critical section, both are built over [`Graph::metrics_snapshot`]
+//! — a lock-light read of counts/memory/latencies — with the `parseLatency` sort and the
+//! clock reading deferred to [`MetricsSnapshot::into_envelope`] after the guard is dropped.
+//!
 //! Per `AGENT_PROTOCOL.md` §6 this is panic-free: a clock error or a parse with no
 //! `file` node degrades to a safe default rather than unwrapping.
 
@@ -47,8 +70,8 @@ use std::collections::{HashMap, HashSet};
 use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
 use crate::wire::{
-    agent_node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
-    HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+    agent_node_id, derive_child_ids, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
+    EventType, FileParseLatency, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
 };
 
 /// CLV protocol version stamped on every envelope this graph emits.
@@ -67,6 +90,21 @@ const DEFAULT_SESSION_ID: &str = "sess-local";
 /// `now`/`last_seen` clock is the monotonic millisecond domain of
 /// [`monotonic_now_ms`].
 pub const ROSTER_IDLE_MS: u64 = 5_000;
+
+/// Retention window, in milliseconds, after which an `"inactive"` process is
+/// **reclaimed** — removed from both `roster` and `last_seen`.
+///
+/// [`Graph::expire_idle`] only *flips* a quiet process to `"inactive"`; the
+/// [`AgentInfo`] row and its `last_seen` entry then linger forever, so a long run
+/// that spawns many short-lived pids grows both maps without bound. This is the
+/// longer horizon after which [`Graph::reclaim_inactive`] drops such a row: a
+/// process is reclaimed once its `last_seen` age exceeds this window **and** its
+/// status is already `"inactive"`. It is **strictly greater than**
+/// [`ROSTER_IDLE_MS`] so a just-timed-out process stays visible for a grace period
+/// (a client still sees it as `"inactive"`) before it is garbage-collected; a
+/// reclaimed pid does not resurrect unless fresh activity arrives. Same monotonic
+/// millisecond domain as [`monotonic_now_ms`].
+pub const RETENTION_MS: u64 = 60_000;
 
 /// The in-memory structural graph and the diff that emits CLV patch events.
 ///
@@ -102,6 +140,14 @@ pub struct Graph {
     /// flipped to `"inactive"`. Same monotonic-millisecond domain as
     /// [`monotonic_now_ms`].
     last_seen: HashMap<u32, u64>,
+    /// Most-recent parse latency (microseconds) per repo-relative source path (Phase 9).
+    ///
+    /// [`Graph::record_parse_latency`] stamps a file's `duration_us` here on every
+    /// parse, overwriting the prior value, so the map is **bounded by the number of
+    /// distinct source files** — never by the number of edits. It is a pure
+    /// self-observability read: [`Graph::metrics_payload`] snapshots it into the
+    /// `metrics.update` envelope's `parseLatency` rows without a clock.
+    parse_latency: HashMap<String, u64>,
 }
 
 impl Default for Graph {
@@ -126,7 +172,110 @@ impl Graph {
             file_edges: HashMap::new(),
             roster: HashMap::new(),
             last_seen: HashMap::new(),
+            parse_latency: HashMap::new(),
         }
+    }
+
+    /// Rebuilds a graph from persisted node/edge records (crash-rebuild warm start).
+    ///
+    /// Given the `nodes`/`edges` a [`Storage`](crate::storage::Storage) backend loaded
+    /// for `session_id` ([`load_nodes`](crate::storage::Storage::load_nodes) /
+    /// [`load_edges`](crate::storage::Storage::load_edges)), this bulk-loads the node
+    /// and edge maps and reconstructs the diff-tracking bookkeeping so a subsequent
+    /// [`Graph::apply_parsed`] of an **unchanged** file is a no-op (the reconcile path,
+    /// Design Decision #1).
+    ///
+    /// **Re-derives each node's `child_ids` from the loaded `contains` edges (Design
+    /// Decision #7).** `child_ids` is part of a [`Node`]'s identity (and the
+    /// [`Graph::apply_parsed`] byte-equality no-op check) but has **no persisted
+    /// column**, so [`load_nodes`](crate::storage::Storage::load_nodes) returns it
+    /// empty. This applies the shared [`derive_child_ids`] rule — the **same** one the
+    /// parser's `populate_child_ids` uses — which sorts each node's `child_ids`
+    /// **canonically by child id**. The sort is what makes this **order-independent**:
+    /// neither backend's `load_edges` guarantees an order, so deriving in raw edge order
+    /// would yield a different permutation than the parser produced and spuriously fail
+    /// the no-op check; sorting makes a rebuilt node byte-equal to a freshly parsed one
+    /// regardless of loaded edge order, so re-parsing the same source emits no spurious
+    /// upsert.
+    ///
+    /// **Rebuilds `file_nodes`/`file_edges`** (the per-file id sets
+    /// [`Graph::apply_parsed`] uses to compute removals): a node is grouped under the
+    /// root `file:` node reached by walking its `parent_id` chain, and an edge under
+    /// the file of its **source** node (so cross-file `calls`/`data_flows_from`/
+    /// `authored_by` edges are attributed to the file that produces them, not removed
+    /// when another file re-parses).
+    ///
+    /// The `roster`/`last_seen` maps start **empty**: the agent roster has no table and
+    /// is **not restored** here — it is repopulated by live activity after restart
+    /// (Design Decision #1). Never panics.
+    pub fn from_records(session_id: impl Into<String>, nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
+        let mut graph = Self::with_session(session_id);
+
+        // Re-derive child_ids canonically (sorted, backend-independent) from the
+        // `contains` edges (DD#7) — the same shared rule the parser applies. Move each
+        // child list out of the map (rather than clone) as it is consumed.
+        let mut children = derive_child_ids(&edges);
+        for mut node in nodes {
+            node.child_ids = children.remove(&node.id).unwrap_or_default();
+            graph.nodes.insert(node.id.clone(), node);
+        }
+        for edge in edges {
+            graph.edges.insert(edge.id.clone(), edge);
+        }
+
+        graph.rebuild_file_tracking();
+        graph
+    }
+
+    /// Rebuilds the `file_nodes`/`file_edges` diff-tracking maps from the current
+    /// node/edge maps, grouping each node under its owning `file:` root and each edge
+    /// under its **source** node's file (Design Decision #7). Used by
+    /// [`Graph::from_records`] after a bulk load.
+    ///
+    /// **Agent-layer overlays are excluded**, mirroring exactly what [`Graph::apply_parsed`]
+    /// file-tracks: [`NodeType::Agent`] vertices and [`EdgeKind::AuthoredBy`] edges are the
+    /// live-overlay product of [`Graph::apply_clv`] and are **never** recorded in
+    /// `file_nodes`/`file_edges`. Tracking them here would make a follow-up reparse of an
+    /// agent-touched file treat the agent vertex / `authored_by` edge as a vanished
+    /// file element and emit a spurious `node.remove`/`edge.remove`.
+    fn rebuild_file_tracking(&mut self) {
+        let mut file_nodes: HashMap<String, Vec<String>> = HashMap::new();
+        for node in self.nodes.values() {
+            // Agent vertices are live-overlay, not file-tracked by `apply_parsed`.
+            if node.node_type == NodeType::Agent {
+                continue;
+            }
+            if let Some(file_id) = self.owning_file(&node.id) {
+                file_nodes.entry(file_id).or_default().push(node.id.clone());
+            }
+        }
+        let mut file_edges: HashMap<String, Vec<String>> = HashMap::new();
+        for edge in self.edges.values() {
+            // `authored_by` edges are live-overlay, not file-tracked by `apply_parsed`.
+            if edge.kind == EdgeKind::AuthoredBy {
+                continue;
+            }
+            if let Some(file_id) = self.owning_file(&edge.source) {
+                file_edges.entry(file_id).or_default().push(edge.id.clone());
+            }
+        }
+        self.file_nodes = file_nodes;
+        self.file_edges = file_edges;
+    }
+
+    /// Returns the id of the root `file:` node that owns `node_id`, by walking the
+    /// `parent_id` chain to its topmost present ancestor (a node with no `parent_id`,
+    /// i.e. the file). Returns `None` when `node_id` is unknown. A bounded loop guards
+    /// against a malformed parent cycle, so it never hangs or panics.
+    fn owning_file(&self, node_id: &str) -> Option<String> {
+        let mut current = self.nodes.get(node_id)?;
+        for _ in 0..=self.nodes.len() {
+            match current.parent_id.as_deref().and_then(|p| self.nodes.get(p)) {
+                Some(parent) => current = parent,
+                None => return Some(current.id.clone()),
+            }
+        }
+        Some(current.id.clone())
     }
 
     /// Inserts `node`, or replaces the existing node with the same [`Node::id`].
@@ -628,12 +777,52 @@ impl Graph {
         }
     }
 
+    /// Reclaims every long-idle `"inactive"` process, returning the rebuilt roster.
+    ///
+    /// The garbage-collection half of the roster lifecycle (Phase 9 deferral #1):
+    /// [`Graph::expire_idle`] flips a quiet process to `"inactive"` but never removes
+    /// it, so `roster`/`last_seen` are insert-only and grow without bound on a long
+    /// run. This **removes from both maps** every process whose status is already
+    /// `"inactive"` **and** whose `last_seen` age (`now_ms - last_seen`, saturating)
+    /// is **strictly greater** than [`RETENTION_MS`]. Active processes and
+    /// recently-inactive ones (still within the retention window) are left untouched,
+    /// so a just-timed-out row stays visible for its grace period. Reclaim **never
+    /// flips** status — that stays [`Graph::expire_idle`]'s job — and is driven from
+    /// the collector tick (right after `expire_idle`), **not** from `expire_idle`
+    /// itself, so the P8-4 idle-timeout tests are unaffected. A reclaimed pid does not
+    /// resurrect unless new activity re-inserts it. Returns **one** full `agent.roster`
+    /// snapshot envelope when at least one row was removed and an empty vector
+    /// otherwise (a no-op broadcasts nothing). `now_ms` shares the
+    /// monotonic-millisecond domain of [`monotonic_now_ms`]; panic-free.
+    pub fn reclaim_inactive(&mut self, now_ms: u64) -> Vec<EventEnvelope> {
+        let stale: Vec<u32> = self
+            .roster
+            .iter()
+            .filter(|(pid, info)| {
+                info.status == "inactive"
+                    && now_ms.saturating_sub(self.last_seen.get(pid).copied().unwrap_or(0))
+                        > RETENTION_MS
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        for pid in stale {
+            self.roster.remove(&pid);
+            self.last_seen.remove(&pid);
+        }
+        vec![self.roster_envelope(self.session_id.clone())]
+    }
+
     /// Builds one full `agent.roster` snapshot envelope stamped with `session_id`.
     ///
     /// Clones every [`AgentInfo`] roster row and sorts it by `process_id` for a
     /// stable order, then wraps it in an [`EventType::AgentRoster`] envelope. Shared
-    /// by [`Graph::apply_activity`] (a new/changed process) and [`Graph::expire_idle`]
-    /// (a timed-out process) so both paths broadcast an identical full-roster shape.
+    /// by [`Graph::apply_activity`] (a new/changed process), [`Graph::expire_idle`]
+    /// (a timed-out process), [`Graph::reclaim_inactive`] (a reclaimed process) and
+    /// [`Graph::roster_snapshot`] (the connect/resync trailer) so every path
+    /// broadcasts an identical full-roster shape.
     fn roster_envelope(&self, session_id: String) -> EventEnvelope {
         let mut agents: Vec<AgentInfo> = self.roster.values().cloned().collect();
         agents.sort_by_key(|a| a.process_id);
@@ -641,6 +830,107 @@ impl Graph {
             EventType::AgentRoster,
             Payload::AgentRoster { session_id, agents },
         )
+    }
+
+    /// Returns the current roster as an `agent.roster` envelope, or `None` when empty.
+    ///
+    /// The connect/resync trailer accessor (Design Decision #4, P9-7): a `snapshot`
+    /// is root-only and never carries agent-layer state, so a client connecting or
+    /// resyncing mid-run would see agent nodes but an empty roster. This exposes the
+    /// live [`Graph::roster`] as one full [`EventType::AgentRoster`] envelope (built
+    /// via [`Graph::roster_envelope`], stamped with the graph's `session_id`) for
+    /// [`handle_connection`](crate::ws) to send **after** the snapshot. Returns
+    /// `None` when the roster is empty, so an empty-roster connect emits no spurious
+    /// trailing `agent.roster`. Read-only and panic-free.
+    pub fn roster_snapshot(&self) -> Option<EventEnvelope> {
+        if self.roster.is_empty() {
+            return None;
+        }
+        Some(self.roster_envelope(self.session_id.clone()))
+    }
+
+    /// Records `micros` as the most-recent parse latency for repo-relative `path`.
+    ///
+    /// Overwrites any prior value for the same path, so re-parsing a file does **not**
+    /// grow the map — it stays bounded by the number of distinct source files, never by
+    /// the number of edits (Phase 9 self-observability, `SPEC.md` §11.3). The recorded
+    /// durations surface via [`Graph::metrics_payload`]'s `parseLatency` rows.
+    pub fn record_parse_latency(&mut self, path: &str, micros: u64) {
+        self.parse_latency.insert(path.to_string(), micros);
+    }
+
+    /// Builds a deterministic `metrics.update` [`Payload`] over the current graph state.
+    ///
+    /// **Clock-free and pure** (Design Decision #3): given the same nodes, edges and
+    /// recorded parse latencies it always returns the same scalars, so it is
+    /// unit-testable without timers. `nodeCount`/`edgeCount` mirror the live map sizes,
+    /// `memoryBytes` is the deterministic [`Graph::estimated_memory_bytes`] estimate
+    /// (not platform RSS), `eventsPerSecMilli` is `events_per_sec_milli` verbatim, and
+    /// `parseLatency` lists each recorded file (sorted by path for a stable order) with
+    /// its most-recent `durationUs`. The payload's `ts` is left **empty** here — the
+    /// authoritative timestamp is stamped by [`Graph::metrics_envelope`] — so this
+    /// method takes no clock reading. Implemented over [`Graph::metrics_snapshot`], so
+    /// the `parseLatency` sort lives in [`MetricsSnapshot::into_payload`] rather than
+    /// under any lock a caller holds while reading `&self`.
+    pub fn metrics_payload(&self, events_per_sec_milli: u64) -> Payload {
+        self.metrics_snapshot()
+            .into_payload(events_per_sec_milli, String::new())
+    }
+
+    /// Wraps [`Graph::metrics_payload`] in a fully stamped `metrics.update` envelope.
+    ///
+    /// Reads the clock **once**, stamps that timestamp into both the envelope and the
+    /// payload's `ts`, and returns the same [`EventEnvelope`] as before. The metrics
+    /// emitter no longer calls this **under** the graph lock — it takes a lock-light
+    /// [`Graph::metrics_snapshot`], drops the guard, then assembles the envelope off-lock
+    /// via [`MetricsSnapshot::into_envelope`]. This method is retained (delegating through
+    /// that same snapshot) so its signature and result are unchanged for any other caller.
+    pub fn metrics_envelope(&self, events_per_sec_milli: u64) -> EventEnvelope {
+        self.metrics_snapshot().into_envelope(events_per_sec_milli)
+    }
+
+    /// Captures the minimal graph state a `metrics.update` needs, reading **no clock and
+    /// doing no sort** while `&self` is borrowed.
+    ///
+    /// The lock-contention seam for the Phase-9 metrics emitter (`SPEC.md` §11.3): the
+    /// emitter holds the graph [`Mutex`](tokio::sync::Mutex) only long enough to read the
+    /// live node/edge counts, the deterministic [`Graph::estimated_memory_bytes`]
+    /// estimate, the session id, and a snapshot of the per-file parse-latency entries —
+    /// then drops the guard and does the sort + clock stamp + envelope assembly off-lock
+    /// via [`MetricsSnapshot::into_envelope`]. Keeping the sort and clock reading out of
+    /// the critical section stops the emitter contending with the watcher and collector
+    /// on the same mutex. The captured `parse_latency` is left **unsorted** here.
+    pub(crate) fn metrics_snapshot(&self) -> MetricsSnapshot {
+        let parse_latency: Vec<FileParseLatency> = self
+            .parse_latency
+            .iter()
+            .map(|(file_path, &duration_us)| FileParseLatency {
+                file_path: file_path.clone(),
+                duration_us,
+            })
+            .collect();
+        MetricsSnapshot {
+            session_id: self.session_id.clone(),
+            node_count: self.nodes.len() as u64,
+            edge_count: self.edges.len() as u64,
+            memory_bytes: self.estimated_memory_bytes(),
+            parse_latency,
+        }
+    }
+
+    /// Deterministic estimate of this graph's structural memory use, in bytes.
+    ///
+    /// A **pure function of the map sizes** (Design Decision #3): each of the
+    /// `nodes`/`edges`/`parse_latency` counts times that element type's fixed stack
+    /// size. Same graph state → same value on every call, so [`Graph::metrics_payload`]
+    /// is unit-testable. This is a self-observability estimate, **not** platform RSS: it
+    /// deliberately undercounts heap-owned strings in exchange for determinism.
+    fn estimated_memory_bytes(&self) -> u64 {
+        let node_bytes = self.nodes.len() as u64 * std::mem::size_of::<Node>() as u64;
+        let edge_bytes = self.edges.len() as u64 * std::mem::size_of::<Edge>() as u64;
+        let latency_bytes =
+            self.parse_latency.len() as u64 * std::mem::size_of::<FileParseLatency>() as u64;
+        node_bytes + edge_bytes + latency_bytes
     }
 
     /// Wraps `payload` in an [`EventEnvelope`] stamped now with this graph's session.
@@ -659,6 +949,59 @@ impl Graph {
             ts,
             session_id: self.session_id.clone(),
             event_type,
+            payload,
+        }
+    }
+}
+
+/// A minimal owned snapshot of the graph state a `metrics.update` needs.
+///
+/// Produced by [`Graph::metrics_snapshot`] while the graph lock is held, so the sort,
+/// clock reading, and envelope assembly can all run **after** the guard is dropped — the
+/// Phase-9 fix that keeps the metrics emitter from contending with the watcher and
+/// collector on the graph mutex (`SPEC.md` §11.3). `parse_latency` is captured
+/// **unsorted** here and ordered off-lock by [`MetricsSnapshot::into_payload`].
+pub(crate) struct MetricsSnapshot {
+    session_id: String,
+    node_count: u64,
+    edge_count: u64,
+    memory_bytes: u64,
+    parse_latency: Vec<FileParseLatency>,
+}
+
+impl MetricsSnapshot {
+    /// Builds the deterministic `metrics.update` [`Payload`] from this snapshot, stamping
+    /// the payload's `ts` with `ts` (empty for the clock-free [`Graph::metrics_payload`]
+    /// path). Sorts the captured `parse_latency` by `file_path` for a stable order — this
+    /// is the sort lifted out of the graph lock's critical section, so the same graph
+    /// state always yields the same ordered `parseLatency` regardless of map iteration.
+    fn into_payload(mut self, events_per_sec_milli: u64, ts: String) -> Payload {
+        self.parse_latency
+            .sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Payload::MetricsUpdate {
+            session_id: self.session_id,
+            ts,
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+            memory_bytes: self.memory_bytes,
+            events_per_sec_milli,
+            parse_latency: self.parse_latency,
+        }
+    }
+
+    /// Assembles a fully stamped `metrics.update` [`EventEnvelope`] from this snapshot,
+    /// reading the clock **once** off-lock and stamping that timestamp into both the
+    /// envelope and the payload's `ts`. This is the emitter's off-lock path; it returns
+    /// the same envelope [`Graph::metrics_envelope`] would for the same graph state.
+    pub(crate) fn into_envelope(self, events_per_sec_milli: u64) -> EventEnvelope {
+        let ts = rfc3339_now();
+        let session_id = self.session_id.clone();
+        let payload = self.into_payload(events_per_sec_milli, ts.clone());
+        EventEnvelope {
+            v: PROTOCOL_VERSION,
+            ts,
+            session_id,
+            event_type: EventType::MetricsUpdate,
             payload,
         }
     }
@@ -765,10 +1108,11 @@ pub(crate) fn monotonic_now_ms() -> u64 {
 mod tests {
     use super::Graph;
     use crate::clv::ClvEvent;
-    use crate::parser::parse_rust_source;
+    use crate::parser::{parse_rust_source, parse_source};
     use crate::wire::{
-        agent_node_id, edge_id, node_id, AgentInfo, Edge, EdgeKind, EventEnvelope, EventType,
-        HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+        agent_node_id, edge_id, node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
+        EventType, FileParseLatency, HotEdgeState, Node, NodeStatus, NodeType, Payload,
+        TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -1386,6 +1730,49 @@ mod tests {
         assert_eq!(row.status, "active", "the touched process is marked active");
     }
 
+    // ---- P9-7: Graph::roster_snapshot() accessor for connect/resync trailer ----
+    //
+    // These pin the new `pub fn Graph::roster_snapshot(&self) -> Option<EventEnvelope>`
+    // accessor the ws.rs connect/resync trailer is built from (Design Decision #4).
+    // RED until P9-7 lands: `roster_snapshot` does not yet exist, so the two calls
+    // below are E0599 method-not-found errors and the whole test binary fails to
+    // compile.
+
+    /// An empty roster must yield `None` — no spurious empty `agent.roster`.
+    #[test]
+    fn roster_snapshot_is_none_when_the_roster_is_empty() {
+        let graph = Graph::new();
+        assert!(
+            graph.roster_snapshot().is_none(),
+            "an empty roster must yield no agent.roster envelope"
+        );
+    }
+
+    /// After seeding the roster via the Phase-8 activity path, `roster_snapshot`
+    /// returns `Some(agent.roster)` listing the seeded process.
+    #[test]
+    fn roster_snapshot_carries_the_seeded_roster() {
+        let mut graph = Graph::new();
+        // Seed the roster via the Phase-8 activity path (`apply_clv`).
+        let _ = graph.apply_clv(&activity_event("fn:src/x.rs:foo", "tdd-green", 48213));
+
+        let env = graph
+            .roster_snapshot()
+            .expect("a non-empty roster yields an agent.roster envelope");
+        assert_eq!(
+            env.event_type,
+            EventType::AgentRoster,
+            "roster_snapshot wraps an agent.roster envelope, got {env:?}"
+        );
+        let agents = roster_agents(std::slice::from_ref(&env));
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.agent_id == "tdd-green" && a.process_id == 48213),
+            "roster_snapshot lists the seeded process, got {agents:?}"
+        );
+    }
+
     #[test]
     fn apply_clv_second_activity_new_pid_adds_roster_row_reuses_node_and_edge_id() {
         let mut graph = Graph::new();
@@ -1668,5 +2055,454 @@ mod tests {
             "inactive",
             "one ms past the window the process expires, got {agents:?}"
         );
+    }
+
+    // ---- P9-8: roster retention reclaim (removal from both maps) -------------
+    //
+    // P8-4 made `expire_idle` flip a quiet process to `inactive`, but `roster` and
+    // `last_seen` are insert-only — a long-dead pid lingers forever. P9-8 adds a
+    // longer **retention window** `RETENTION_MS` (strictly greater than the P8-4
+    // idle window `ROSTER_IDLE_MS`) and `Graph::reclaim_inactive(now)`, which
+    // **removes** from *both* `roster` and `last_seen` every process whose
+    // `last_seen` is older than `RETENTION_MS` *and* whose status is already
+    // `inactive`. Reclaim never flips (that stays `expire_idle`'s job) and lives
+    // only on the collector tick, so the P8-4 tests above are untouched.
+    //
+    // Time is injected (`apply_clv_at` / `expire_idle` / `reclaim_inactive` all take
+    // an explicit `now_ms`), so this is deterministic with NO real sleeps.
+    //
+    // RED until P9-8 lands: `super::RETENTION_MS` and `Graph::reclaim_inactive` do
+    // not yet exist, so this module fails to compile (E0425 / E0599).
+
+    #[test]
+    fn reclaim_inactive_removes_only_long_idle_inactive_processes_from_both_maps() {
+        // The retention window must be a genuinely longer horizon than the idle
+        // window: a process is flipped `inactive` at `ROSTER_IDLE_MS`, but only
+        // reclaimed (removed) once it has been quiet for the longer `RETENTION_MS`.
+        let idle = super::ROSTER_IDLE_MS;
+        let retention = super::RETENTION_MS;
+        assert!(
+            retention > idle,
+            "RETENTION_MS ({retention}) must be strictly greater than ROSTER_IDLE_MS ({idle})"
+        );
+
+        let mut graph = Graph::new();
+        // A reference `now` comfortably larger than the retention window so the
+        // per-pid `last_seen` timestamps below never underflow.
+        let now = retention + idle + 1_000;
+
+        // pid 100 — long-idle: last activity older than the retention window
+        // (age = retention + 1). It becomes `inactive` and is reclaimed.
+        let t_gone = now - retention - 1;
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:foo", "agent-gone", 100),
+            t_gone,
+        );
+        // pid 200 — recently-inactive: quiet long enough to be flipped `inactive`
+        // (age = idle + 1 > idle) but still within the retention window
+        // (age = idle + 1 <= retention, since retention > idle), so NOT reclaimed.
+        let t_recent = now - idle - 1;
+        let _ = graph.apply_clv_at(
+            &activity_event("fn:src/x.rs:bar", "agent-recent", 200),
+            t_recent,
+        );
+        // pid 300 — active: touched at `now` (age 0), never flipped, never reclaimed.
+        let _ = graph.apply_clv_at(&activity_event("fn:src/x.rs:baz", "agent-live", 300), now);
+
+        // Flip the two quiet processes to `inactive` (100 and 200); 300 stays active.
+        let _ = graph.expire_idle(now);
+        assert_eq!(
+            graph.roster.get(&100).map(|a| a.status.as_str()),
+            Some("inactive"),
+            "precondition: pid 100 is inactive before reclaim, got {:?}",
+            graph.roster.get(&100)
+        );
+        assert_eq!(
+            graph.roster.get(&200).map(|a| a.status.as_str()),
+            Some("inactive"),
+            "precondition: pid 200 is inactive before reclaim, got {:?}",
+            graph.roster.get(&200)
+        );
+
+        // Reclaim: only pid 100 (inactive AND older than the retention window) is
+        // dropped from BOTH maps; 200 (recently-inactive) and 300 (active) remain.
+        let _ = graph.reclaim_inactive(now);
+
+        assert!(
+            !graph.roster.contains_key(&100),
+            "long-idle inactive pid 100 must be removed from the roster"
+        );
+        assert!(
+            !graph.last_seen.contains_key(&100),
+            "long-idle inactive pid 100 must be removed from last_seen too"
+        );
+        assert!(
+            graph.roster.contains_key(&200),
+            "recently-inactive pid 200 (within retention) must NOT be reclaimed"
+        );
+        assert!(
+            graph.last_seen.contains_key(&200),
+            "recently-inactive pid 200's last_seen must remain"
+        );
+        assert_eq!(
+            graph.roster.get(&300).map(|a| a.status.as_str()),
+            Some("active"),
+            "active pid 300 must be left intact, got {:?}",
+            graph.roster.get(&300)
+        );
+        assert!(
+            graph.last_seen.contains_key(&300),
+            "active pid 300's last_seen must remain"
+        );
+    }
+
+    // ---- P9-1: Graph::from_records rehydration constructor ----
+
+    /// Models the load path for one file: parses `(path, src)` and strips each
+    /// node's `child_ids` (the unpersisted field `load_nodes` returns as `[]`), so
+    /// [`Graph::from_records`] must re-derive them from the `contains` edges (DD#7).
+    fn loaded_records(path: &str, src: &str) -> (Vec<Node>, Vec<Edge>) {
+        let parsed = parse_source(path, src);
+        let nodes = parsed
+            .nodes
+            .into_iter()
+            .map(|mut n| {
+                n.child_ids = Vec::new();
+                n
+            })
+            .collect();
+        (nodes, parsed.edges)
+    }
+
+    /// Normalises a `snapshot` envelope for order-independent comparison: nodes
+    /// sorted by id with each node's `child_ids` sorted, edges sorted by id.
+    fn normalised_snapshot(env: &EventEnvelope) -> (Vec<Node>, Vec<Edge>) {
+        let mut nodes = snapshot_nodes(env);
+        for n in &mut nodes {
+            n.child_ids.sort();
+        }
+        nodes.sort_by_key(|n| n.id.clone());
+        let mut edges = snapshot_edges(env);
+        edges.sort_by_key(|e| e.id.clone());
+        (nodes, edges)
+    }
+
+    #[test]
+    fn from_records_snapshot_equals_parsed_baseline() {
+        // AC#3: a graph rebuilt from loaded records (child_ids stripped) has a
+        // snapshot equal — order-independently, child_ids re-derived — to a graph
+        // that PARSED the same file.
+        let src = "fn alpha() { let x = 1; }\nfn beta() {}";
+
+        let mut baseline = Graph::new();
+        let _ = baseline.apply_parsed(parse_source("a.rs", src));
+
+        let (nodes, edges) = loaded_records("a.rs", src);
+        let rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        assert_eq!(
+            normalised_snapshot(&rebuilt.snapshot()),
+            normalised_snapshot(&baseline.snapshot()),
+            "rebuilt snapshot must equal the parsed-baseline snapshot"
+        );
+    }
+
+    #[test]
+    fn from_records_single_file_reparse_is_a_noop() {
+        // AC#3 load-bearing proof: after rebuilding from loaded records, re-parsing
+        // the SAME unchanged file emits no node.upsert/node.remove — proving the
+        // child_ids re-derivation and the file_nodes/file_edges rebuild are correct.
+        let src = "fn alpha() { let x = 1; }\nfn beta() {}";
+        let (nodes, edges) = loaded_records("a.rs", src);
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse of an unchanged file must be a no-op, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_multi_file_reparse_one_leaves_other_intact() {
+        // AC#4: rebuild from two files' records, re-parse ONE unchanged file → empty
+        // diff AND the other file's nodes are not removed.
+        let a_src = "fn alpha() { let x = 1; }";
+        let b_src = "fn beta() {}";
+
+        let (mut nodes, mut edges) = loaded_records("a.rs", a_src);
+        let (b_nodes, b_edges) = loaded_records("b.rs", b_src);
+        nodes.extend(b_nodes);
+        edges.extend(b_edges);
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", a_src));
+        assert!(
+            diff.is_empty(),
+            "reparse of unchanged a.rs must be a no-op, got {diff:?}"
+        );
+
+        // b.rs's nodes must survive the a.rs reparse (no cross-file removal).
+        let (b_children, _) = rebuilt.children_of("file:b.rs");
+        assert!(
+            b_children.iter().any(|n| n.id == "fn:b.rs:beta"),
+            "b.rs function must not be removed by reparsing a.rs, got {b_children:?}"
+        );
+        let roots = snapshot_nodes(&rebuilt.snapshot());
+        assert!(
+            roots.iter().any(|n| n.id == "file:b.rs"),
+            "b.rs file root must remain after reparsing a.rs, got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_reparse_noop_is_edge_order_independent() {
+        // Finding #2 regression: neither backend's `load_edges` has an `ORDER BY`, so
+        // the loaded edge order is arbitrary. `from_records` must derive `child_ids`
+        // canonically (sorted) — NOT in incidental edge order — or a differently-ordered
+        // child list makes a rebuilt node fail the byte-equality no-op check on reparse.
+        // The variable names (c, a, b) are deliberately out of source order so the sort
+        // genuinely reorders them; reversing the loaded edges before rebuilding proves
+        // the no-op holds regardless of edge order.
+        let src = "fn alpha() { let c = 1; let a = 2; let b = 3; }\nfn beta() {}";
+        let (nodes, mut edges) = loaded_records("a.rs", src);
+        edges.reverse();
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse must be a no-op regardless of loaded edge order, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn from_records_with_agent_overlay_reparse_emits_no_spurious_removal() {
+        // Finding #3 regression: `rebuild_file_tracking` must NOT absorb agent-layer
+        // overlays — the live `apply_clv` path never file-tracks an `agent` vertex or an
+        // `authored_by` edge. With both present in the loaded records (as a crash would
+        // have persisted them), reparsing the agent-touched source file unchanged must
+        // be a no-op — no spurious `node.remove`/`edge.remove` for the overlay.
+        let src = "fn alpha() { let x = 1; }";
+        let (mut nodes, mut edges) = loaded_records("a.rs", src);
+
+        // The agent overlay `apply_clv` would have produced + persisted: a root agent
+        // vertex and an `authored_by` edge from the touched function to it.
+        let agent_vertex = agent_node_id("tdd-green");
+        nodes.push(Node {
+            id: agent_vertex.clone(),
+            node_type: NodeType::Agent,
+            label: "tdd-green".to_string(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            status: NodeStatus::Unknown,
+            docs: None,
+            signature: None,
+            meta: None,
+        });
+        let authored_by_id = typed_edge_id("fn:a.rs:alpha", &agent_vertex, EdgeKind::AuthoredBy);
+        edges.push(Edge {
+            id: authored_by_id.clone(),
+            source: "fn:a.rs:alpha".to_string(),
+            target: agent_vertex.clone(),
+            kind: EdgeKind::AuthoredBy,
+            hot: false,
+        });
+
+        let mut rebuilt = Graph::from_records("sess-local", nodes, edges);
+
+        let diff = rebuilt.apply_parsed(parse_source("a.rs", src));
+        assert!(
+            diff.is_empty(),
+            "reparse of an agent-touched file must not disturb the agent overlay, got {diff:?}"
+        );
+        // The overlay must survive the reparse (not removed as a vanished file element).
+        assert!(
+            rebuilt.edges.contains_key(&authored_by_id),
+            "the authored_by edge must survive the reparse"
+        );
+        assert!(
+            rebuilt.nodes.contains_key(&agent_vertex),
+            "the agent vertex must survive the reparse"
+        );
+    }
+
+    // ---- P9-4: self-observability metrics (deterministic builder + latency map) ----
+
+    /// Destructures a [`Payload::MetricsUpdate`] into
+    /// `(node_count, edge_count, memory_bytes, events_per_sec_milli, parse_latency)`,
+    /// panicking on any other payload — a test-only reader for the P9-4 metrics tests.
+    fn metrics_fields(payload: &Payload) -> (u64, u64, u64, u64, &[FileParseLatency]) {
+        match payload {
+            Payload::MetricsUpdate {
+                node_count,
+                edge_count,
+                memory_bytes,
+                events_per_sec_milli,
+                parse_latency,
+                ..
+            } => (
+                *node_count,
+                *edge_count,
+                *memory_bytes,
+                *events_per_sec_milli,
+                parse_latency,
+            ),
+            other => panic!("expected MetricsUpdate payload, got {other:?}"),
+        }
+    }
+
+    /// P9-4 AC: `metrics_payload` is a deterministic builder. Given a known graph and
+    /// several recorded per-file latencies, it returns a [`Payload::MetricsUpdate`] whose
+    /// `node_count`/`edge_count` mirror the live graph, whose `memory_bytes` is a pure
+    /// function of state (identical across two calls), whose `events_per_sec_milli` is
+    /// exactly the value passed in, and whose `parse_latency` vec is identical across two
+    /// calls **including order** and ascending by `file_path`. Recording MORE THAN ONE
+    /// path makes the ordering a real variable, so this pins the builder's
+    /// `sort_by(file_path)` against `HashMap` iteration nondeterminism — dropping the sort
+    /// would leave raw map order and fail the expected-order assertion. No timers, no
+    /// sleeps — pure over graph state.
+    #[test]
+    fn metrics_payload_is_deterministic_and_reflects_the_graph() {
+        let mut graph = graph_with_function(); // file:a.rs + fn:a.rs:f
+                                               // Two+ distinct paths so the emitted order is not trivially a single element.
+        graph.record_parse_latency("a.rs", 1234);
+        graph.record_parse_latency("b.rs", 5678);
+        graph.record_parse_latency("c.rs", 42);
+
+        let first = graph.metrics_payload(4200);
+        let second = graph.metrics_payload(4200);
+
+        let (n1, e1, m1, eps1, lat1) = metrics_fields(&first);
+        let (n2, e2, m2, eps2, lat2) = metrics_fields(&second);
+
+        // Deterministic: identical graph state → identical scalar metrics every call.
+        assert_eq!(
+            m1, m2,
+            "memory_bytes must be a pure function of graph state"
+        );
+        assert_eq!(
+            (n1, e1, eps1),
+            (n2, e2, eps2),
+            "counts/throughput must be stable across calls"
+        );
+
+        // Counts mirror the live in-memory graph exactly.
+        assert_eq!(
+            n1,
+            graph.nodes.len() as u64,
+            "node_count must equal live nodes"
+        );
+        assert_eq!(
+            e1,
+            graph.edges.len() as u64,
+            "edge_count must equal live edges"
+        );
+        // Throughput is exactly the argument (events/sec ×1000).
+        assert_eq!(eps1, 4200, "events_per_sec_milli must echo the argument");
+
+        // The full parse_latency vec is identical across two calls, order included …
+        assert_eq!(
+            lat1, lat2,
+            "parse_latency must be byte-identical across calls, order included: {lat1:?} vs {lat2:?}"
+        );
+        // … and that order is exactly ascending by file_path. This locks the builder's
+        // `sort_by(file_path)`: without it, `lat1` would be raw HashMap order and fail.
+        let expected = [
+            FileParseLatency {
+                file_path: "a.rs".to_string(),
+                duration_us: 1234,
+            },
+            FileParseLatency {
+                file_path: "b.rs".to_string(),
+                duration_us: 5678,
+            },
+            FileParseLatency {
+                file_path: "c.rs".to_string(),
+                duration_us: 42,
+            },
+        ];
+        assert_eq!(
+            lat1,
+            expected.as_slice(),
+            "parse_latency must be sorted ascending by file_path: {lat1:?}"
+        );
+    }
+
+    /// P9-4: `metrics_envelope` is the retained public wrapper — it stamps a single clock
+    /// reading into BOTH the envelope's `ts` and the payload's `ts`, and otherwise mirrors
+    /// [`Graph::metrics_payload`]. Exercised directly so the retained seam stays covered
+    /// even though the metrics emitter now assembles envelopes off-lock via
+    /// [`Graph::metrics_snapshot`] + [`MetricsSnapshot::into_envelope`].
+    #[test]
+    fn metrics_envelope_stamps_one_timestamp_into_envelope_and_payload() {
+        let mut graph = graph_with_function(); // file:a.rs + fn:a.rs:f
+        graph.record_parse_latency("a.rs", 99);
+
+        let env = graph.metrics_envelope(1500);
+        assert_eq!(env.event_type, EventType::MetricsUpdate);
+        assert!(!env.ts.is_empty(), "the envelope ts must be stamped");
+        match &env.payload {
+            Payload::MetricsUpdate {
+                ts,
+                session_id,
+                node_count,
+                events_per_sec_milli,
+                ..
+            } => {
+                assert_eq!(*ts, env.ts, "payload ts must equal the envelope ts");
+                assert_eq!(
+                    *session_id, env.session_id,
+                    "payload session must match the envelope session"
+                );
+                assert_eq!(
+                    *node_count,
+                    graph.nodes.len() as u64,
+                    "node_count must mirror the live graph"
+                );
+                assert_eq!(
+                    *events_per_sec_milli, 1500,
+                    "events_per_sec_milli must echo the argument"
+                );
+            }
+            other => panic!("expected metrics.update, got {other:?}"),
+        }
+    }
+
+    /// P9-4 AC: `record_parse_latency` keeps the most-recent duration per repo-relative
+    /// path and is bounded by the distinct-file count. Re-recording a path overwrites
+    /// (the map stays size 1, latest value wins); a second distinct path grows it to 2.
+    #[test]
+    fn record_parse_latency_is_bounded_and_overwrites_per_path() {
+        let mut graph = Graph::new();
+        graph.record_parse_latency("a.rs", 100);
+        graph.record_parse_latency("a.rs", 250); // same path → overwrite, not append
+
+        let payload = graph.metrics_payload(0);
+        let (.., latency) = metrics_fields(&payload);
+        assert_eq!(
+            latency.len(),
+            1,
+            "re-parsing one path stays a single entry: {latency:?}"
+        );
+        assert_eq!(
+            latency[0].duration_us, 250,
+            "the latest recorded duration must win: {latency:?}"
+        );
+
+        graph.record_parse_latency("b.rs", 500); // a distinct path → bounded growth to 2
+        let payload = graph.metrics_payload(0);
+        let (.., latency) = metrics_fields(&payload);
+        assert_eq!(
+            latency.len(),
+            2,
+            "two distinct paths → two entries: {latency:?}"
+        );
+        assert!(latency
+            .iter()
+            .any(|f| f.file_path == "a.rs" && f.duration_us == 250));
+        assert!(latency
+            .iter()
+            .any(|f| f.file_path == "b.rs" && f.duration_us == 500));
     }
 }

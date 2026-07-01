@@ -45,7 +45,14 @@
 //!   `ROSTER_IDLE_MS` window, re-emitting the roster only when a status actually
 //!   changes (Phase 8). An unknown node/edge id, an unparsable hot-edge state, a
 //!   no-change heat transition, or an `activity` event missing its `agent`/`pid` is
-//!   a no-op (empty `Vec`).
+//!   a no-op (empty `Vec`). For Phase-9 self-observability it also exposes a metrics
+//!   surface: [`graph::Graph::record_parse_latency`] stamps each file's most-recent parse
+//!   `duration_us` into a distinct-file-bounded map, and [`graph::Graph::metrics_payload`]
+//!   / [`graph::Graph::metrics_envelope`] render a clock-free, deterministic
+//!   `metrics.update` (live node/edge counts, a pure `memoryBytes` estimate, events/sec,
+//!   and the sorted per-file latencies) — both built over a lock-light
+//!   [`graph::Graph::metrics_snapshot`] so the sort and clock stamp run off the graph
+//!   mutex.
 //! - [`tracing_layer`] — the Phase-6 runtime tracing emitter (the *write* side of
 //!   the hot-edge seam): [`tracing_layer::HotEdgeLayer`] is a `tracing` layer that
 //!   records an `edge` field off each span and emits a throttled `#CLV1` `hotedge`
@@ -77,7 +84,8 @@
 //! - [`watcher`] — a debounced `notify` filesystem watcher
 //!   ([`watcher::watch`]) that forwards changed source-file paths (Rust, Python,
 //!   or TypeScript, via [`watcher::is_source_file`]), coalescing rapid bursts
-//!   within [`watcher::DEBOUNCE`].
+//!   within [`watcher::DEBOUNCE`] and bounding sustained churn via a
+//!   [`watcher::MAX_DEBOUNCE`] cap.
 //! - [`ws`] — a `tokio-tungstenite` WebSocket server ([`ws::serve`]) that sends
 //!   each connecting client the current [`graph::Graph`] root-only `snapshot` and
 //!   then streams broadcast [`wire::EventEnvelope`]s, replying to a client
@@ -86,7 +94,12 @@
 //! - [`app`] — the wiring entry point [`run`] that joins watcher → parser →
 //!   graph → WebSocket so editing a source file (Rust, Python, or TypeScript)
 //!   updates a connected client's graph live, and spawns the [`collector`] task so
-//!   tailed CLV `test`/`status` events recolour nodes on that same live graph.
+//!   tailed CLV `test`/`status` events recolour nodes on that same live graph. It also
+//!   spawns the Phase-9 self-observability metrics emitter: a task ticking on
+//!   [`app::RunConfig::metrics_interval`] that counts each window's broadcast throughput
+//!   (its own `metrics.update`s excluded) and broadcasts a `metrics.update` — assembled
+//!   off-lock from a brief [`graph::Graph::metrics_snapshot`] — with the live counts, a
+//!   deterministic memory estimate, events/sec, and per-file parse latencies.
 
 pub mod app;
 pub mod clv;

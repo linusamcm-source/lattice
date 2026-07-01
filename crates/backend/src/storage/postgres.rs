@@ -53,6 +53,17 @@
 //! Only a typed [`EventEnvelope`] reaches [`PostgresStore::persist`] — raw stdout is
 //! never persisted (§B.5).
 //!
+//! **Read side (story P9-1).** [`PostgresStore::load_nodes`] /
+//! [`PostgresStore::load_edges`] are the Postgres twins of the SQLite read methods —
+//! same column reconstruction, differing only in the `$1` bind — feeding the
+//! crash-rebuild warm start ([`crate::graph::Graph::from_records`]). The Docker-gated
+//! `pg_load_nodes_edges_parity_with_sqlite` test exercises them **directly**: it persists
+//! a parsed multi-file set through both backends, then asserts `load_nodes`/`load_edges`
+//! return byte-equal reconstructed nodes (`id`/`type`/`label`/`parentId`/`status`/
+//! `signature`/`meta`) and edges (`source`/`target`/`kind`) across Postgres and SQLite.
+//! The separate `pg_parity_with_sqlite` harness covers the **write** side via row counts.
+//! Both are skipped when `LATTICE_TEST_PG` is unset, so `just qg` is green with no daemon.
+//!
 //! **Live Docker-Postgres parity run (acceptance).** The parity integration test is
 //! `#[ignore]`-by-default and additionally gated on the `LATTICE_TEST_PG` env var
 //! (a `postgres://…` URL), so `just qg` is fully green with **no daemon**. To run it
@@ -75,7 +86,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{Storage, StorageError};
-use crate::wire::{AgentInfo, EventEnvelope, HotEdgeState, Payload};
+use crate::wire::{AgentInfo, Edge, EventEnvelope, HotEdgeState, Node, Payload};
 
 /// The §B.6 schema in **Postgres dialect**, as idempotent `CREATE … IF NOT EXISTS`
 /// statements (decision-2).
@@ -213,6 +224,17 @@ const SQL_UPSERT_EDGE: &str = "INSERT INTO edges (id, session_id, source, target
        target = excluded.target,
        kind = excluded.kind,
        hot = excluded.hot";
+
+/// Selects a session's `nodes` rows for the P9-1 crash-rebuild read path; 1 bind. The
+/// column order matches the [`Node`] reconstruction tuple in [`PostgresStore::load_nodes`].
+const SQL_SELECT_NODES: &str =
+    "SELECT id, type, label, parent_id, status, docs, signature_json, meta_json
+     FROM nodes WHERE session_id = $1";
+
+/// Selects a session's `edges` rows for the P9-1 crash-rebuild read path; 1 bind. The
+/// column order matches the [`Edge`] reconstruction tuple in [`PostgresStore::load_edges`].
+const SQL_SELECT_EDGES: &str =
+    "SELECT id, source, target, kind, hot FROM edges WHERE session_id = $1";
 
 /// Deletes a node by id (`node.remove`); 1 bind.
 const SQL_DELETE_NODE: &str = "DELETE FROM nodes WHERE id = $1";
@@ -464,6 +486,9 @@ impl Storage for PostgresStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::MetricsUpdate { .. } => {
+                // Self-observability metrics are ephemeral — persist nothing (§B.5).
+            }
             Payload::AgentActivity {
                 agent_id,
                 action,
@@ -514,6 +539,69 @@ impl Storage for PostgresStore {
             .await?;
         Ok(())
     }
+
+    /// Loads every `nodes` row for `session_id` — the Postgres twin of
+    /// [`SqliteStore::load_nodes`](super::sqlite::SqliteStore::load_nodes), differing
+    /// only in the `$1` bind. Reconstructs each [`Node`] from the columns the
+    /// `node.upsert` write arm bound; `type`/`status` parse back via
+    /// [`wire_enum_from_str`] and `signature`/`meta` via [`parse_json_column`].
+    /// **`child_ids` is unpersisted** and loads empty (re-derived by
+    /// [`crate::graph::Graph::from_records`], Design Decision #7). Never panics on
+    /// malformed stored data.
+    async fn load_nodes(&self, session_id: &str) -> Result<Vec<Node>, StorageError> {
+        let rows: Vec<(
+            String,         // id
+            String,         // type
+            String,         // label
+            Option<String>, // parent_id
+            String,         // status
+            Option<String>, // docs
+            Option<String>, // signature_json
+            Option<String>, // meta_json
+        )> = sqlx::query_as(SQL_SELECT_NODES)
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut nodes = Vec::with_capacity(rows.len());
+        for (id, node_type, label, parent_id, status, docs, signature_json, meta_json) in rows {
+            nodes.push(Node {
+                id,
+                node_type: wire_enum_from_str(&node_type)?,
+                label,
+                parent_id,
+                child_ids: Vec::new(),
+                status: wire_enum_from_str(&status)?,
+                docs,
+                signature: parse_json_column(signature_json.as_deref())?,
+                meta: parse_json_column(meta_json.as_deref())?,
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Loads every `edges` row for `session_id` — the Postgres twin of
+    /// [`SqliteStore::load_edges`](super::sqlite::SqliteStore::load_edges). `kind`
+    /// parses back via [`wire_enum_from_str`] and `hot` decodes from the `BOOLEAN`
+    /// column. Never panics on malformed stored data.
+    async fn load_edges(&self, session_id: &str) -> Result<Vec<Edge>, StorageError> {
+        let rows: Vec<(String, String, String, String, bool)> = sqlx::query_as(SQL_SELECT_EDGES)
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut edges = Vec::with_capacity(rows.len());
+        for (id, source, target, kind, hot) in rows {
+            edges.push(Edge {
+                id,
+                source,
+                target,
+                kind: wire_enum_from_str(&kind)?,
+                hot,
+            });
+        }
+        Ok(edges)
+    }
 }
 
 /// Serialises a small CLV enum (e.g. `NodeType`, `NodeStatus`, `TestOutcome`,
@@ -528,6 +616,30 @@ fn wire_enum_str<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(serde_json::Value::String(s)) => s,
         _ => String::new(),
+    }
+}
+
+/// Parses a stored canonical wire string back into its CLV enum — the inverse of
+/// [`wire_enum_str`] used by the P9-1 load path. A local twin of the SQLite backend's
+/// helper (kept per-module so this story does not couple the two backends). An
+/// unrecognised value yields a [`StorageError::Config`] rather than panicking.
+fn wire_enum_from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, StorageError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|err| StorageError::Config(format!("unrecognised wire enum value '{s}': {err}")))
+}
+
+/// Deserialises an optional JSON TEXT column (`signature_json` / `meta_json`) back to
+/// its typed value for the P9-1 load path: `Ok(None)` for a NULL column and a
+/// [`StorageError::Config`] (never a panic) for malformed JSON. A local twin of the
+/// SQLite backend's helper.
+fn parse_json_column<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+) -> Result<Option<T>, StorageError> {
+    match raw {
+        Some(text) => serde_json::from_str(text)
+            .map(Some)
+            .map_err(|err| StorageError::Config(format!("corrupt JSON column '{text}': {err}"))),
+        None => Ok(None),
     }
 }
 
@@ -961,6 +1073,28 @@ mod tests {
         }
     }
 
+    /// Wraps `node` in a `node.upsert` envelope under `session` (P9-1 read-parity).
+    fn node_upsert_for(session: &str, node: Node) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::NodeUpsert,
+            payload: Payload::NodeUpsert { node },
+        }
+    }
+
+    /// Wraps `edge` in an `edge.upsert` envelope under `session` (P9-1 read-parity).
+    fn edge_upsert_for(session: &str, edge: Edge) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::EdgeUpsert,
+            payload: Payload::EdgeUpsert { edge },
+        }
+    }
+
     async fn pg_count(pool: &PgPool, table: &str) -> i64 {
         // `table` is a fixed test constant, never user input.
         sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
@@ -1261,5 +1395,134 @@ mod tests {
             pg_status, sqlite_status,
             "agent status after activity must match across both backends"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via LATTICE_TEST_PG (Docker); run with --ignored"]
+    async fn pg_load_nodes_edges_parity_with_sqlite() {
+        // Finding #1 (P9-1 read path): load_nodes/load_edges must return identical
+        // reconstructed nodes/edges across Postgres and SQLite for the SAME persisted
+        // multi-file source set. Gated exactly like the write-side parity test: SKIPPED
+        // by `cargo test` (`#[ignore]`) and a no-op when `LATTICE_TEST_PG` is unset, so
+        // `just qg` is green with no Docker daemon.
+        use super::super::sqlite::SqliteStore;
+        use crate::parser::parse_source;
+
+        let pg_url = match std::env::var("LATTICE_TEST_PG") {
+            Ok(u) if !u.trim().is_empty() => u,
+            _ => {
+                eprintln!("skipped: LATTICE_TEST_PG unset — Postgres load parity not run");
+                return;
+            }
+        };
+
+        // --- Postgres side: open, reset to a clean schema. ---
+        let pg = PostgresStore::connect(&pg_url)
+            .await
+            .expect("connect Postgres");
+        sqlx::query(
+            "DROP TABLE IF EXISTS test_results, agent_activity, protocol_versions, nodes, edges, agents, sessions CASCADE",
+        )
+        .execute(&pg.pool)
+        .await
+        .expect("reset Postgres schema");
+        pg.ensure_schema().await.expect("pg ensure_schema");
+
+        // --- SQLite side: a fresh tempfile DB with the same schema. ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite_url = format!("sqlite://{}", dir.path().join("load_parity.db").display());
+        let sqlite = SqliteStore::connect(&sqlite_url)
+            .await
+            .expect("connect SQLite");
+        sqlite.ensure_schema().await.expect("sqlite ensure_schema");
+
+        // Persist a parsed multi-file set (functions, variables, contains + derived
+        // edges, signature/meta) through BOTH backends under one session.
+        let sources = [
+            (
+                "a.rs",
+                "fn alpha() { let x = 1; let y = beta(); }\nfn beta() -> i32 { 0 }",
+            ),
+            ("b.rs", "fn gamma() {}"),
+        ];
+        for (path, src) in sources {
+            let parsed = parse_source(path, src);
+            for node in parsed.nodes {
+                let env = node_upsert_for("sess-1", node);
+                pg.persist(&env).await.expect("pg node persist");
+                sqlite.persist(&env).await.expect("sqlite node persist");
+            }
+            for edge in parsed.edges {
+                let env = edge_upsert_for("sess-1", edge);
+                pg.persist(&env).await.expect("pg edge persist");
+                sqlite.persist(&env).await.expect("sqlite edge persist");
+            }
+        }
+
+        // --- Node read parity (load order is unspecified — sort by id first). ---
+        let mut pg_nodes = pg.load_nodes("sess-1").await.expect("pg load_nodes");
+        let mut sqlite_nodes = sqlite
+            .load_nodes("sess-1")
+            .await
+            .expect("sqlite load_nodes");
+        pg_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        sqlite_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert!(
+            !pg_nodes.is_empty(),
+            "the fixture must persist at least one node"
+        );
+        assert_eq!(
+            pg_nodes.len(),
+            sqlite_nodes.len(),
+            "node count must match across backends"
+        );
+        for (p, s) in pg_nodes.iter().zip(&sqlite_nodes) {
+            assert_eq!(p.id, s.id, "node id parity");
+            assert_eq!(p.node_type, s.node_type, "node type parity for {}", p.id);
+            assert_eq!(p.label, s.label, "node label parity for {}", p.id);
+            assert_eq!(
+                p.parent_id, s.parent_id,
+                "node parentId parity for {}",
+                p.id
+            );
+            assert_eq!(p.status, s.status, "node status parity for {}", p.id);
+            assert_eq!(
+                p.signature, s.signature,
+                "node signature parity for {}",
+                p.id
+            );
+            assert_eq!(p.meta, s.meta, "node meta parity for {}", p.id);
+            assert!(
+                p.child_ids.is_empty(),
+                "child_ids is unpersisted and must load empty for {}",
+                p.id
+            );
+        }
+
+        // --- Edge read parity. ---
+        let mut pg_edges = pg.load_edges("sess-1").await.expect("pg load_edges");
+        let mut sqlite_edges = sqlite
+            .load_edges("sess-1")
+            .await
+            .expect("sqlite load_edges");
+        pg_edges.sort_by(|a, b| a.id.cmp(&b.id));
+        sqlite_edges.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert!(
+            !pg_edges.is_empty(),
+            "the fixture must persist at least one edge"
+        );
+        assert_eq!(
+            pg_edges.len(),
+            sqlite_edges.len(),
+            "edge count must match across backends"
+        );
+        for (p, s) in pg_edges.iter().zip(&sqlite_edges) {
+            assert_eq!(p.id, s.id, "edge id parity");
+            assert_eq!(p.source, s.source, "edge source parity for {}", p.id);
+            assert_eq!(p.target, s.target, "edge target parity for {}", p.id);
+            assert_eq!(p.kind, s.kind, "edge kind parity for {}", p.id);
+        }
     }
 }

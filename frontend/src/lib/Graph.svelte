@@ -3,11 +3,13 @@
 
 	On mount the canvas shows only top-level (root) CLV nodes from the `nodes`
 	store. Each node carries an expand/collapse affordance; expanding a node adds
-	its id to an explicit `expanded` Set<string> and invokes `onExpand` (default:
-	`requestExpand` over the injected `socket`), and once the `subtree` reply has
-	merged the children into the store they render. Collapsing removes the id from
-	the set and calls `collapse`, discarding the node's transitive descendants
-	from the store. `expanded` is the render-side zoom gate: a function's
+	its id to an explicit `expanded` Set<string> and invokes the `onExpand` prop
+	(the index route routes it through the resilient `WsClient.requestExpand`), and
+	once the `subtree` reply has merged the children into the store they render.
+	Collapsing removes the node's id **and its transitive descendant ids**
+	(`descendantIds`) from the set and calls `collapse`, discarding the node's
+	transitive descendants from the store — so no stale descendant id lingers in
+	`expanded` for a later reconnect resync to re-expand. `expanded` is the render-side zoom gate: a function's
 	`variable` children render only when the function's id is in the set, even if
 	those variables already live in the store. The canvas mounts only after
 	`onMount` so SvelteKit prerender/SSR never instantiates the browser-only
@@ -36,10 +38,24 @@
 	(`agentsForNode`), or clears the highlight when the node has no author. The
 	highlight is also dropped when the agent layer is toggled off.
 
+	P9-5 adds a self-observability **Metrics** toggle (default off) that mounts a
+	`MetricsPanel` beside the roster/sidebar, rendering the latest `metrics.update`
+	snapshot (node/edge counts, memory, events/sec, per-file parse latency) from the
+	derived `metrics` store.
+
+	P9-6 surfaces the socket lifecycle: a small "reconnecting" badge (driven by the
+	`connectionStatus` store) appears whenever the socket is not `open`, so the user
+	sees a resync in flight and it clears on recovery. The render-side `expanded` set
+	is a `$bindable` prop so the index route can read it for the reconnect resync —
+	user expansions are routed exclusively through the route's stable
+	`WsClient.requestExpand` handle (via `onExpand`), never a one-shot socket captured
+	before a drop (the removed `socket` prop was that foot-gun).
+
 	@component
 -->
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
 	import {
 		SvelteFlow,
 		Background,
@@ -47,37 +63,47 @@
 		type Edge as FlowEdge
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { nodes, edges, agents, graphStore, requestExpand, collapse } from './ws';
+	import {
+		nodes,
+		edges,
+		agents,
+		metrics,
+		graphStore,
+		collapse,
+		descendantIds,
+		connectionStatus
+	} from './ws';
 	import { buildHierarchy, buildEdges, nodesAuthoredBy, agentsForNode } from './layout';
 	import HierarchyNode from './HierarchyNode.svelte';
 	import Sidebar from './Sidebar.svelte';
 	import RosterPanel from './RosterPanel.svelte';
+	import MetricsPanel from './MetricsPanel.svelte';
 
 	/** Public props for the lazy hierarchy canvas. */
 	interface GraphProps {
 		/**
-		 * Live WebSocket used by the default {@link GraphProps.onExpand} handler to
-		 * request a node's subtree. The index route wires the connected socket;
-		 * tests that inject `onExpand` can omit it.
-		 */
-		socket?: WebSocket;
-		/**
-		 * Expand handler invoked with a node's id when the user expands it. Defaults
-		 * to `requestExpand(socket, nodeId)` against {@link GraphProps.socket} so the
-		 * backend replies with that node's subtree; tests inject a spy. Collapsing is
-		 * always handled internally via `collapse` and never calls this.
+		 * Expand handler invoked with a node's id when the user expands it. The index
+		 * route routes it through the resilient `WsClient.requestExpand` handle so the
+		 * backend replies with that node's subtree; tests inject a spy. Omitted =
+		 * expansion is a local render-only toggle. Collapsing is always handled
+		 * internally via `collapse` and never calls this.
 		 */
 		onExpand?: (nodeId: string) => void;
+		/**
+		 * The render-side open-node set (the zoom gate). `$bindable` so the index
+		 * route can read it for the reconnect resync — on a re-open the WS client
+		 * re-expands exactly the ids still in this set. Defaults to an empty set for
+		 * standalone/test renders.
+		 */
+		expanded?: Set<string>;
 	}
 
-	let { socket, onExpand }: GraphProps = $props();
+	let { onExpand, expanded = $bindable(new Set<string>()) }: GraphProps = $props();
 
 	/** Registers the `hierarchy` custom node so labels carry an expand affordance. */
 	const nodeTypes = { hierarchy: HierarchyNode };
 
 	let mounted = $state(false);
-	/** Ids of nodes whose children are currently revealed (the render-side zoom gate). */
-	let expanded = $state(new Set<string>());
 	/** Id of the node whose details are shown in the sidebar (`undefined` = none). */
 	let selected = $state<string | undefined>(undefined);
 	/** Drilled-in agentId for the agent↔code highlight (`undefined` = none). */
@@ -88,6 +114,8 @@
 	let dataFlow = $state(true);
 	/** Whether the Phase-8 agent layer (agent nodes + `authored_by` edges) is shown. Default off. */
 	let showAgents = $state(false);
+	/** Whether the Phase-9 self-observability metrics panel is shown. Default off. */
+	let showMetrics = $state(false);
 	let flowNodes = $state.raw<FlowNode[]>([]);
 	let flowEdges = $state.raw<FlowEdge[]>([]);
 
@@ -137,9 +165,13 @@
 	);
 
 	/**
-	 * Toggle a node's expansion. Expanding reveals the node's children and, by
-	 * default, requests its subtree over the live socket; collapsing hides them and
-	 * discards the node's transitive descendants from the store to bound memory.
+	 * Toggle a node's expansion. Expanding reveals the node's children and requests
+	 * its subtree via `onExpand`; collapsing hides them and discards the node's
+	 * transitive descendants from the store to bound memory. On collapse the node's
+	 * id **and every transitive descendant id** (`descendantIds`, read from the
+	 * pre-collapse store) are dropped from `expanded`, so a nested collapse leaves no
+	 * stale descendant for a later reconnect resync to re-expand into invisible
+	 * orphans.
 	 *
 	 * @param nodeId - the id of the node whose affordance was activated.
 	 */
@@ -147,13 +179,13 @@
 		const next = new Set(expanded);
 		if (next.has(nodeId)) {
 			next.delete(nodeId);
+			for (const id of descendantIds(get(graphStore), nodeId)) next.delete(id);
 			expanded = next;
 			graphStore.update((state) => collapse(state, nodeId));
 		} else {
 			next.add(nodeId);
 			expanded = next;
-			if (onExpand) onExpand(nodeId);
-			else if (socket) requestExpand(socket, nodeId);
+			onExpand?.(nodeId);
 		}
 	}
 
@@ -184,6 +216,22 @@
 
 <div class="flex h-full w-full">
 	<div class="relative h-full flex-1">
+		{#if $connectionStatus !== 'open'}
+			<!-- P9-6 reconnecting indicator: visible whenever the socket is not open, so the
+			     user sees the resync in flight; it clears the moment the socket recovers. -->
+			<div
+				data-testid="connection-status"
+				role="status"
+				class="absolute right-3 top-3 z-10 flex items-center gap-2 rounded-md border border-amber-400 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-900 shadow-sm dark:border-amber-500 dark:bg-amber-950 dark:text-amber-100"
+			>
+				<span class="h-2 w-2 animate-pulse rounded-full bg-amber-500" aria-hidden="true"></span>
+				{$connectionStatus === 'reconnecting'
+					? 'Reconnecting…'
+					: $connectionStatus === 'connecting'
+						? 'Connecting…'
+						: 'Disconnected'}
+			</div>
+		{/if}
 		{#if mounted}
 			<SvelteFlow
 				{nodeTypes}
@@ -212,6 +260,10 @@
 					<input type="checkbox" class="accent-violet-500" bind:checked={showAgents} />
 					Agent layer
 				</label>
+				<label class="flex items-center gap-2">
+					<input type="checkbox" class="accent-emerald-500" bind:checked={showMetrics} />
+					Metrics
+				</label>
 			</fieldset>
 		{/if}
 	</div>
@@ -222,6 +274,9 @@
 			authoredCount={authoredNodeIds.size}
 			onSelect={selectAgent}
 		/>
+	{/if}
+	{#if showMetrics}
+		<MetricsPanel metrics={$metrics} />
 	{/if}
 	<Sidebar selected={selectedNode} />
 </div>

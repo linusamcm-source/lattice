@@ -1,8 +1,9 @@
 /**
  * CLV wire schema — TypeScript mirror of `docs/orignal_specs/DATA_MODEL.md` §A.2–A.5
  * plus the Phase 0 wire payload contract, the Phase 5 `test.result`/`status.update`
- * event payloads, the Phase 6 `hot_edge` runtime-call-path payload, and the Phase 8
- * `agent.roster`/`agent.activity` agent-layer payloads.
+ * event payloads, the Phase 6 `hot_edge` runtime-call-path payload, the Phase 8
+ * `agent.roster`/`agent.activity` agent-layer payloads, and the Phase 9
+ * `metrics.update` self-observability payload.
  *
  * This is the single, `any`-free source of truth the WebSocket boundary parses into.
  * JSON keys are camelCase exactly as they arrive on the wire (`parentId`, `childIds`,
@@ -215,6 +216,35 @@ export interface AgentRosterPayload {
 	agents: AgentInfo[];
 }
 
+/**
+ * Phase 9 `metrics.update` per-file parse latency row (DATA_MODEL §A.5) — the
+ * time `parse_source` spent lowering one file, in microseconds. Field spelling
+ * mirrors the Rust `FileParseLatency` wire struct (camelCase) exactly.
+ */
+export interface FileParseLatency {
+	filePath: string;
+	durationUs: number;
+}
+
+/**
+ * Phase 9 `metrics.update` payload (DATA_MODEL §A.5) — the self-observability
+ * snapshot the backend emitter broadcasts on a fixed interval. All counters are
+ * integers (the Rust `Payload` derives `Eq`): `nodeCount`/`edgeCount` are the live
+ * graph sizes, `memoryBytes` is a deterministic estimate of the in-memory map
+ * footprint, and `eventsPerSecMilli` is broadcast throughput ×1000 (so `/1000`
+ * yields events/sec). `parseLatency` lists the most-recent per-file parse cost.
+ * Field spelling mirrors the Rust `Payload::MetricsUpdate` wire struct exactly.
+ */
+export interface MetricsUpdatePayload {
+	sessionId: string;
+	ts: string;
+	nodeCount: number;
+	edgeCount: number;
+	memoryBytes: number;
+	eventsPerSecMilli: number;
+	parseLatency: FileParseLatency[];
+}
+
 /** Fields shared by every {@link EventEnvelope} variant (DATA_MODEL §A.4). */
 export interface EnvelopeBase {
 	v: 1;
@@ -238,7 +268,8 @@ export type EventEnvelope =
 	| (EnvelopeBase & { type: 'status.update'; payload: StatusUpdatePayload })
 	| (EnvelopeBase & { type: 'hot_edge'; payload: HotEdgePayload })
 	| (EnvelopeBase & { type: 'agent.roster'; payload: AgentRosterPayload })
-	| (EnvelopeBase & { type: 'agent.activity'; payload: AgentActivityPayload });
+	| (EnvelopeBase & { type: 'agent.activity'; payload: AgentActivityPayload })
+	| (EnvelopeBase & { type: 'metrics.update'; payload: MetricsUpdatePayload });
 
 /** The set of envelope `type` discriminants this Phase 0 client understands. */
 export type EventType = EventEnvelope['type'];

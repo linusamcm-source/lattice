@@ -50,3 +50,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` enables paused-clock control (`start_paused`) for deterministic
+# timer-driven debounce tests; features unify with the main tokio entry, so this
+# stays out of non-test builds.
+tokio = { version = "1", features = ["test-util"] }

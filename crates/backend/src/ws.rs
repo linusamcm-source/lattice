@@ -4,12 +4,15 @@
 //! [`BoundServer`] exposing the **actual** bound address (so a test may pass
 //! `127.0.0.1:0` and read back the ephemeral port) plus a shutdown handle. Each
 //! accepted connection is handled independently and panic-free: the per-connection
-//! task first sends the current graph (root-only) `snapshot`, then forwards every
+//! task first sends the current graph (root-only) `snapshot`, then — when the graph
+//! has a non-empty roster — an `agent.roster` trailer carrying the live agent layer
+//! (P9-7, [`Graph::roster_snapshot`](crate::graph::Graph::roster_snapshot)), so a
+//! mid-run connect sees agent nodes *and* their roster. It then forwards every
 //! [`EventEnvelope`](crate::wire::EventEnvelope) published on the shared
 //! [`broadcast`] channel as JSON text, while concurrently honouring two client
-//! requests — `{"type":"snapshot"}` with a fresh snapshot and
-//! `{"type":"expand","nodeId":...}` with that node's `subtree` (its direct
-//! children), the Phase-1 lazy-hierarchy load path.
+//! requests — `{"type":"snapshot"}` with a fresh snapshot (again trailed by the
+//! roster when non-empty) and `{"type":"expand","nodeId":...}` with that node's
+//! `subtree` (its direct children), the Phase-1 lazy-hierarchy load path.
 //!
 //! Per `AGENT_PROTOCOL.md` §6 nothing here unwraps on bad input: a client that
 //! closes, errors, or lags simply drops out of the fan-out without disturbing the
@@ -117,9 +120,12 @@ pub async fn serve(
 ///
 /// Upgrades `stream` to a WebSocket, subscribes to `events` **before** sending the
 /// initial snapshot (so a client that has received the snapshot is guaranteed to be
-/// in the fan-out and will miss no subsequent broadcast), then loops: forwarding
-/// each broadcast [`EventEnvelope`] as JSON text and replying to client requests —
-/// `{"type":"snapshot"}` with a fresh root-only snapshot and
+/// in the fan-out and will miss no subsequent broadcast), then — when the graph has
+/// a non-empty roster — sends an `agent.roster` trailer built from
+/// [`Graph::roster_snapshot`] (P9-7), so the connect delivers the agent layer as
+/// well as the tree. It then loops: forwarding each broadcast [`EventEnvelope`] as
+/// JSON text and replying to client requests — `{"type":"snapshot"}` with a fresh
+/// root-only snapshot **followed by the same roster trailer** when non-empty, and
 /// `{"type":"expand","nodeId":...}` with that node's `subtree`. Returns when the
 /// client closes or errors, or the broadcast channel closes. Lagged broadcasts are
 /// skipped rather than fatal.
@@ -136,6 +142,19 @@ async fn handle_connection(
     write
         .send(Message::text(serde_json::to_string(&snapshot)?))
         .await?;
+
+    // P9-7: trail the root-only snapshot with the live roster (Design Decision #4)
+    // when the graph has rostered agents, so a mid-run connect sees agent nodes
+    // *and* their roster rather than an empty one. Benign duplicate: if an activity
+    // lands between `subscribe` (above) and this read, the client may receive the
+    // roster once here and again as the buffered broadcast — harmless, since the
+    // frontend reducer replaces the roster wholesale.
+    let roster = graph.lock().await.roster_snapshot();
+    if let Some(roster) = roster {
+        write
+            .send(Message::text(serde_json::to_string(&roster)?))
+            .await?;
+    }
 
     loop {
         tokio::select! {
@@ -157,6 +176,15 @@ async fn handle_connection(
                             write
                                 .send(Message::text(serde_json::to_string(&snapshot)?))
                                 .await?;
+                            // P9-7: a resync repeats the connect-time snapshot→roster
+                            // trailer pair, so a reconnecting client re-hydrates the
+                            // agent layer with the current roster.
+                            let roster = graph.lock().await.roster_snapshot();
+                            if let Some(roster) = roster {
+                                write
+                                    .send(Message::text(serde_json::to_string(&roster)?))
+                                    .await?;
+                            }
                         } else if let Some(node_id) = expand_request_node_id(text) {
                             let subtree = graph.lock().await.subtree(&node_id);
                             write
@@ -211,6 +239,7 @@ fn expand_request_node_id(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clv::ClvEvent;
     use crate::wire::{EventType, Node, NodeStatus, NodeType, Payload};
     use std::time::Duration;
     use tokio::time::timeout;
@@ -247,6 +276,27 @@ mod tests {
 
     async fn start() -> (BoundServer, broadcast::Sender<EventEnvelope>) {
         let graph = Arc::new(Mutex::new(Graph::new()));
+        let (tx, _rx) = broadcast::channel(16);
+        let server = serve("127.0.0.1:0".parse().unwrap(), graph, tx.clone())
+            .await
+            .expect("server binds");
+        (server, tx)
+    }
+
+    /// A roster-carrying variant of [`start`]: seeds one active agent into the
+    /// graph's roster via the Phase-8 activity path (`apply_clv`) **before**
+    /// serving, so a connecting client exercises the P9-7 snapshot+roster trailer.
+    async fn start_with_roster() -> (BoundServer, broadcast::Sender<EventEnvelope>) {
+        let mut graph = Graph::new();
+        let _ = graph.apply_clv(&ClvEvent::Activity {
+            session: "s1".to_string(),
+            pid: Some(48213),
+            agent: Some("tdd-green".to_string()),
+            msg: Some("touched".to_string()),
+            node: "fn:src/x.rs:foo".to_string(),
+            action: "modified".to_string(),
+        });
+        let graph = Arc::new(Mutex::new(graph));
         let (tx, _rx) = broadcast::channel(16);
         let server = serve("127.0.0.1:0".parse().unwrap(), graph, tx.clone())
             .await
@@ -416,6 +466,119 @@ mod tests {
                 );
             }
             other => panic!("expected subtree payload, got {other:?}"),
+        }
+
+        server.shutdown().await;
+    }
+
+    // ---- P9-7: snapshot/resync carries roster state (Design Decision #4) ----
+    //
+    // RED until P9-7 lands: `handle_connection` sends only the root-only snapshot,
+    // never the `agent.roster` trailer, so `connect_sends_snapshot_then_roster*`
+    // and the resync variant fail (the roster trailer is absent). The whole test
+    // binary is additionally blocked at compile time by the missing
+    // `Graph::roster_snapshot` in the graph.rs P9-7 tests (same lib crate).
+
+    /// On connect against a non-empty roster the client receives the `snapshot`
+    /// first, then an `agent.roster` trailer carrying every seeded roster entry.
+    #[tokio::test]
+    async fn connect_sends_snapshot_then_roster_when_roster_non_empty() {
+        let (server, _tx) = start_with_roster().await;
+        let mut ws = connect(server.addr).await;
+
+        let first = next_envelope(&mut ws).await;
+        assert_eq!(
+            first.event_type,
+            EventType::Snapshot,
+            "the first message is the snapshot, got {first:?}"
+        );
+
+        let second = next_envelope(&mut ws).await;
+        assert_eq!(
+            second.event_type,
+            EventType::AgentRoster,
+            "the second message is the agent.roster trailer, got {second:?}"
+        );
+        match second.payload {
+            Payload::AgentRoster { agents, .. } => assert!(
+                agents
+                    .iter()
+                    .any(|a| a.agent_id == "tdd-green" && a.process_id == 48213),
+                "the trailer carries every seeded roster entry, got {agents:?}"
+            ),
+            other => panic!("expected agent.roster payload, got {other:?}"),
+        }
+
+        server.shutdown().await;
+    }
+
+    /// Regression: an empty roster emits **no** trailing `agent.roster` — the
+    /// message after the snapshot is the normal broadcast, never a spurious roster.
+    #[tokio::test]
+    async fn connect_against_empty_roster_sends_no_roster_trailer() {
+        let (server, tx) = start().await;
+        let mut ws = connect(server.addr).await;
+
+        let first = next_envelope(&mut ws).await;
+        assert_eq!(
+            first.event_type,
+            EventType::Snapshot,
+            "the first message is the snapshot, got {first:?}"
+        );
+
+        // With no roster to trail, the next message must be the broadcast we
+        // publish — never a spurious empty agent.roster.
+        let id = "fn:src/x.rs:foo";
+        tx.send(node_upsert_envelope(id)).expect("publish");
+
+        let next = next_envelope(&mut ws).await;
+        assert_eq!(
+            next.event_type,
+            EventType::NodeUpsert,
+            "an empty roster must not emit a trailing agent.roster, got {next:?}"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// A `{"type":"snapshot"}` resync repeats the snapshot-then-roster pair when
+    /// the roster is non-empty.
+    #[tokio::test]
+    async fn resync_request_sends_snapshot_then_roster_when_roster_non_empty() {
+        let (server, _tx) = start_with_roster().await;
+        let mut ws = connect(server.addr).await;
+
+        // Drain the initial connect snapshot + roster trailer.
+        let first = next_envelope(&mut ws).await;
+        assert_eq!(first.event_type, EventType::Snapshot);
+        let trailer = next_envelope(&mut ws).await;
+        assert_eq!(trailer.event_type, EventType::AgentRoster);
+
+        // The resync request must repeat the same ordered pair.
+        ws.send(Message::text("{\"type\":\"snapshot\"}"))
+            .await
+            .expect("send request");
+
+        let again = next_envelope(&mut ws).await;
+        assert_eq!(
+            again.event_type,
+            EventType::Snapshot,
+            "resync replies with a snapshot first, got {again:?}"
+        );
+        let again_roster = next_envelope(&mut ws).await;
+        assert_eq!(
+            again_roster.event_type,
+            EventType::AgentRoster,
+            "resync trails the snapshot with the roster, got {again_roster:?}"
+        );
+        match again_roster.payload {
+            Payload::AgentRoster { agents, .. } => assert!(
+                agents
+                    .iter()
+                    .any(|a| a.agent_id == "tdd-green" && a.process_id == 48213),
+                "resync roster carries every seeded entry, got {agents:?}"
+            ),
+            other => panic!("expected agent.roster payload, got {other:?}"),
         }
 
         server.shutdown().await;

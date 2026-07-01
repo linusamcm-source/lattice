@@ -45,6 +45,13 @@
 //!
 //! Only a typed [`EventEnvelope`] (the collector's parsed output) reaches
 //! [`SqliteStore::persist`] — raw stdout is never persisted (§B.5).
+//!
+//! **Read side (story P9-1).** [`SqliteStore::load_nodes`] / [`SqliteStore::load_edges`]
+//! reconstruct a session's persisted [`Node`](crate::wire::Node)s /
+//! [`Edge`](crate::wire::Edge)s for the crash-rebuild warm start, parsing the wire
+//! enums back with [`wire_enum_from_str`] (the inverse of [`wire_enum_str`]) and the
+//! JSON columns with [`parse_json_column`]. `child_ids` is unpersisted and loads empty
+//! (re-derived by [`crate::graph::Graph::from_records`], Design Decision #7).
 
 use std::str::FromStr;
 
@@ -55,7 +62,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use super::{Storage, StorageError};
-use crate::wire::{AgentInfo, EventEnvelope, HotEdgeState, Payload};
+use crate::wire::{AgentInfo, Edge, EventEnvelope, HotEdgeState, Node, Payload};
 
 /// The §B.6 schema in SQLite dialect, as idempotent `CREATE … IF NOT EXISTS`
 /// statements (decision-2).
@@ -211,9 +218,10 @@ impl Storage for SqliteStore {
     /// `agent.roster` upserts a **real** `agents` row per [`AgentInfo`] plus a
     /// `protocol_versions` row per process; `agent.activity` inserts an
     /// `agent_activity` row (upserting its `agents` parent first for the FK);
-    /// `snapshot`/`subtree` (view frames) persist nothing. A `sessions` row is
-    /// upserted per event (the DB no-ops a duplicate), and an `agents` row when a
-    /// pid is present, before the event row.
+    /// `snapshot`/`subtree` view frames, the `*.remove` arms, and `metrics.update`
+    /// persist nothing. For the persisted arms a `sessions` row is upserted per
+    /// event (the DB no-ops a duplicate), and an `agents` row when a pid is
+    /// present, before the event row.
     async fn persist(&self, env: &EventEnvelope) -> Result<(), StorageError> {
         // One timestamp per event, reused by every write below (decision-3).
         let now = now_rfc3339();
@@ -348,6 +356,9 @@ impl Storage for SqliteStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::MetricsUpdate { .. } => {
+                // Self-observability metrics are ephemeral — persist nothing (§B.5).
+            }
             Payload::AgentActivity {
                 agent_id,
                 action,
@@ -403,6 +414,75 @@ impl Storage for SqliteStore {
         .await?;
         Ok(())
     }
+
+    /// Loads every `nodes` row for `session_id`, reconstructing each [`Node`] from the
+    /// columns the `node.upsert` write arm bound (`id`, `type`, `label`, `parent_id`,
+    /// `status`, `docs`, `signature_json`, `meta_json`).
+    ///
+    /// `type`/`status` are parsed back from their canonical wire strings via
+    /// [`wire_enum_from_str`] (the inverse of [`wire_enum_str`]) and `signature`/`meta`
+    /// from their JSON columns via [`parse_json_column`]. **`child_ids` is unpersisted**
+    /// (no column), so each node loads with an empty `child_ids` — re-derived by
+    /// [`crate::graph::Graph::from_records`] (Design Decision #7). Corrupt stored data
+    /// surfaces a [`StorageError`] rather than panicking.
+    async fn load_nodes(&self, session_id: &str) -> Result<Vec<Node>, StorageError> {
+        let rows: Vec<(
+            String,         // id
+            String,         // type
+            String,         // label
+            Option<String>, // parent_id
+            String,         // status
+            Option<String>, // docs
+            Option<String>, // signature_json
+            Option<String>, // meta_json
+        )> = sqlx::query_as(
+            "SELECT id, type, label, parent_id, status, docs, signature_json, meta_json
+             FROM nodes WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut nodes = Vec::with_capacity(rows.len());
+        for (id, node_type, label, parent_id, status, docs, signature_json, meta_json) in rows {
+            nodes.push(Node {
+                id,
+                node_type: wire_enum_from_str(&node_type)?,
+                label,
+                parent_id,
+                child_ids: Vec::new(),
+                status: wire_enum_from_str(&status)?,
+                docs,
+                signature: parse_json_column(signature_json.as_deref())?,
+                meta: parse_json_column(meta_json.as_deref())?,
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Loads every `edges` row for `session_id`, reconstructing each [`Edge`]
+    /// (`id`/`source`/`target`/`kind`/`hot`); `kind` is parsed from its canonical wire
+    /// string via [`wire_enum_from_str`] and `hot` decodes from the `INTEGER` flag.
+    /// Corrupt stored data surfaces a [`StorageError`] rather than panicking.
+    async fn load_edges(&self, session_id: &str) -> Result<Vec<Edge>, StorageError> {
+        let rows: Vec<(String, String, String, String, bool)> =
+            sqlx::query_as("SELECT id, source, target, kind, hot FROM edges WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut edges = Vec::with_capacity(rows.len());
+        for (id, source, target, kind, hot) in rows {
+            edges.push(Edge {
+                id,
+                source,
+                target,
+                kind: wire_enum_from_str(&kind)?,
+                hot,
+            });
+        }
+        Ok(edges)
+    }
 }
 
 /// Serialises a small CLV enum (e.g. `NodeType`, `NodeStatus`, `TestOutcome`,
@@ -415,6 +495,34 @@ fn wire_enum_str<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(serde_json::Value::String(s)) => s,
         _ => String::new(),
+    }
+}
+
+/// Parses a stored canonical wire string back into its CLV enum (e.g. [`NodeType`],
+/// [`NodeStatus`], [`EdgeKind`]) — the inverse of [`wire_enum_str`] used by the P9-1
+/// load path.
+///
+/// Wraps the TEXT value in a `serde_json::Value::String` and deserialises through the
+/// same `serde` mapping the write side used, so the round-trip stays in lock-step with
+/// `wire.rs`. An unrecognised value yields a [`StorageError::Config`] rather than
+/// panicking (the never-panic-on-bad-input contract; unreachable for well-formed data).
+fn wire_enum_from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, StorageError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|err| StorageError::Config(format!("unrecognised wire enum value '{s}': {err}")))
+}
+
+/// Deserialises an optional JSON TEXT column (`signature_json` / `meta_json`) back to
+/// its typed value for the P9-1 load path: `Ok(None)` for a NULL column, the decoded
+/// value for valid JSON, and a [`StorageError::Config`] (never a panic) for malformed
+/// JSON.
+fn parse_json_column<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+) -> Result<Option<T>, StorageError> {
+    match raw {
+        Some(text) => serde_json::from_str(text)
+            .map(Some)
+            .map_err(|err| StorageError::Config(format!("corrupt JSON column '{text}': {err}"))),
+        None => Ok(None),
     }
 }
 
@@ -586,6 +694,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{parse_source, ParsedFile};
     use crate::wire::{
         AgentInfo, Edge, EdgeKind, EventType, Node, NodeStatus, NodeType, Signature, TestOutcome,
     };
@@ -1101,6 +1210,39 @@ mod tests {
         }
     }
 
+    /// P9-3: a `metrics.update` envelope is **ephemeral** (`DATA_MODEL.md` §B.5 — no
+    /// DDL table), so persisting it writes **no row to any table**. The table counts
+    /// before and after must both be zero. RED until P9-3 (GREEN) adds
+    /// `EventType::MetricsUpdate` / `Payload::MetricsUpdate` plus the no-op skip arm
+    /// `Payload::MetricsUpdate { .. } => {}` to `persist`.
+    #[tokio::test]
+    async fn metrics_update_persists_nothing() {
+        let (store, _dir) = temp_store().await;
+        let metrics = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::MetricsUpdate,
+            payload: Payload::MetricsUpdate {
+                session_id: "sess-1".to_string(),
+                ts: "2026-06-30T00:00:00Z".to_string(),
+                node_count: 128,
+                edge_count: 342,
+                memory_bytes: 1_048_576,
+                events_per_sec_milli: 4200,
+                parse_latency: Vec::new(),
+            },
+        };
+        store.persist(&metrics).await.expect("metrics persist");
+        for table in TABLES {
+            assert_eq!(
+                count(&store, table).await,
+                0,
+                "metrics.update wrote to {table} — metrics are ephemeral (§B.5)"
+            );
+        }
+    }
+
     // ---- P8-3: persist the agent layer (DATA_MODEL §A.5 / §B.6) ----
     //
     // RED-phase contract for the agent-layer writers. P8-3 replaces the no-op
@@ -1588,5 +1730,199 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(n, 1);
+    }
+
+    // ---- P9-1: Storage read methods (load_nodes / load_edges) ----
+
+    /// Wraps an arbitrary parsed [`Node`] in a `node.upsert` envelope stamped with
+    /// `session`, so a parsed file can be persisted node-by-node (P9-1 load fixtures).
+    fn node_upsert_for(session: &str, node: Node) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::NodeUpsert,
+            payload: Payload::NodeUpsert { node },
+        }
+    }
+
+    /// Wraps an arbitrary parsed [`Edge`] in an `edge.upsert` envelope stamped with
+    /// `session` (P9-1 load fixtures).
+    fn edge_upsert_for(session: &str, edge: Edge) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::EdgeUpsert,
+            payload: Payload::EdgeUpsert { edge },
+        }
+    }
+
+    /// Wraps a node id in a `node.remove` envelope stamped with `session`.
+    fn node_remove_for(session: &str, id: &str) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: session.to_string(),
+            event_type: EventType::NodeRemove,
+            payload: Payload::NodeRemove { id: id.to_string() },
+        }
+    }
+
+    /// Parses `(path, src)` and persists every node/edge under `session`, returning
+    /// the parsed file so a test can derive the expected load result.
+    async fn seed_parsed(store: &SqliteStore, session: &str, path: &str, src: &str) -> ParsedFile {
+        let parsed = parse_source(path, src);
+        for node in &parsed.nodes {
+            store
+                .persist(&node_upsert_for(session, node.clone()))
+                .await
+                .expect("persist node.upsert");
+        }
+        for edge in &parsed.edges {
+            store
+                .persist(&edge_upsert_for(session, edge.clone()))
+                .await
+                .expect("persist edge.upsert");
+        }
+        parsed
+    }
+
+    #[tokio::test]
+    async fn load_methods_are_callable_through_trait_object() {
+        // AC#1: load_nodes/load_edges keep the trait object-safe — they are callable
+        // on a Box<dyn Storage + Send + Sync>, and an empty store yields empty Vecs.
+        let (store, _dir) = temp_store().await;
+        let dyn_store: Box<dyn Storage + Send + Sync> = Box::new(store);
+        let nodes = dyn_store
+            .load_nodes("sess-local")
+            .await
+            .expect("load_nodes");
+        let edges = dyn_store
+            .load_edges("sess-local")
+            .await
+            .expect("load_edges");
+        assert!(nodes.is_empty(), "empty store yields no nodes");
+        assert!(edges.is_empty(), "empty store yields no edges");
+    }
+
+    #[tokio::test]
+    async fn load_nodes_round_trips_persisted_nodes_with_empty_child_ids() {
+        // AC#2: every persisted node loads back with id/type/label/parentId/status
+        // intact across a multi-file source set; child_ids is NOT persisted, so it
+        // loads as [] (re-derived later by Graph::from_records, not by load_nodes).
+        let (store, _dir) = temp_store().await;
+        let mut expected: Vec<Node> = Vec::new();
+        expected.extend(
+            seed_parsed(&store, "sess-local", "a.rs", "fn alpha() { let x = 1; }")
+                .await
+                .nodes,
+        );
+        expected.extend(
+            seed_parsed(&store, "sess-local", "b.rs", "fn beta() {}")
+                .await
+                .nodes,
+        );
+
+        let loaded = store.load_nodes("sess-local").await.expect("load_nodes");
+        let by_id: std::collections::HashMap<&str, &Node> =
+            loaded.iter().map(|n| (n.id.as_str(), n)).collect();
+        assert_eq!(
+            loaded.len(),
+            expected.len(),
+            "every persisted node loads: {loaded:?}"
+        );
+        for want in &expected {
+            let got = by_id
+                .get(want.id.as_str())
+                .unwrap_or_else(|| panic!("missing node {}", want.id));
+            assert_eq!(got.node_type, want.node_type, "type for {}", want.id);
+            assert_eq!(got.label, want.label, "label for {}", want.id);
+            assert_eq!(got.parent_id, want.parent_id, "parentId for {}", want.id);
+            assert_eq!(got.status, want.status, "status for {}", want.id);
+            // Finding #4: the JSON-encoded signature/meta columns must round-trip back
+            // equal through load_nodes (the function node `fn:a.rs:alpha` carries both).
+            assert_eq!(got.signature, want.signature, "signature for {}", want.id);
+            assert_eq!(got.meta, want.meta, "meta for {}", want.id);
+            assert!(
+                got.child_ids.is_empty(),
+                "child_ids is unpersisted and must load as [] for {}: {:?}",
+                want.id,
+                got.child_ids
+            );
+        }
+        // Guard: the fixture really did persist a non-None signature AND meta, so the
+        // round-trip assertions above are meaningful (not vacuously comparing None==None).
+        let alpha = by_id
+            .get("fn:a.rs:alpha")
+            .expect("function node fn:a.rs:alpha must load");
+        assert!(
+            alpha.signature.is_some(),
+            "fixture function must carry a signature to exercise the round-trip"
+        );
+        assert!(
+            alpha.meta.is_some(),
+            "fixture function must carry meta to exercise the round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_edges_round_trips_persisted_edges() {
+        // AC#2: every persisted edge loads back with source/target/kind intact.
+        let (store, _dir) = temp_store().await;
+        let mut expected: Vec<Edge> = Vec::new();
+        expected.extend(
+            seed_parsed(&store, "sess-local", "a.rs", "fn alpha() { let x = 1; }")
+                .await
+                .edges,
+        );
+        expected.extend(
+            seed_parsed(&store, "sess-local", "b.rs", "fn beta() {}")
+                .await
+                .edges,
+        );
+
+        let loaded = store.load_edges("sess-local").await.expect("load_edges");
+        let by_id: std::collections::HashMap<&str, &Edge> =
+            loaded.iter().map(|e| (e.id.as_str(), e)).collect();
+        assert_eq!(
+            loaded.len(),
+            expected.len(),
+            "every persisted edge loads: {loaded:?}"
+        );
+        for want in &expected {
+            let got = by_id
+                .get(want.id.as_str())
+                .unwrap_or_else(|| panic!("missing edge {}", want.id));
+            assert_eq!(got.source, want.source, "source for {}", want.id);
+            assert_eq!(got.target, want.target, "target for {}", want.id);
+            assert_eq!(got.kind, want.kind, "kind for {}", want.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_nodes_excludes_a_removed_node() {
+        // AC#2: a node.remove-then-load does not return the removed node.
+        let (store, _dir) = temp_store().await;
+        let parsed = seed_parsed(&store, "sess-local", "a.rs", "fn alpha() {}\nfn beta() {}").await;
+        assert!(
+            parsed.nodes.iter().any(|n| n.id == "fn:a.rs:beta"),
+            "fixture must seed fn:a.rs:beta"
+        );
+
+        store
+            .persist(&node_remove_for("sess-local", "fn:a.rs:beta"))
+            .await
+            .expect("persist node.remove");
+
+        let loaded = store.load_nodes("sess-local").await.expect("load_nodes");
+        assert!(
+            loaded.iter().all(|n| n.id != "fn:a.rs:beta"),
+            "removed node must not load: {loaded:?}"
+        );
+        assert!(
+            loaded.iter().any(|n| n.id == "fn:a.rs:alpha"),
+            "the surviving node must still load: {loaded:?}"
+        );
     }
 }

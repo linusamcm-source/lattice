@@ -12,18 +12,35 @@
 //! ([`collect`](crate::collector::collect)), which tails
 //! `<root>/.lattice/clv.ndjson` and folds each correlated `test`/`status` event
 //! onto its node's colour — so a failing test reddens its node within ~1s on the
-//! same live graph the watcher feeds. [`RunHandle::shutdown`] aborts the watcher,
-//! the pump, the collector, and the optional persistence task.
+//! same live graph the watcher feeds.
+//!
+//! It also spawns the Phase-9 **self-observability** metrics emitter: a task ticking
+//! on [`RunConfig::metrics_interval`] that counts broadcast throughput over each window
+//! (excluding its **own** `metrics.update` emissions) and broadcasts a `metrics.update`
+//! carrying live node/edge counts, a deterministic memory estimate, events/sec, and
+//! per-file parse latencies (`SPEC.md` §11.3). To avoid contending with the
+//! watcher/collector, the emitter holds the graph lock only for a lock-light
+//! [`Graph::metrics_snapshot`] and does the sort + clock stamp + envelope assembly
+//! off-lock ([`crate::graph::MetricsSnapshot::into_envelope`]). Parse latency is measured
+//! at the [`ingest_file`] call site so the initial WalkDir parse already populates the
+//! map. [`RunHandle::shutdown`] aborts the watcher, the pump, the collector, the metrics
+//! emitter, and the optional persistence task.
 //!
 //! Persistence is an **opt-in, best-effort write-through** (Phase 7,
 //! `DATA_MODEL.md` §B): set `LATTICE_DB_URL` and [`run`] also subscribes a task that
 //! durably records the structured event stream to that database via
-//! [`crate::storage`]; unset, the backend runs exactly as before. The store is
-//! observability rather than a hard dependency, so a storage failure (bad URL,
-//! unreachable DB, schema error, per-event write error) is logged and **degrades
-//! gracefully** — the watch/WS/collector path is never failed or interrupted by it.
-//! Tests drive [`run_with_db_url`] to pass an explicit URL without the process-global
-//! env var.
+//! [`crate::storage`]; unset, the backend runs exactly as before. With a database set,
+//! [`run_with_db_url`] additionally **crash-rebuilds** (Phase 9): before serving, it
+//! warm-starts the in-memory [`Graph`] from the persisted run-session records
+//! ([`Storage::load_nodes`](crate::storage::Storage::load_nodes) /
+//! [`load_edges`](crate::storage::Storage::load_edges) → [`Graph::from_records`]) so a
+//! restart's first snapshot reflects the prior run, then the filesystem re-parse
+//! reconciles drift. The store is observability rather than a hard dependency, so a
+//! storage failure (bad URL, unreachable DB, schema error, rehydrate read error,
+//! per-event write error) is logged and **degrades gracefully** to the
+//! empty-then-parse path — the watch/WS/collector path is never failed or interrupted
+//! by it. Tests drive [`run_with_db_url`] to pass an explicit URL without the
+//! process-global env var.
 //!
 //! File paths are normalised to repo-relative form (matching `DATA_MODEL.md` §A.1
 //! ids such as `fn:a.rs:alpha`) by stripping the **canonicalised** repository
@@ -33,6 +50,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -43,7 +61,7 @@ use crate::graph::Graph;
 use crate::parser::parse_source;
 use crate::storage::open_store;
 use crate::watcher::{is_source_file, watch};
-use crate::wire::EventEnvelope;
+use crate::wire::{EventEnvelope, EventType};
 use crate::ws::{serve, BoundServer};
 
 /// Capacity of the broadcast channel fanning patch events out to WS clients.
@@ -54,10 +72,36 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// (`"sess-local"`) so the run's `sessions` row aligns with the in-memory graph.
 const RUN_SESSION_ID: &str = "sess-local";
 
+/// Default cadence of the self-observability metrics emitter in production.
+///
+/// A two-second tick is frequent enough to feel live in the debug panel yet cheap
+/// (one graph lock + one broadcast per tick), and — with the emitter's **first** tick
+/// deferred by one interval — leaves the fast full-stack tests (which finish their
+/// reads well inside two seconds) free of interleaved `metrics.update` frames.
+/// [`run_with_db_url`] uses this; [`run_with_config`] lets a test inject a shorter
+/// interval to exercise the emitter without wall-clock flakiness.
+const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Tuning knobs for a Lattice backend run ([`run_with_config`]).
+///
+/// Separates the persistence target from the metrics cadence so tests can drive a
+/// short, deterministic [`RunConfig::metrics_interval`] while production keeps the
+/// [`DEFAULT_METRICS_INTERVAL`]. [`run_with_db_url`] constructs one with the production
+/// default and delegates here.
+pub struct RunConfig {
+    /// Optional persistence target (Phase 7/9). [`Some`] enables crash-rebuild + best-
+    /// effort write-through against that database URL; [`None`] runs with no database.
+    pub db_url: Option<String>,
+    /// How often the self-observability metrics emitter ticks and broadcasts a
+    /// `metrics.update` envelope.
+    pub metrics_interval: Duration,
+}
+
 /// A running Lattice backend: the WebSocket server plus the watcher pump.
 ///
 /// Holds the bound server [`addr`](RunHandle::addr) (read it to connect) and the
 /// background tasks. [`RunHandle::shutdown`] stops the server and the watcher.
+/// `metrics_task` is the Phase-9 self-observability emitter (always present).
 /// `store_task` is the optional opt-in persistence task: it is [`Some`] only when a
 /// `LATTICE_DB_URL` was provided **and** the store opened and applied its schema
 /// successfully ([`run_with_db_url`]); it is [`None`] when persistence is disabled
@@ -69,17 +113,19 @@ pub struct RunHandle {
     watcher_task: JoinHandle<()>,
     pump_task: JoinHandle<()>,
     collector_task: JoinHandle<()>,
+    metrics_task: JoinHandle<()>,
     store_task: Option<JoinHandle<()>>,
 }
 
 impl RunHandle {
-    /// Stops the WebSocket server, the watcher pump, the CLV collector, and (when
-    /// present) the persistence task, and waits for teardown.
+    /// Stops the WebSocket server, the watcher pump, the CLV collector, the metrics
+    /// emitter, and (when present) the persistence task, and waits for teardown.
     pub async fn shutdown(self) {
         self.server.shutdown().await;
         self.watcher_task.abort();
         self.pump_task.abort();
         self.collector_task.abort();
+        self.metrics_task.abort();
         if let Some(store_task) = self.store_task {
             store_task.abort();
         }
@@ -101,7 +147,10 @@ fn repo_relative(root: &Path, path: &Path) -> Option<String> {
 /// Reads, parses, and applies one changed source file into `graph`, returning patch events.
 ///
 /// The repo-relative path is lowered through [`parse_source`], which dispatches on
-/// the file extension (Rust/Python/TypeScript, else a bare `file` node). Returns an
+/// the file extension (Rust/Python/TypeScript, else a bare `file` node). The parse is
+/// **timed** and its `duration_us` recorded via [`Graph::record_parse_latency`] (Phase-9
+/// self-observability) so the metrics emitter can report per-file parse latency — the
+/// initial WalkDir parse populates the map before any client connects. Returns an
 /// empty vector (logging the cause) when the file is outside `root` or cannot be
 /// read; never panics.
 async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec<EventEnvelope> {
@@ -115,8 +164,12 @@ async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec
             return Vec::new();
         }
     };
+    let started = std::time::Instant::now();
     let parsed = parse_source(&rel, &source);
-    graph.lock().await.apply_parsed(parsed)
+    let micros = started.elapsed().as_micros() as u64;
+    let mut guard = graph.lock().await;
+    guard.record_parse_latency(&rel, micros);
+    guard.apply_parsed(parsed)
 }
 
 /// Default WebSocket listen address used when `LATTICE_ADDR` is unset.
@@ -154,57 +207,116 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
     run_with_db_url(root, addr, std::env::var("LATTICE_DB_URL").ok()).await
 }
 
-/// Starts the Lattice backend against `root` on `addr`, optionally write-through
-/// persisting the structured event stream to `db_url`.
+/// Starts the Lattice backend against `root` on `addr` with an optional persistence
+/// `db_url` and the production metrics cadence.
 ///
-/// Canonicalises `root`, does an initial parse of every source file (Rust, Python,
-/// or TypeScript) into a fresh [`Graph`], starts the WebSocket [`serve`]r, and spawns
-/// the watcher pump (re-parses changed files, broadcasting their patch events) and
-/// the CLV [`collect`]or.
-///
-/// When `db_url` is [`Some`], a **best-effort** persistence task is additionally
-/// spawned: it [`open_store`]s the backend selected by the URL scheme, applies the
-/// schema ([`ensure_schema`](crate::storage::Storage::ensure_schema)), records the
-/// run's `sessions` row ([`record_session`](crate::storage::Storage::record_session)
-/// keyed by [`RUN_SESSION_ID`]), then subscribes to the broadcast channel and
-/// write-throughs every structured [`EventEnvelope`] via
-/// [`persist`](crate::storage::Storage::persist). Only structured events flow on that
-/// channel, so raw/untagged stdout is never persisted (`DATA_MODEL.md` §B.5). When
-/// `db_url` is [`None`] the backend runs with no database, identical to before this
-/// story.
-///
-/// # Graceful degradation
-/// Storage is observability, not a hard dependency, so it must never take down the
-/// watch/WS/collector path. If [`open_store`] or
-/// [`ensure_schema`](crate::storage::Storage::ensure_schema) fails, the failure is
-/// logged to stderr and the run continues **without** persistence
-/// ([`RunHandle::store_task`](RunHandle) is [`None`]). A per-event
-/// [`persist`](crate::storage::Storage::persist) error is likewise logged and
-/// skipped — the persistence task never panics and keeps consuming the channel.
+/// A thin wrapper over [`run_with_config`] that pairs `db_url` with the
+/// [`DEFAULT_METRICS_INTERVAL`]. All boot behaviour (crash-rebuild, reconcile, persist,
+/// metrics emitter) is documented on [`run_with_config`]; this preserves the historical
+/// `run_with_db_url` signature and call sites.
 ///
 /// # Errors
-/// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
-/// cannot bind to `addr`. A storage problem is *not* an error here — it degrades to
-/// no persistence as described above.
+/// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server cannot
+/// bind to `addr`. A storage problem never fails the run — it degrades to no
+/// persistence (see [`run_with_config`]).
 pub async fn run_with_db_url(
     root: PathBuf,
     addr: SocketAddr,
     db_url: Option<String>,
 ) -> std::io::Result<RunHandle> {
+    run_with_config(
+        root,
+        addr,
+        RunConfig {
+            db_url,
+            metrics_interval: DEFAULT_METRICS_INTERVAL,
+        },
+    )
+    .await
+}
+
+/// Starts the Lattice backend against `root` on `addr`, optionally crash-rebuilding
+/// the graph from `config.db_url` and write-through persisting the structured event
+/// stream back to it, ticking the metrics emitter at `config.metrics_interval`.
+///
+/// Boot order is **rehydrate, then reconcile, then serve** (Phase 9, crash-rebuild):
+/// 1. Canonicalise `root` and, when `db_url` is [`Some`], [`open_store`] +
+///    [`ensure_schema`](crate::storage::Storage::ensure_schema) +
+///    [`record_session`](crate::storage::Storage::record_session) (keyed by
+///    [`RUN_SESSION_ID`]).
+/// 2. **Warm start:** while the store is still owned (before the persist task moves
+///    it), read the persisted run-session graph via
+///    [`load_nodes`](crate::storage::Storage::load_nodes) /
+///    [`load_edges`](crate::storage::Storage::load_edges) — keyed on the
+///    [`RUN_SESSION_ID`] constant, **not** a most-recent-session lookup — and rebuild
+///    the initial [`Graph`] with [`Graph::from_records`]. With no `db_url` (or on any
+///    read failure) the initial graph is an empty [`Graph::new`].
+/// 3. **Reconcile:** the WalkDir initial parse re-parses every on-disk source file
+///    (Rust, Python, or TypeScript) over the warm-started graph — the **filesystem
+///    wins**, so a stale persisted file is corrected and an empty graph is filled.
+/// 4. Start the WebSocket [`serve`]r (whose first snapshot now reflects the
+///    rehydrated-and-reconciled roots), then spawn the watcher pump (re-parses
+///    changed files, broadcasting patch events), the CLV [`collect`]or, and the
+///    self-observability metrics emitter. The emitter ticks every
+///    `config.metrics_interval`, counts the envelopes broadcast during the window
+///    (its own `metrics.update` emissions **excluded**, so a quiet window reports 0
+///    events/sec), and — holding the graph lock only for a lock-light
+///    [`Graph::metrics_snapshot`] — broadcasts a `metrics.update` assembled off-lock
+///    ([`crate::graph::MetricsSnapshot::into_envelope`]) with the live counts, a
+///    deterministic memory estimate, that throughput, and the per-file parse latencies.
+///    Because it broadcasts on the same channel the WS server fans out, the persist
+///    subscriber sees each `metrics.update` as a no-op (P9-3, ephemeral).
+///
+/// When `db_url` is [`Some`], the **best-effort** persistence task subscribes to the
+/// broadcast channel and write-throughs every structured [`EventEnvelope`] via
+/// [`persist`](crate::storage::Storage::persist). Only structured events flow on that
+/// channel, so raw/untagged stdout is never persisted (`DATA_MODEL.md` §B.5). When
+/// `db_url` is [`None`] the backend runs with no database, identical to before the
+/// crash-rebuild story (empty graph, then filesystem parse).
+///
+/// # Graceful degradation
+/// Storage is observability, not a hard dependency, so it must never take down the
+/// watch/WS/collector path. If [`open_store`],
+/// [`ensure_schema`](crate::storage::Storage::ensure_schema), or a rehydrate read
+/// ([`load_nodes`](crate::storage::Storage::load_nodes) /
+/// [`load_edges`](crate::storage::Storage::load_edges)) fails, the failure is logged
+/// to stderr and the run continues on the **empty-then-parse** path (no warm start;
+/// [`RunHandle::store_task`](RunHandle) is [`None`] for an open/schema failure). A
+/// per-event [`persist`](crate::storage::Storage::persist) error is likewise logged
+/// and skipped — the persistence task never panics and keeps consuming the channel.
+///
+/// # Errors
+/// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
+/// cannot bind to `addr`. A storage problem is *not* an error here — it degrades to
+/// no persistence as described above.
+pub async fn run_with_config(
+    root: PathBuf,
+    addr: SocketAddr,
+    config: RunConfig,
+) -> std::io::Result<RunHandle> {
+    let RunConfig {
+        db_url,
+        metrics_interval,
+    } = config;
     let root = std::fs::canonicalize(&root)?;
-    let graph = Arc::new(Mutex::new(Graph::new()));
     let (events_tx, _) = broadcast::channel::<EventEnvelope>(EVENT_CHANNEL_CAPACITY);
 
-    // Opt-in, best-effort write-through persistence. The subscriber is registered
-    // here — before any task can send — so no structured event is missed; any
-    // storage failure degrades to `None` (no persistence) and never fails the run.
-    let store_task = match db_url {
-        None => None,
+    // Opt-in, best-effort write-through persistence with a crash-rebuild warm start.
+    // The store is opened and **read for rehydration here** — while it is still owned,
+    // BEFORE the persist task moves it (`store` is a `Box<dyn Storage>`, not shared) —
+    // so the initial graph can be rebuilt from the DB (`load_nodes`/`load_edges` keyed
+    // on the `RUN_SESSION_ID` constant, not a most-recent-session lookup) ahead of the
+    // WalkDir re-parse that reconciles drift. The subscriber is registered here —
+    // before any task can send — so no structured event is missed. Every storage/read
+    // failure logs and degrades to an empty `Graph::new()` (then-parse), exactly like
+    // the no-`db_url` path; persistence is observability, never a hard dependency.
+    let (initial_graph, store_task) = match db_url {
+        None => (Graph::new(), None),
         Some(url) => match open_store(&url).await {
             Ok(store) => {
                 if let Err(error) = store.ensure_schema().await {
                     eprintln!("lattice: storage disabled (schema error: {error})");
-                    None
+                    (Graph::new(), None)
                 } else {
                     if let Err(error) = store
                         .record_session(RUN_SESSION_ID, &root.display().to_string())
@@ -214,8 +326,21 @@ pub async fn run_with_db_url(
                         // upserts the session row on first sight (`DATA_MODEL.md` §B.2).
                         eprintln!("lattice: record_session failed: {error}");
                     }
+                    // Crash-rebuild warm start: read the persisted run-session graph
+                    // BEFORE the store is moved into the persist task. A read error
+                    // (e.g. a corrupted row) degrades to an empty graph (then-parse).
+                    let graph = match (
+                        store.load_nodes(RUN_SESSION_ID).await,
+                        store.load_edges(RUN_SESSION_ID).await,
+                    ) {
+                        (Ok(nodes), Ok(edges)) => Graph::from_records(RUN_SESSION_ID, nodes, edges),
+                        (Err(error), _) | (_, Err(error)) => {
+                            eprintln!("lattice: rehydrate disabled (read error: {error})");
+                            Graph::new()
+                        }
+                    };
                     let mut rx = events_tx.subscribe();
-                    Some(tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 Ok(env) => {
@@ -233,17 +358,22 @@ pub async fn run_with_db_url(
                                 Err(broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                    }))
+                    });
+                    (graph, Some(task))
                 }
             }
             Err(error) => {
                 eprintln!("lattice: storage disabled ({error})");
-                None
+                (Graph::new(), None)
             }
         },
     };
 
-    // Initial parse: fill the graph so the first snapshot reflects the repo.
+    let graph = Arc::new(Mutex::new(initial_graph));
+
+    // Initial parse: reconcile the (possibly warm-started) graph against the on-disk
+    // source — the filesystem wins, so a re-parse corrects any drift in the rehydrated
+    // graph and fills an empty one. The first snapshot reflects the repo.
     for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if is_source_file(path) {
@@ -272,21 +402,81 @@ pub async fn run_with_db_url(
     // test/status event onto its node's colour, broadcasting the patch envelope.
     let collector_task = tokio::spawn(collect(root.clone(), Arc::clone(&graph), events_tx.clone()));
 
+    // Self-observability metrics emitter (Phase 9): tick on `metrics_interval`, count
+    // broadcast throughput over each window, and broadcast a `metrics.update`. The
+    // receiver is subscribed here — before the loop — so events arriving between ticks
+    // are buffered for the next drain. Its OWN `metrics.update` emissions are excluded
+    // from the count (else a quiet window would report itself), so events/sec reflects
+    // genuine watcher/collector activity only.
+    let metrics_graph = Arc::clone(&graph);
+    let metrics_events = events_tx.clone();
+    let mut metrics_rx = events_tx.subscribe();
+    let metrics_task = tokio::spawn(async move {
+        // Defer the FIRST tick by one interval (`interval` fires immediately at t=0):
+        // no `metrics.update` is broadcast until a full window has elapsed, so a client
+        // that connects and reads a fixed sequence right after boot is not disrupted.
+        let start = tokio::time::Instant::now() + metrics_interval;
+        let mut ticker = tokio::time::interval_at(start, metrics_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // Drain every envelope observed since the last tick, counting only those
+            // NOT produced by this emitter (self-emitted `metrics.update`s excluded).
+            let mut observed: u64 = 0;
+            loop {
+                match metrics_rx.try_recv() {
+                    Ok(env) => {
+                        if env.event_type != EventType::MetricsUpdate {
+                            observed += 1;
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Closed) => return,
+                }
+            }
+            let per_sec_milli = events_per_sec_milli(observed, metrics_interval);
+            // Hold the graph lock only long enough to snapshot the counts/memory/latency
+            // entries; the `parse_latency` sort, the clock read, and the envelope assembly
+            // all run AFTER the guard drops (via `into_envelope`), so the emitter never
+            // contends with the watcher/collector on the graph mutex.
+            let snapshot = {
+                let graph = metrics_graph.lock().await;
+                graph.metrics_snapshot()
+            };
+            let env = snapshot.into_envelope(per_sec_milli);
+            // Best-effort: a full/absent channel just drops this tick's snapshot.
+            let _ = metrics_events.send(env);
+        }
+    });
+
     Ok(RunHandle {
         addr,
         server,
         watcher_task,
         pump_task,
         collector_task,
+        metrics_task,
         store_task,
     })
+}
+
+/// Converts a window's observed event count into `eventsPerSecMilli` (events/sec ×1000).
+///
+/// `observed / (interval_secs) × 1000`, kept in integer milli-units to preserve the
+/// `metrics.update` `Eq` derive (Design Decision #3). `interval` is clamped to at least
+/// 1ms so a degenerate zero interval can never divide by zero; the multiply saturates
+/// rather than overflowing. A quiet window (`observed == 0`) yields exactly 0.
+fn events_per_sec_milli(observed: u64, interval: Duration) -> u64 {
+    let interval_ms = (interval.as_millis() as u64).max(1);
+    observed.saturating_mul(1_000_000) / interval_ms
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::watcher::DEBOUNCE;
-    use crate::wire::{EventType, Node, NodeStatus, Payload, TestOutcome};
+    use crate::wire::{Edge, EventType, Node, NodeStatus, Payload, TestOutcome};
     use futures_util::{SinkExt, StreamExt};
     use std::io::Write;
     use std::path::Path;
@@ -675,7 +865,19 @@ mod tests {
     async fn partial_line_is_parsed_only_after_its_newline() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
-        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+        // Boot with a metrics interval far longer than the negative window below, so the
+        // self-observability emitter never fires a `metrics.update` inside the 900ms wait
+        // and the "no envelope arrives" assertion cannot be tripped by a metrics tick.
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .expect("run");
 
         let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
             .await
@@ -924,6 +1126,674 @@ mod tests {
         assert_eq!(
             total, 1,
             "raw and malformed sink lines must not persist any test_results row"
+        );
+        handle.shutdown().await;
+    }
+
+    // ---- P9-2: crash-rebuild — rehydrate the graph from the DB at startup ----
+    //
+    // These integration tests mirror the `initial_snapshot_is_root_only_…` full-stack
+    // template: seed a file-backed SQLite DB with a prior run's persisted graph, then
+    // boot `run_with_db_url` against it and assert the FIRST `snapshot` already
+    // reflects the persisted roots — i.e. the warm start rehydrated the graph BEFORE
+    // any file was re-parsed (`Storage::load_nodes`/`load_edges` →
+    // `Graph::from_records`, keyed on the `RUN_SESSION_ID` constant). Tests 1, 2 and 5
+    // are RED until that wiring exists (the graph boots empty today); tests 3 and 4
+    // guard the no-DB and read-error degradation paths.
+
+    /// Builds a `node.upsert` [`EventEnvelope`] stamped with `session_id`, modelling a
+    /// prior run's write-through of one parsed node (the sqlite `node.upsert` arm keys
+    /// the persisted `nodes` row on `env.session_id`). Test-only.
+    fn upsert_node_env(session_id: &str, node: Node) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::NodeUpsert,
+            payload: Payload::NodeUpsert { node },
+        }
+    }
+
+    /// Builds an `edge.upsert` [`EventEnvelope`] stamped with `session_id` — the edge
+    /// twin of [`upsert_node_env`]. Test-only.
+    fn upsert_edge_env(session_id: &str, edge: Edge) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::EdgeUpsert,
+            payload: Payload::EdgeUpsert { edge },
+        }
+    }
+
+    /// Builds a `test.result` [`EventEnvelope`] under `session_id` — used to plant a
+    /// distinct, later-started `sessions` row so the multi-session regression can prove
+    /// rehydrate keys on [`RUN_SESSION_ID`], not the most-recent session. Test-only.
+    fn test_result_env(session_id: &str, node_id: &str) -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-02-02T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            event_type: EventType::TestResult,
+            payload: Payload::TestResult {
+                node_id: node_id.to_string(),
+                test_id: "t-seed".to_string(),
+                outcome: TestOutcome::Pass,
+                duration_ms: None,
+                session_id: session_id.to_string(),
+                agent_id: None,
+                process_id: None,
+                message: None,
+            },
+        }
+    }
+
+    /// Seeds a file-backed SQLite DB at `db_url` with the parsed nodes/edges of each
+    /// `(path, src)` file, persisted as `node.upsert`/`edge.upsert` envelopes under
+    /// `session_id` — modelling exactly what a prior run's write-through persistence
+    /// stored for a session's graph (`DATA_MODEL.md` §B).
+    ///
+    /// Test-only helper. The store's pool is dropped on return; the committed rows
+    /// survive on the file-backed database for a later [`open_store`] (the run under
+    /// test) to read back via [`Storage::load_nodes`]/[`Storage::load_edges`].
+    async fn seed_persisted_graph(db_url: &str, session_id: &str, files: &[(&str, &str)]) {
+        let store = open_store(db_url).await.expect("open seed store");
+        store.ensure_schema().await.expect("seed schema");
+        store
+            .record_session(session_id, "/seed/repo")
+            .await
+            .expect("seed sessions row");
+        for (path, src) in files {
+            let parsed = parse_source(path, src);
+            for node in parsed.nodes {
+                store
+                    .persist(&upsert_node_env(session_id, node))
+                    .await
+                    .expect("persist seed node");
+            }
+            for edge in parsed.edges {
+                store
+                    .persist(&upsert_edge_env(session_id, edge))
+                    .await
+                    .expect("persist seed edge");
+            }
+        }
+    }
+
+    /// Collects a `snapshot` envelope's root node ids (panicking if the first envelope
+    /// is not a snapshot) — the first frame the server sends on connect (`ws.rs:135`).
+    fn snapshot_root_ids(env: &EventEnvelope) -> Vec<String> {
+        match &env.payload {
+            Payload::Snapshot { nodes, .. } => nodes.iter().map(|n| n.id.clone()).collect(),
+            other => panic!("expected a snapshot envelope, got {other:?}"),
+        }
+    }
+
+    /// AC#1 (rebuild-from-seeded-DB). A file-backed SQLite DB pre-seeded with persisted
+    /// nodes/edges for [`RUN_SESSION_ID`], booted against an **empty** repo dir (so the
+    /// WalkDir re-parse adds nothing), must yield a **non-empty** first `snapshot`
+    /// carrying the persisted roots — proving the graph was rehydrated from the DB
+    /// BEFORE any file was re-parsed.
+    ///
+    /// RED today: `run_with_db_url` boots `Graph::new()` (always empty) and the empty
+    /// repo parses nothing, so the first snapshot has no `file:` roots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_from_seeded_db_first_snapshot_carries_persisted_roots() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("seed.db").display());
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[
+                ("seed_a.rs", "fn alpha() {}"),
+                ("seed_b.rs", "fn gamma() {}"),
+            ],
+        )
+        .await;
+
+        // Empty repo dir → the initial WalkDir re-parse adds nothing, so any snapshot
+        // content can only have come from the DB rehydrate.
+        let repo = tempdir().expect("repo tempdir");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        assert_eq!(env.event_type, EventType::Snapshot);
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:seed_a.rs"),
+            "first snapshot must carry the rehydrated root file:seed_a.rs before any reparse: {roots:?}"
+        );
+        assert!(
+            roots.iter().any(|id| id == "file:seed_b.rs"),
+            "first snapshot must carry the rehydrated root file:seed_b.rs before any reparse: {roots:?}"
+        );
+        // Lazy snapshot: the rehydrated child function is NOT in the root payload.
+        assert!(
+            !roots.iter().any(|id| id == "fn:seed_a.rs:alpha"),
+            "rehydrated snapshot stays lazy — no child function at the root: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#2 (multi-session regression — adversarial-review HIGH). With the DB holding
+    /// the [`RUN_SESSION_ID`] graph PLUS a distinct, later-started CLV session (its own
+    /// nodes and a `test.result` row), the rehydrate must still load the
+    /// [`RUN_SESSION_ID`] nodes — proving it keys on the run-session constant, not a
+    /// "most-recent session" lookup (which would load the other session's nodes, or
+    /// zero run-session rows).
+    ///
+    /// RED today: no rehydrate runs at all, so the empty-repo snapshot is empty —
+    /// `file:run_file.rs` is absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_keys_on_run_session_not_most_recent_session() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("multi.db").display());
+
+        // The run-session graph — what a warm start must restore.
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[("run_file.rs", "fn run_fn() {}")],
+        )
+        .await;
+
+        // A DISTINCT, later-started session with its OWN, different nodes …
+        let other = "sess-newer-deadbeef";
+        seed_persisted_graph(&db_url, other, &[("other_file.rs", "fn other_fn() {}")]).await;
+        // … plus a `test.result` row, so the other session is the most-recently-written
+        // `sessions` row a naive most-recent lookup would pick.
+        let store = open_store(&db_url)
+            .await
+            .expect("open for other test.result");
+        store
+            .persist(&test_result_env(other, "fn:other_file.rs:other_fn"))
+            .await
+            .expect("persist other session test.result");
+        drop(store);
+
+        let repo = tempdir().expect("repo tempdir");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:run_file.rs"),
+            "rehydrate must load the RUN_SESSION_ID graph: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "file:other_file.rs"),
+            "rehydrate must NOT load a different (most-recent) session's nodes: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#3 (no-DB regression guard). With `db_url == None`, boot is byte-for-byte
+    /// today's behaviour: an empty graph filled by the filesystem parse, served as a
+    /// lazy root-only `snapshot`. Passes today and must keep passing once rehydrate is
+    /// wired (the rehydrate path must never touch the no-DB case).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_db_boot_is_root_only_filesystem_snapshot() {
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("only.rs"), "fn only() {}").expect("write");
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), None)
+            .await
+            .expect("run");
+        assert!(
+            handle.store_task.is_none(),
+            "no persistence task when there is no db_url"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:only.rs"),
+            "no-DB boot still parses and serves the on-disk file root: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "fn:only.rs:only"),
+            "no-DB snapshot stays lazy — no child function at the root: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 (read-error degradation). A persisted node whose `type` column is corrupted
+    /// to an unknown wire enum makes [`Storage::load_nodes`] return a
+    /// [`StorageError`](crate::storage::StorageError) — the rehydrate read error the
+    /// boot must catch, log, and degrade past, falling back to the empty-then-parse
+    /// path: the on-disk file is still parsed and served, and the run never panics or
+    /// aborts. Passes today (rehydrate is unwired); once wired it exercises the
+    /// caught-error branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_read_error_degrades_to_empty_then_parse() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("corrupt.db").display());
+        seed_persisted_graph(&db_url, RUN_SESSION_ID, &[("ghost.rs", "fn ghost() {}")]).await;
+
+        // Corrupt the persisted node's enum so the read side cannot reconstruct it —
+        // load_nodes must surface a StorageError, never panic.
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("open db to corrupt the row");
+        sqlx::query("UPDATE nodes SET type = 'not-a-real-type' WHERE session_id = ?")
+            .bind(RUN_SESSION_ID)
+            .execute(&pool)
+            .await
+            .expect("corrupt the persisted node type");
+        pool.close().await;
+
+        // A live on-disk file the empty-then-parse fallback must still serve.
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("live.rs"), "fn live() {}").expect("write live");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run must not panic/abort on a rehydrate read error");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:live.rs"),
+            "a rehydrate read error must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|id| id == "file:ghost.rs"),
+            "an atomic load error must discard the entire persisted graph — the corrupt seeded node must not leak into the snapshot: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#5 (reconcile-corrects-drift). After a warm start whose persisted graph drifts
+    /// from the on-disk source, the re-parse must win: the served graph matches the
+    /// re-parsed filesystem for files that still exist on disk, while a persisted file
+    /// that is absent on disk remains from the warm start.
+    ///
+    /// The DB holds `drift.rs` → `old_fn` and a `cold.rs` → `cold_fn` that is NOT on
+    /// disk; on disk `drift.rs` instead contains `new_fn`. After rehydrate + reparse:
+    /// - `file:cold.rs` is present (warm-started; it never gets re-parsed) — this is the
+    ///   RED proof: today the graph boots empty so `file:cold.rs` is absent;
+    /// - expanding `file:drift.rs` yields `new_fn` and NOT the stale `old_fn` — reconcile
+    ///   wins over the stale DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rehydrate_then_reparse_reconciles_drift_filesystem_wins() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("drift.db").display());
+        seed_persisted_graph(
+            &db_url,
+            RUN_SESSION_ID,
+            &[
+                ("drift.rs", "fn old_fn() {}"),
+                ("cold.rs", "fn cold_fn() {}"),
+            ],
+        )
+        .await;
+
+        // On disk, drift.rs has drifted to new_fn; cold.rs is deliberately absent.
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("drift.rs"), "fn new_fn() {}").expect("write drift");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        // RED proof: the warm-started, on-disk-absent file survives the reparse.
+        assert!(
+            roots.iter().any(|id| id == "file:cold.rs"),
+            "warm start must rehydrate the DB-only file (absent on disk) before reparse — \
+             missing means rehydrate is unwired: {roots:?}"
+        );
+        // The re-parsed file is also a root (from the filesystem).
+        assert!(
+            roots.iter().any(|id| id == "file:drift.rs"),
+            "the on-disk file must be a root after reparse: {roots:?}"
+        );
+
+        // Reconcile wins: expanding drift.rs shows the filesystem's new_fn, not the
+        // stale persisted old_fn.
+        let children = expand_subtree_nodes(&mut ws, "file:drift.rs").await;
+        let child_ids: Vec<&str> = children.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            child_ids.contains(&"fn:drift.rs:new_fn"),
+            "reparse must add the on-disk function fn:drift.rs:new_fn: {child_ids:?}"
+        );
+        assert!(
+            !child_ids.contains(&"fn:drift.rs:old_fn"),
+            "reparse must reconcile away the stale persisted fn:drift.rs:old_fn: {child_ids:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 sibling (open-store fail-soft). A `db_url` whose scheme `open_store` rejects
+    /// (`StorageError::Config`) must degrade exactly like the no-DB path: no persistence
+    /// task, an empty-then-parse graph, and the on-disk file still served — the run never
+    /// fails or panics on a bad storage URL (mirrors the `record_session`/read-error
+    /// degradation the story mandates for every storage failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_db_url_degrades_to_empty_then_parse() {
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("kept.rs"), "fn kept() {}").expect("write");
+
+        let handle = run_with_db_url(
+            repo.path().to_path_buf(),
+            local(),
+            Some("mysql://unsupported/scheme".to_string()),
+        )
+        .await
+        .expect("run must not fail on an unsupported db_url");
+        assert!(
+            handle.store_task.is_none(),
+            "an unsupported db_url scheme must disable persistence (no store task)"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:kept.rs"),
+            "a bad db_url must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// AC#4 sibling (schema fail-soft). A valid `sqlite:` DB whose `nodes` is a **VIEW**
+    /// opens cleanly (WAL pragma succeeds) but fails
+    /// [`Storage::ensure_schema`](crate::storage::Storage::ensure_schema) — its
+    /// `CREATE INDEX … ON nodes(…)` cannot index a view. The run must degrade to
+    /// empty-then-parse (no persistence task) and still serve the on-disk file, never
+    /// panicking — proving the schema-error branch of the rehydrate boot is fail-soft.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_error_degrades_to_empty_then_parse() {
+        let db_dir = tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("conflict.db");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        // Pre-create a valid SQLite DB whose `nodes` is a VIEW: connect (real DB) and the
+        // WAL pragma succeed, but ensure_schema's index-on-`nodes` cannot index a view, so
+        // ensure_schema errors — the connect-ok / schema-fail branch (not an open error).
+        let setup = sqlx::SqlitePool::connect(&format!("{db_url}?mode=rwc"))
+            .await
+            .expect("create conflict db");
+        sqlx::query("CREATE VIEW nodes AS SELECT 1 AS x")
+            .execute(&setup)
+            .await
+            .expect("create conflicting view");
+        setup.close().await;
+
+        let repo = tempdir().expect("repo tempdir");
+        std::fs::write(repo.path().join("survives.rs"), "fn survives() {}").expect("write");
+
+        let handle = run_with_db_url(repo.path().to_path_buf(), local(), Some(db_url))
+            .await
+            .expect("run must not fail on a schema error");
+        assert!(
+            handle.store_task.is_none(),
+            "a schema error must disable persistence (no store task)"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let env = next_envelope(&mut ws).await;
+        let roots = snapshot_root_ids(&env);
+        assert!(
+            roots.iter().any(|id| id == "file:survives.rs"),
+            "a schema error must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    // ---- P9-4: metrics emitter task (broadcast + events/sec accounting) ----
+
+    /// Reads envelopes until a `metrics.update` arrives (or times out via
+    /// [`next_envelope`]). The metrics emitter broadcasts on the same channel the WS
+    /// server fans out to clients, so a connected client observes each tick.
+    async fn next_metrics_update(ws: &mut ClientWs) -> EventEnvelope {
+        loop {
+            let env = next_envelope(ws).await;
+            if matches!(env.payload, Payload::MetricsUpdate { .. }) {
+                return env;
+            }
+        }
+    }
+
+    /// P9-4 AC: the emitter task broadcasts a `metrics.update` within a bounded window.
+    /// Booting the full stack over a single source file with a short **injected** metrics
+    /// interval (no wall-clock flakiness), a connected client observes a `metrics.update`
+    /// whose `node_count`/`edge_count` match the parsed graph and whose `parse_latency`
+    /// includes the parsed file (presence, not an exact latency value).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_emitter_broadcasts_update_reflecting_the_graph() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await; // drain the initial snapshot
+
+        let env = next_metrics_update(&mut ws).await;
+        assert_eq!(env.event_type, EventType::MetricsUpdate);
+        match env.payload {
+            Payload::MetricsUpdate {
+                node_count,
+                edge_count,
+                parse_latency,
+                ..
+            } => {
+                // `fn f() {}` → file:a.rs + fn:a.rs:f, joined by one file→function edge.
+                assert_eq!(node_count, 2, "node_count must match the live graph");
+                assert_eq!(edge_count, 1, "edge_count must match the live graph");
+                assert!(
+                    parse_latency.iter().any(|f| f.file_path == "a.rs"),
+                    "parse_latency must include the parsed file: {parse_latency:?}"
+                );
+            }
+            other => panic!("expected metrics.update, got {other:?}"),
+        }
+        handle.shutdown().await;
+    }
+
+    /// P9-4 AC: `events_per_sec_milli` is 0 for a quiet window. Booting an empty repo
+    /// (no source files → no broadcast activity) with a short injected interval, every
+    /// metrics tick reports 0 throughput — proving the emitter does NOT count its own
+    /// `metrics.update` broadcasts (else the second window would be non-zero).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_per_sec_milli_is_zero_in_a_quiet_window() {
+        let dir = tempdir().expect("tempdir"); // empty repo: nothing to broadcast
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        for _ in 0..2 {
+            let env = next_metrics_update(&mut ws).await;
+            match env.payload {
+                Payload::MetricsUpdate {
+                    events_per_sec_milli,
+                    ..
+                } => {
+                    assert_eq!(
+                        events_per_sec_milli, 0,
+                        "a quiet window must yield 0 events/sec"
+                    );
+                }
+                other => panic!("expected metrics.update, got {other:?}"),
+            }
+        }
+        handle.shutdown().await;
+    }
+
+    /// P9-4 AC: `events_per_sec_milli` reflects broadcast throughput. Booting over one
+    /// file, then generating broadcast activity (each CLV `test` line folds onto
+    /// `fn:a.rs:f` and broadcasts a `test.result` patch the emitter must count), at
+    /// least one metrics window overlapping the activity reports a non-zero throughput.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_per_sec_milli_is_non_zero_after_broadcast_activity() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Drive broadcast events: each line folds onto fn:a.rs:f and broadcasts a
+        // test.result patch the emitter counts toward the window's throughput.
+        for _ in 0..6 {
+            append_sink_line(
+                dir.path(),
+                r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"}"#,
+            );
+        }
+
+        let saw_non_zero = timeout(Duration::from_secs(6), async {
+            loop {
+                let env = next_metrics_update(&mut ws).await;
+                if let Payload::MetricsUpdate {
+                    events_per_sec_milli,
+                    ..
+                } = env.payload
+                {
+                    if events_per_sec_milli > 0 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            saw_non_zero.is_ok(),
+            "a window with observed broadcast events must yield non-zero events/sec"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Reads the row count of every persisted table at `db_url` (the same set the storage
+    /// layer manages), returning them keyed by table name so two reads can be compared for
+    /// equality. A not-yet-created table is treated as `0`. Test-only; opens and closes
+    /// its own read pool. The table names are fixed literals, never client input.
+    async fn all_table_counts(db_url: &str) -> Vec<(&'static str, i64)> {
+        const TABLES: [&str; 7] = [
+            "sessions",
+            "agents",
+            "protocol_versions",
+            "nodes",
+            "edges",
+            "test_results",
+            "agent_activity",
+        ];
+        let pool = sqlx::SqlitePool::connect(db_url)
+            .await
+            .expect("open db for read");
+        let mut counts = Vec::with_capacity(TABLES.len());
+        for table in TABLES {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+            counts.push((table, n));
+        }
+        pool.close().await;
+        counts
+    }
+
+    /// P9-4 AC (emitter → persist integration): with persistence enabled AND the metrics
+    /// emitter running on a short injected interval, a client observes `metrics.update`
+    /// frames on the broadcast channel, yet each one persists as a **no-op** — the store's
+    /// per-table row counts are identical across two consecutive ticks (`DATA_MODEL.md`
+    /// §B.5: self-observability metrics are ephemeral). Booting over an EMPTY repo makes
+    /// the emitter the only source of broadcast traffic, so any row a `metrics.update`
+    /// wrote would surface as a delta between the two snapshots. Bounded by
+    /// [`next_metrics_update`]'s timeout so it can never hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_update_broadcast_persists_as_a_no_op() {
+        let dir = tempdir().expect("tempdir"); // empty repo: only the emitter broadcasts
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("events.db").display());
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: Some(db_url.clone()),
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+        assert!(
+            handle.store_task.is_some(),
+            "a persistence task exists when a db_url is set"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await; // drain the initial snapshot
+
+        // Observe one metrics.update, snapshot the table counts, observe another, snapshot
+        // again. At least one full tick's worth of `metrics.update`s flows through the
+        // persist task between the two reads, so a metrics write would show as a delta.
+        let _ = next_metrics_update(&mut ws).await;
+        let before = all_table_counts(&db_url).await;
+        let _ = next_metrics_update(&mut ws).await;
+        let after = all_table_counts(&db_url).await;
+
+        assert_eq!(
+            before, after,
+            "a broadcast metrics.update must persist nothing — counts changed: {before:?} -> {after:?}"
         );
         handle.shutdown().await;
     }

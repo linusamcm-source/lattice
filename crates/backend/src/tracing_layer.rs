@@ -27,7 +27,10 @@
 //! per window are the cheapest structure that *provably* bounds the line rate — see the
 //! `throttle_bounds_emissions_per_window` test — while still surfacing both an enter and
 //! an exit sample per window. The borrow-first hot path also allocates nothing once an
-//! edge is tracked, so a suppressed tight loop does no heap work.
+//! edge is tracked, so a suppressed tight loop does no heap work. The per-edge tally map
+//! is kept bounded too: once it exceeds [`THROTTLE_TALLY_CAP`] entries a
+//! **once-per-window** amortized sweep evicts tallies from older windows, so tracing an
+//! unbounded stream of distinct edges over a long run cannot grow memory without bound.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -63,6 +66,22 @@ pub const THROTTLE_ENTER_CAP: u32 = 2;
 /// terminal `exit` is never starved by `enter` spam in the same window — the edge
 /// always gets to go cold.
 pub const THROTTLE_EXIT_CAP: u32 = 1;
+
+/// Soft cap on distinct edge tallies before [`HotEdgeThrottle`] evicts stale entries.
+///
+/// The per-edge tally map is keyed by edge id, so a long run that traces an unbounded
+/// stream of distinct edges would grow it forever. Once the map exceeds this many
+/// entries, [`HotEdgeThrottle::note`] runs an **amortized sweep** that drops every
+/// tally whose `window_id` is older than the current window — a re-touched edge simply
+/// re-inserts a fresh tally, so eviction is correctness-neutral. The sweep can only ever
+/// evict entries from *older* windows, so re-running it within the same window frees
+/// nothing; it is therefore gated by [`HotEdgeThrottle`]'s `last_sweep_window` to run
+/// **at most once per window**. A window that inserts far more than the cap of distinct
+/// edges thus pays a single O(N) sweep — not one per insert (which would be O(M²) for M
+/// edges) — so the steady-state hot path stays O(1) and zero-alloc while amortized cost
+/// stays O(1) per insert. 4096 comfortably covers the live-edge working set of a real
+/// call graph while keeping worst-case memory bounded.
+pub const THROTTLE_TALLY_CAP: u32 = 4096;
 
 /// Per-edge emission tally scoped to a single throttle window.
 struct WindowTally {
@@ -114,11 +133,22 @@ pub struct HotEdgeThrottle {
     enter_cap: u32,
     /// Maximum `exit` lines emitted per edge per window.
     exit_cap: u32,
-    /// Live per-edge tally keyed by edge id. Not evicted: memory is bounded by the
-    /// count of *distinct* edge ids (`e:<from>-><to>` over static node ids — a finite
-    /// property of the traced call graph), not by transition count, so it cannot grow
-    /// without bound over time.
+    /// Live per-edge tally keyed by edge id. **Bounded by amortized eviction:** while
+    /// the live-edge working set is normally small, an unbounded stream of distinct
+    /// edge ids over a long run could otherwise grow this map forever, so once it
+    /// exceeds [`THROTTLE_TALLY_CAP`] entries [`HotEdgeThrottle::note`] sweeps out every
+    /// tally from a window older than the current one. The sweep is correctness-neutral
+    /// — a re-touched edge re-inserts a fresh tally — and runs only past the cap, so the
+    /// steady-state hot path never scans the map.
     tallies: HashMap<String, WindowTally>,
+    /// The `window_id` in which the eviction sweep last ran, so the O(N) `retain` fires
+    /// **at most once per window** rather than on every over-cap insert. The sweep can
+    /// only evict tallies from *older* windows, so a second sweep in the same window
+    /// would free nothing; gating on this field turns a within-window burst of
+    /// more-than-cap distinct edges from O(M²) back into amortized O(1) per insert. It
+    /// starts at `0` (the initial window); the guard `window_id > last_sweep_window`
+    /// simply skips the futile window-0 sweep.
+    last_sweep_window: u64,
 }
 
 impl HotEdgeThrottle {
@@ -133,6 +163,7 @@ impl HotEdgeThrottle {
             enter_cap,
             exit_cap,
             tallies: HashMap::new(),
+            last_sweep_window: 0,
         }
     }
 
@@ -152,7 +183,14 @@ impl HotEdgeThrottle {
     /// are budgeted independently, so a lone terminal `exit` still emits even after
     /// the `enter` budget is exhausted. **Zero-alloc hot path:** an already-tracked
     /// edge is looked up by borrow and allocates nothing — a `String` key is only
-    /// minted the first time an edge is seen.
+    /// minted the first time an edge is seen. **Amortized eviction:** minting a new key
+    /// that pushes the tally map past [`THROTTLE_TALLY_CAP`] triggers a sweep dropping
+    /// every tally from an older window; the O(N) scan runs only when the cap is
+    /// exceeded (never on the steady-state already-tracked path) **and at most once per
+    /// window** (gated by `last_sweep_window`), since a repeat sweep in the same window
+    /// could evict nothing. That gate keeps a within-window burst of more-than-cap
+    /// distinct edges amortized O(1) per insert instead of O(M²). The sweep is
+    /// correctness-neutral since a re-touched edge re-inserts a fresh tally.
     pub fn note(&mut self, edge: &str, state: HotEdgeState, now_millis: u64) -> bool {
         let window_id = now_millis / self.window_ms;
         // Borrow-first: only mint an owned key the first time this edge is seen, so the
@@ -165,6 +203,18 @@ impl HotEdgeThrottle {
             self.tallies
                 .entry(edge.to_owned())
                 .or_insert_with(|| WindowTally::fresh(window_id));
+            // Only a fresh key can grow the map; sweep stale windows when it exceeds the
+            // cap. The retain can only drop tallies from *older* windows, so re-running
+            // it within one window frees nothing — gate it to once per window
+            // (`window_id > last_sweep_window`) so a burst of more-than-cap distinct
+            // edges in a single window stays amortized O(1) per insert, not O(M²). The
+            // just-inserted edge is in the current window, so it always survives.
+            if self.tallies.len() > THROTTLE_TALLY_CAP as usize
+                && window_id > self.last_sweep_window
+            {
+                self.tallies.retain(|_, tally| tally.window_id >= window_id);
+                self.last_sweep_window = window_id;
+            }
         }
         let Some(tally) = self.tallies.get_mut(edge) else {
             // Unreachable: the key was just ensured present. Stay panic-free regardless.
@@ -502,5 +552,94 @@ mod tests {
             }
             other => panic!("expected HotEdge exit, got {other:?}"),
         }
+    }
+
+    /// P9-8: `HotEdgeThrottle.tallies` must NOT grow without bound. The map was
+    /// insert-only (the "finite edge set" assumption at `tracing_layer.rs:117-121`);
+    /// P9-8 adds an amortized eviction sweep — when the map exceeds a named cap
+    /// `THROTTLE_TALLY_CAP`, entries older than the current `window_id` are dropped.
+    ///
+    /// Feeds transitions across MANY distinct edge ids over MANY windows (each
+    /// window touching a fresh batch of more-than-cap unique edges) and asserts the
+    /// map stays bounded by `cap + one window's live edges`, rather than ballooning
+    /// to `windows * edges_per_window` insert-only entries.
+    ///
+    /// RED until `super::THROTTLE_TALLY_CAP` and the eviction sweep exist: the
+    /// constant does not compile today (E0425), and the current insert-only `note`
+    /// would retain every distinct edge forever.
+    #[test]
+    fn tallies_are_evicted_and_do_not_grow_without_bound() {
+        let mut throttle = HotEdgeThrottle::new(100, THROTTLE_ENTER_CAP, THROTTLE_EXIT_CAP);
+        let cap = THROTTLE_TALLY_CAP as usize;
+
+        // Each window touches `cap + 8` fresh unique edges — already over the cap —
+        // so the insert-only map would balloon to `windows * (cap + 8)` entries. The
+        // amortized sweep (dropping entries older than the current window once the
+        // map exceeds the cap) must keep it bounded.
+        let edges_per_window = cap + 8;
+        let windows: u64 = 8;
+        for w in 0..windows {
+            // Distinct `window_id` per `w` (now / window_ms == w for window_ms 100).
+            let now = w * 100;
+            for e in 0..edges_per_window {
+                throttle.note(&format!("e:w{w}->n{e}"), HotEdgeState::Enter, now);
+            }
+        }
+
+        let bound = cap + edges_per_window; // cap + one window's live edges
+        assert!(
+            throttle.tallies.len() <= bound,
+            "tallies grew unbounded: {} entries for {} distinct edges over {windows} windows; \
+             expected <= cap + one window's edges ({bound})",
+            throttle.tallies.len(),
+            windows as usize * edges_per_window,
+        );
+    }
+
+    /// P9-8 fix: the eviction sweep is gated to run **at most once per window**, since a
+    /// `retain` can only drop tallies from *older* windows and would free nothing if
+    /// re-run within the same window. This proves the gate is correct: a single window
+    /// bursting well past the cap of distinct edges retains them all (nothing older to
+    /// evict), then the *first* over-cap insert of the next window sweeps the whole prior
+    /// window out in one pass — collapsing the map — while per-edge budgets are
+    /// unaffected. Regression against the within-window O(M²) re-sweep.
+    #[test]
+    fn tally_sweep_is_gated_to_once_per_window_yet_stays_bounded() {
+        let mut throttle = HotEdgeThrottle::new(100, THROTTLE_ENTER_CAP, THROTTLE_EXIT_CAP);
+        let cap = THROTTLE_TALLY_CAP as usize;
+
+        // Window 0: insert far more than the cap of distinct edges. No sweep can evict
+        // current-window entries, so every one is retained — the inherent per-window
+        // memory bound, not unbounded growth.
+        let burst = cap + 500;
+        for e in 0..burst {
+            throttle.note(&format!("e:w0->n{e}"), HotEdgeState::Enter, 0);
+        }
+        assert_eq!(
+            throttle.tallies.len(),
+            burst,
+            "within one window every distinct edge is retained (nothing older to evict)"
+        );
+
+        // Window 1: the first over-cap insert triggers the single per-window sweep,
+        // dropping every window-0 tally in one pass and leaving only the new edge.
+        assert!(throttle.note("e:w1->n0", HotEdgeState::Enter, 100));
+        assert_eq!(
+            throttle.tallies.len(),
+            1,
+            "the once-per-window sweep evicts every window-0 tally, leaving only the new one"
+        );
+
+        // Per-edge budgets are unaffected by the gated sweep: a fresh edge in the new
+        // window still gets its full enter budget, and re-noting the swept-and-reinserted
+        // edge behaves like a fresh window-1 tally.
+        assert!(
+            throttle.note("e:w1->fresh", HotEdgeState::Enter, 100),
+            "a fresh edge in the new window emits its first enter"
+        );
+        assert!(
+            throttle.note("e:w1->fresh", HotEdgeState::Exit, 100),
+            "the independent exit sub-budget is unaffected by the gated sweep"
+        );
     }
 }

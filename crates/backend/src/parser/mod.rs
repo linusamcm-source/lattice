@@ -35,11 +35,27 @@
 //! binding winning, so the contribution holds no duplicate ids or edges.
 //!
 //! Per `SPEC.md` §6/§11.1 the parser is **panic-free**: malformed input never
-//! aborts. When `syn::parse_file` rejects the source, the function returns a
-//! [`ParsedFile`] holding only the file node with [`NodeStatus::Error`] and no
-//! function nodes, so a downstream graph still receives a partial, well-formed
-//! contribution. The caller supplies an already repo-relative `path`
-//! (normalisation is a separate concern).
+//! aborts. The *granularity* of recovery, however, differs by language, and the
+//! difference is a deliberate, documented limitation:
+//!
+//! - **Rust (`syn`) is all-or-nothing.** `syn::parse_file` either yields a whole
+//!   AST or fails outright, so on *any* syntax error [`parse_rust_source`] returns
+//!   a [`ParsedFile`] holding **only** the file node with [`NodeStatus::Error`] —
+//!   there is no partial tree, and every sibling item (even a syntactically valid
+//!   one beside the broken one) is discarded.
+//! - **Python / TypeScript (`tree-sitter`) recover siblings.** The shared
+//!   [`treesitter`] walk emits every `function`/`variable` it can still read from
+//!   the partial parse tree and flags the **file** node [`NodeStatus::Error`] when
+//!   the tree reports a syntax error. Valid siblings stay live, so a function
+//!   declared *before* a broken one is still extracted. The mark is coarse
+//!   (file-level, not the individual offending node); fully marking the offending
+//!   node — and closing the `syn` all-or-nothing gap — is a future refinement, not
+//!   done here, so `SPEC.md` §11.1's "offending node marked `error`" remains a
+//!   file-level approximation on both paths.
+//!
+//! Either way a downstream graph still receives a well-formed contribution. The
+//! caller supplies an already repo-relative `path` (normalisation is a separate
+//! concern).
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,8 +64,8 @@ use quote::ToTokens;
 use syn::visit::Visit;
 
 use crate::wire::{
-    edge_id, node_id, typed_edge_id, Edge, EdgeKind, Meta, Node, NodeStatus, NodeType, Param,
-    Range, Signature,
+    derive_child_ids, edge_id, node_id, typed_edge_id, Edge, EdgeKind, Meta, Node, NodeStatus,
+    NodeType, Param, Range, Signature,
 };
 
 mod treesitter;
@@ -90,9 +106,13 @@ pub struct ParsedFile {
 /// (`param_source` / `data_flows_from`) edges derived from the function bodies;
 /// the node set and `contains` edges are unchanged by this step.
 ///
-/// Recovery (panic-free): if `syn::parse_file` fails, the returned [`ParsedFile`]
+/// Recovery (panic-free, **all-or-nothing**): `syn::parse_file` yields either a
+/// whole AST or an error, so on any syntax error the returned [`ParsedFile`]
 /// contains only the file node with status [`NodeStatus::Error`] and no functions
-/// or variables.
+/// or variables — even a syntactically valid sibling item beside the broken one is
+/// discarded. This is the documented language asymmetry: the `tree-sitter` paths
+/// ([`parse_python`] / [`parse_typescript`]) instead keep valid siblings live under
+/// a file-level error (see the module doc).
 pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
     let file_id = node_id(NodeType::File, path, "");
     let label = std::path::Path::new(path)
@@ -181,7 +201,11 @@ pub fn parse_rust_source(path: &str, source: &str) -> ParsedFile {
 /// language Lattice does not parse in Phase 2, so the result is a bare `file` node
 /// (status [`NodeStatus::Unknown`], no function/variable children and no edges) —
 /// the file still appears in the graph, just without an extracted interior.
-/// Panic-free: each delegate recovers from malformed input on its own.
+/// Panic-free: each delegate recovers from malformed input on its own, with the
+/// recovery *asymmetry* documented at the module level — Rust/`syn` is
+/// all-or-nothing (a syntax error leaves only the file node with
+/// [`NodeStatus::Error`]) while the `tree-sitter` paths keep valid siblings live
+/// under a file-level error.
 pub fn parse_source(path: &str, source: &str) -> ParsedFile {
     let mut parsed = match std::path::Path::new(path)
         .extension()
@@ -214,19 +238,17 @@ pub fn parse_source(path: &str, source: &str) -> ParsedFile {
 /// subtree itself is fetched on `expand`). This derives `child_ids` from the
 /// `contains` edges so a `file` node lists its `function` children and a
 /// `function` node lists its `variable` children.
+///
+/// The derivation goes through the shared [`derive_child_ids`] helper, which sorts
+/// each `child_ids` **canonically by child id**. Using the same helper as the
+/// crash-rebuild [`crate::graph::Graph::from_records`] guarantees a freshly parsed node
+/// and a node rebuilt from persisted records are **byte-equal**, so a reparse after a
+/// warm start is a no-op regardless of the loaded edge order.
 fn populate_child_ids(parsed: &mut ParsedFile) {
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for edge in &parsed.edges {
-        if edge.kind == EdgeKind::Contains {
-            children
-                .entry(edge.source.clone())
-                .or_default()
-                .push(edge.target.clone());
-        }
-    }
+    let mut children = derive_child_ids(&parsed.edges);
     for node in &mut parsed.nodes {
-        if let Some(ids) = children.get(&node.id) {
-            node.child_ids = ids.clone();
+        if let Some(ids) = children.remove(&node.id) {
+            node.child_ids = ids;
         }
     }
 }
@@ -1514,5 +1536,132 @@ mod tests {
             2,
             "exactly the two file->function contains edges, unaffected by calls"
         );
+    }
+
+    /// Deterministic, dependency-free pseudo-random byte source (a 64-bit LCG) so
+    /// the fuzz corpus is fully reproducible — no `rand`, no wall-clock seed.
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    /// Builds the deterministic malformed/random corpus exercised by the
+    /// panic-freedom tests: a fixed set of hand-picked malformed fragments (across
+    /// several languages plus adversarial byte shapes) followed by a bounded,
+    /// seeded run of pseudo-random byte vectors made into valid `&str` via lossy
+    /// UTF-8 conversion. Identical on every run.
+    fn fuzz_corpus() -> Vec<String> {
+        let fixed: &[&str] = &[
+            "",
+            "fn foo( {",
+            "fn b( { a(",
+            "def (:\n",
+            "function (",
+            "}}}}{{{{",
+            "\"unterminated string",
+            "/* unclosed comment",
+            "let x = ;;;",
+            "🦀🦀🦀 not code 🦀",
+            "\0\0\0\0",
+            "use use use use",
+            "impl impl for for {{",
+            "\t\n\r  \n",
+            "(((((((((((((((((((",
+            "class C: def def def",
+            "const = = = =>",
+            "/// doc with no item",
+            "//! \n//! \n",
+            "0xZZZ 1.2.3.4 'a",
+        ];
+        let mut corpus: Vec<String> = fixed.iter().map(|s| (*s).to_string()).collect();
+
+        let mut state: u64 = 0x5151_5151_5151_5151;
+        for _ in 0..64 {
+            let len = (lcg_next(&mut state) % 48) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((lcg_next(&mut state) & 0xff) as u8);
+            }
+            corpus.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        corpus
+    }
+
+    #[test]
+    fn parse_source_never_panics_across_dispatch_for_malformed_corpus() {
+        // Every dispatch arm (rs/py/ts + an unknown extension) must survive the
+        // whole malformed/random corpus without panicking and still return at
+        // least a file node so the file stays visible in the graph.
+        let extensions = ["rs", "py", "ts", "md"];
+        let corpus = fuzz_corpus();
+        for ext in extensions {
+            let path = format!("fuzz.{ext}");
+            for source in &corpus {
+                let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parse_source(&path, source)
+                }))
+                .unwrap_or_else(|_| panic!("parse_source panicked: ext={ext} source={source:?}"));
+                assert!(
+                    !parsed.nodes.is_empty(),
+                    "ext={ext} source={source:?}: expected at least a file node"
+                );
+                assert_eq!(
+                    parsed.nodes[0].node_type,
+                    NodeType::File,
+                    "ext={ext} source={source:?}: first node must be the file node"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_source_unknown_extension_and_empty_source_yield_a_bare_file_node() {
+        // An unknown extension is never parsed: any body (including the whole
+        // fuzz corpus) yields exactly the bare `file` node, status Unknown.
+        for source in fuzz_corpus() {
+            let parsed = parse_source("fuzz.unknownext", &source);
+            assert_eq!(
+                ids(&parsed),
+                vec!["file:fuzz.unknownext"],
+                "unknown extension must yield only a bare file node"
+            );
+            assert_eq!(parsed.nodes[0].status, NodeStatus::Unknown);
+            assert!(parsed.edges.is_empty(), "bare file node has no edges");
+        }
+        // Empty source on every parsed extension still yields a file node.
+        for ext in ["rs", "py", "ts", "md"] {
+            let parsed = parse_source(&format!("empty.{ext}"), "");
+            assert!(
+                !parsed.nodes.is_empty(),
+                "empty {ext} source must still yield a file node"
+            );
+            assert_eq!(parsed.nodes[0].node_type, NodeType::File);
+        }
+    }
+
+    #[test]
+    fn rust_is_all_or_nothing_a_valid_fn_beside_a_syntax_error_is_discarded() {
+        // Locks the documented language asymmetry: unlike the tree-sitter paths
+        // (which keep valid siblings live), `syn` is all-or-nothing — one syntax
+        // error anywhere discards every sibling, so a perfectly valid `good`
+        // beside a broken item leaves ONLY the file node, status Error.
+        let parsed = parse_source("x.rs", "fn good() {}\nfn bad( {");
+        assert_eq!(
+            ids(&parsed),
+            vec!["file:x.rs"],
+            "syn discards all siblings on any syntax error"
+        );
+        assert!(
+            function_nodes(&parsed).is_empty(),
+            "no function nodes survive a syn parse error"
+        );
+        assert!(
+            variable_nodes(&parsed).is_empty(),
+            "no variable nodes survive a syn parse error"
+        );
+        assert_eq!(parsed.nodes[0].status, NodeStatus::Error);
+        assert!(parsed.edges.is_empty(), "no edges on a syn parse error");
     }
 }
