@@ -162,7 +162,7 @@ are marked.
    They declare the overlapping `crates/backend/src/graph.rs` glob in `Touches` so the scheduler
    **serializes** them (no parallel collision), per the Phase-8 precedent.
 7. **`from_records` re-derives `child_ids` from the loaded `contains` edges (adversarial review
-   CRITICAL).** `Node.child_ids` (`wire.rs:271`) is part of `Eq` and is populated by the parser from
+   CRITICAL).** `Node.child_ids` (`wire.rs:273`) is part of `Eq` and is populated by the parser from
    `contains` edges (`parser/mod.rs:217-231`) but is **never persisted** (no column; `NodeUpsert`
    binds 12 fields without it, `sqlite.rs:301-318`), so `load_nodes` returns `child_ids: []`.
    `from_records` must re-derive them (reusing the parser's `populate_child_ids` rule: a parent
@@ -200,11 +200,13 @@ by live activity, per Design Decision #1). No `app.rs` wiring yet — pure read+
   a `node.remove`-then-`load` does not return the removed node.
 - **`from_records` round-trips parse state losslessly.** Given the nodes/edges produced by
   `parse_source` of one or more files, `Graph::from_records("sess-local", loaded_nodes, loaded_edges)`
-  yields a graph whose `snapshot()` equals the snapshot of a graph that **parsed the same files**
-  (baseline carries the parser's derived `child_ids`, so the comparison is well-posed — adversarial
-  review CRITICAL), and whose subsequent `apply_parsed` of any of those files **unchanged** returns
-  an **empty** `Vec` (no spurious `node.upsert`/`node.remove`) — proving `child_ids` re-derivation and
-  the `file_nodes`/`file_edges` rebuild are correct.
+  yields a graph whose `snapshot()` is **order-independently equal** to the snapshot of a graph that
+  **parsed the same files** — compare nodes/edges as **sets keyed by id** and `child_ids` as a
+  **sorted/normalised** set, because `snapshot()` collects from unsorted `HashMap::values()`
+  (`graph.rs:156-169`) so a raw `assert_eq!` on two distinct graphs is order-flaky (adversarial review
+  MEDIUM). The **load-bearing** correctness proof is the next clause: a subsequent `apply_parsed` of
+  any of those files **unchanged** returns an **empty** `Vec` (no spurious `node.upsert`/`node.remove`)
+  — proving `child_ids` re-derivation and the `file_nodes`/`file_edges` rebuild are correct.
 - The multi-file case is covered: a graph rebuilt from two files' records, re-parsing **one**
   unchanged file, emits an empty diff and does **not** remove the other file's nodes (edge→file
   grouping attributes cross-file edges to their source file).
@@ -282,7 +284,8 @@ both backends is exhaustive with no wildcard, add a no-op skip arm `Payload::Met
   `edgeCount:u64`, `memoryBytes:u64`, `eventsPerSecMilli:u64`, and
   `parseLatency: Vec<FileParseLatency>` where `FileParseLatency { filePath:String, durationUs:u64 }`;
   all camelCase JSON keys via explicit serde rename. `Payload` and `EventEnvelope` **still derive
-  `Eq`** (all-integer fields) — `just qg` compiles clean.
+  `Eq`**, which requires `FileParseLatency` to **also `derive(Eq)`** (its `String`+`u64` fields allow
+  it) since `Payload::MetricsUpdate` holds `Vec<FileParseLatency>` — `just qg` compiles clean.
 - `serde_json` round-trips a `metrics.update` envelope (serialize → deserialize → equal); a unit test
   decodes the literal JSON from `DATA_MODEL.md` §A.5 into `Payload::MetricsUpdate`.
 - Untagged-decode disambiguation is proven: a `metrics.update` payload does **not** mis-decode as any
@@ -500,7 +503,7 @@ tallies eviction** (scope #4 harden): `HotEdgeThrottle.tallies` (`tracing_layer.
 evicted — drop tally entries whose `window_id` is older than the current window via an **amortized
 sweep triggered when `tallies.len()` exceeds a cap** (not an O(N) scan inside the zero-alloc `note`
 hot path, `tracing_layer.rs:153-168`), keeping the per-edge throttle correctness. (c) **Length-bounded
-collector read** (deferral #2): `poll_once` (`collector.rs:174-196`) `read_to_end`s the **entire**
+collector read** (deferral #2): `poll_once` (`collector.rs:147-197`, read body L174-196) `read_to_end`s the **entire**
 appended region in one allocation and accumulates a partial line across polls if no `\n` arrives —
 bound **both**: read in capped chunks (not `read_to_end`) and, on an over-length line, **resync to the
 next `\n`** (carrying a skip flag across polls when the over-long line spans reads), never corrupting
