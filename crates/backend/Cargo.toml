@@ -2,6 +2,10 @@
 name = "lattice-backend"
 version = "0.1.0"
 edition = "2021"
+description = "Live code & agent visualiser: a single binary watches a repo, parses it into a structural graph, and serves a lazy drill-down SvelteFlow UI it hosts itself over HTTP + WebSocket."
+repository = "https://github.com/linusamcm-source/lattice"
+readme = "../../README.md"
+license = "MIT OR Apache-2.0"
 
 build = "build.rs"
 

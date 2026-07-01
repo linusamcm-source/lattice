@@ -19,6 +19,13 @@ test:
 build:
     cargo build --all
 
+# Release build: compile the frontend bundle FIRST so the `--release` rust-embed
+# build embeds the freshly-built UI, then build the self-contained `lattice`
+# binary (serves the UI on its own port). Output: target/release/lattice.
+release:
+    npm --prefix frontend run build
+    cargo build --release -p lattice-backend
+
 # Run backend (127.0.0.1:7000, override LATTICE_ADDR) + frontend dev together.
 # Open http://localhost:5173 once both are up; Ctrl-C stops both.
 run dir=".":
