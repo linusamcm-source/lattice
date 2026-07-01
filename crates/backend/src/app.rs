@@ -12,8 +12,19 @@
 //! ([`collect`](crate::collector::collect)), which tails
 //! `<root>/.lattice/clv.ndjson` and folds each correlated `test`/`status` event
 //! onto its node's colour — so a failing test reddens its node within ~1s on the
-//! same live graph the watcher feeds. [`RunHandle::shutdown`] aborts the watcher,
-//! the pump, the collector, and the optional persistence task.
+//! same live graph the watcher feeds.
+//!
+//! It also spawns the Phase-9 **self-observability** metrics emitter: a task ticking
+//! on [`RunConfig::metrics_interval`] that counts broadcast throughput over each window
+//! (excluding its **own** `metrics.update` emissions) and broadcasts a `metrics.update`
+//! carrying live node/edge counts, a deterministic memory estimate, events/sec, and
+//! per-file parse latencies (`SPEC.md` §11.3). To avoid contending with the
+//! watcher/collector, the emitter holds the graph lock only for a lock-light
+//! [`Graph::metrics_snapshot`] and does the sort + clock stamp + envelope assembly
+//! off-lock ([`crate::graph::MetricsSnapshot::into_envelope`]). Parse latency is measured
+//! at the [`ingest_file`] call site so the initial WalkDir parse already populates the
+//! map. [`RunHandle::shutdown`] aborts the watcher, the pump, the collector, the metrics
+//! emitter, and the optional persistence task.
 //!
 //! Persistence is an **opt-in, best-effort write-through** (Phase 7,
 //! `DATA_MODEL.md` §B): set `LATTICE_DB_URL` and [`run`] also subscribes a task that
@@ -39,6 +50,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -49,7 +61,7 @@ use crate::graph::Graph;
 use crate::parser::parse_source;
 use crate::storage::open_store;
 use crate::watcher::{is_source_file, watch};
-use crate::wire::EventEnvelope;
+use crate::wire::{EventEnvelope, EventType};
 use crate::ws::{serve, BoundServer};
 
 /// Capacity of the broadcast channel fanning patch events out to WS clients.
@@ -60,10 +72,36 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// (`"sess-local"`) so the run's `sessions` row aligns with the in-memory graph.
 const RUN_SESSION_ID: &str = "sess-local";
 
+/// Default cadence of the self-observability metrics emitter in production.
+///
+/// A two-second tick is frequent enough to feel live in the debug panel yet cheap
+/// (one graph lock + one broadcast per tick), and — with the emitter's **first** tick
+/// deferred by one interval — leaves the fast full-stack tests (which finish their
+/// reads well inside two seconds) free of interleaved `metrics.update` frames.
+/// [`run_with_db_url`] uses this; [`run_with_config`] lets a test inject a shorter
+/// interval to exercise the emitter without wall-clock flakiness.
+const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Tuning knobs for a Lattice backend run ([`run_with_config`]).
+///
+/// Separates the persistence target from the metrics cadence so tests can drive a
+/// short, deterministic [`RunConfig::metrics_interval`] while production keeps the
+/// [`DEFAULT_METRICS_INTERVAL`]. [`run_with_db_url`] constructs one with the production
+/// default and delegates here.
+pub struct RunConfig {
+    /// Optional persistence target (Phase 7/9). [`Some`] enables crash-rebuild + best-
+    /// effort write-through against that database URL; [`None`] runs with no database.
+    pub db_url: Option<String>,
+    /// How often the self-observability metrics emitter ticks and broadcasts a
+    /// `metrics.update` envelope.
+    pub metrics_interval: Duration,
+}
+
 /// A running Lattice backend: the WebSocket server plus the watcher pump.
 ///
 /// Holds the bound server [`addr`](RunHandle::addr) (read it to connect) and the
 /// background tasks. [`RunHandle::shutdown`] stops the server and the watcher.
+/// `metrics_task` is the Phase-9 self-observability emitter (always present).
 /// `store_task` is the optional opt-in persistence task: it is [`Some`] only when a
 /// `LATTICE_DB_URL` was provided **and** the store opened and applied its schema
 /// successfully ([`run_with_db_url`]); it is [`None`] when persistence is disabled
@@ -75,17 +113,19 @@ pub struct RunHandle {
     watcher_task: JoinHandle<()>,
     pump_task: JoinHandle<()>,
     collector_task: JoinHandle<()>,
+    metrics_task: JoinHandle<()>,
     store_task: Option<JoinHandle<()>>,
 }
 
 impl RunHandle {
-    /// Stops the WebSocket server, the watcher pump, the CLV collector, and (when
-    /// present) the persistence task, and waits for teardown.
+    /// Stops the WebSocket server, the watcher pump, the CLV collector, the metrics
+    /// emitter, and (when present) the persistence task, and waits for teardown.
     pub async fn shutdown(self) {
         self.server.shutdown().await;
         self.watcher_task.abort();
         self.pump_task.abort();
         self.collector_task.abort();
+        self.metrics_task.abort();
         if let Some(store_task) = self.store_task {
             store_task.abort();
         }
@@ -107,7 +147,10 @@ fn repo_relative(root: &Path, path: &Path) -> Option<String> {
 /// Reads, parses, and applies one changed source file into `graph`, returning patch events.
 ///
 /// The repo-relative path is lowered through [`parse_source`], which dispatches on
-/// the file extension (Rust/Python/TypeScript, else a bare `file` node). Returns an
+/// the file extension (Rust/Python/TypeScript, else a bare `file` node). The parse is
+/// **timed** and its `duration_us` recorded via [`Graph::record_parse_latency`] (Phase-9
+/// self-observability) so the metrics emitter can report per-file parse latency — the
+/// initial WalkDir parse populates the map before any client connects. Returns an
 /// empty vector (logging the cause) when the file is outside `root` or cannot be
 /// read; never panics.
 async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec<EventEnvelope> {
@@ -121,8 +164,12 @@ async fn ingest_file(graph: &Arc<Mutex<Graph>>, root: &Path, path: &Path) -> Vec
             return Vec::new();
         }
     };
+    let started = std::time::Instant::now();
     let parsed = parse_source(&rel, &source);
-    graph.lock().await.apply_parsed(parsed)
+    let micros = started.elapsed().as_micros() as u64;
+    let mut guard = graph.lock().await;
+    guard.record_parse_latency(&rel, micros);
+    guard.apply_parsed(parsed)
 }
 
 /// Default WebSocket listen address used when `LATTICE_ADDR` is unset.
@@ -160,9 +207,37 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
     run_with_db_url(root, addr, std::env::var("LATTICE_DB_URL").ok()).await
 }
 
+/// Starts the Lattice backend against `root` on `addr` with an optional persistence
+/// `db_url` and the production metrics cadence.
+///
+/// A thin wrapper over [`run_with_config`] that pairs `db_url` with the
+/// [`DEFAULT_METRICS_INTERVAL`]. All boot behaviour (crash-rebuild, reconcile, persist,
+/// metrics emitter) is documented on [`run_with_config`]; this preserves the historical
+/// `run_with_db_url` signature and call sites.
+///
+/// # Errors
+/// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server cannot
+/// bind to `addr`. A storage problem never fails the run — it degrades to no
+/// persistence (see [`run_with_config`]).
+pub async fn run_with_db_url(
+    root: PathBuf,
+    addr: SocketAddr,
+    db_url: Option<String>,
+) -> std::io::Result<RunHandle> {
+    run_with_config(
+        root,
+        addr,
+        RunConfig {
+            db_url,
+            metrics_interval: DEFAULT_METRICS_INTERVAL,
+        },
+    )
+    .await
+}
+
 /// Starts the Lattice backend against `root` on `addr`, optionally crash-rebuilding
-/// the graph from `db_url` and write-through persisting the structured event stream
-/// back to it.
+/// the graph from `config.db_url` and write-through persisting the structured event
+/// stream back to it, ticking the metrics emitter at `config.metrics_interval`.
 ///
 /// Boot order is **rehydrate, then reconcile, then serve** (Phase 9, crash-rebuild):
 /// 1. Canonicalise `root` and, when `db_url` is [`Some`], [`open_store`] +
@@ -181,7 +256,16 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
 ///    wins**, so a stale persisted file is corrected and an empty graph is filled.
 /// 4. Start the WebSocket [`serve`]r (whose first snapshot now reflects the
 ///    rehydrated-and-reconciled roots), then spawn the watcher pump (re-parses
-///    changed files, broadcasting patch events) and the CLV [`collect`]or.
+///    changed files, broadcasting patch events), the CLV [`collect`]or, and the
+///    self-observability metrics emitter. The emitter ticks every
+///    `config.metrics_interval`, counts the envelopes broadcast during the window
+///    (its own `metrics.update` emissions **excluded**, so a quiet window reports 0
+///    events/sec), and — holding the graph lock only for a lock-light
+///    [`Graph::metrics_snapshot`] — broadcasts a `metrics.update` assembled off-lock
+///    ([`crate::graph::MetricsSnapshot::into_envelope`]) with the live counts, a
+///    deterministic memory estimate, that throughput, and the per-file parse latencies.
+///    Because it broadcasts on the same channel the WS server fans out, the persist
+///    subscriber sees each `metrics.update` as a no-op (P9-3, ephemeral).
 ///
 /// When `db_url` is [`Some`], the **best-effort** persistence task subscribes to the
 /// broadcast channel and write-throughs every structured [`EventEnvelope`] via
@@ -205,11 +289,15 @@ pub async fn run(root: PathBuf, addr: SocketAddr) -> std::io::Result<RunHandle> 
 /// Returns an [`std::io::Error`] if `root` cannot be canonicalised or the server
 /// cannot bind to `addr`. A storage problem is *not* an error here — it degrades to
 /// no persistence as described above.
-pub async fn run_with_db_url(
+pub async fn run_with_config(
     root: PathBuf,
     addr: SocketAddr,
-    db_url: Option<String>,
+    config: RunConfig,
 ) -> std::io::Result<RunHandle> {
+    let RunConfig {
+        db_url,
+        metrics_interval,
+    } = config;
     let root = std::fs::canonicalize(&root)?;
     let (events_tx, _) = broadcast::channel::<EventEnvelope>(EVENT_CHANNEL_CAPACITY);
 
@@ -314,14 +402,74 @@ pub async fn run_with_db_url(
     // test/status event onto its node's colour, broadcasting the patch envelope.
     let collector_task = tokio::spawn(collect(root.clone(), Arc::clone(&graph), events_tx.clone()));
 
+    // Self-observability metrics emitter (Phase 9): tick on `metrics_interval`, count
+    // broadcast throughput over each window, and broadcast a `metrics.update`. The
+    // receiver is subscribed here — before the loop — so events arriving between ticks
+    // are buffered for the next drain. Its OWN `metrics.update` emissions are excluded
+    // from the count (else a quiet window would report itself), so events/sec reflects
+    // genuine watcher/collector activity only.
+    let metrics_graph = Arc::clone(&graph);
+    let metrics_events = events_tx.clone();
+    let mut metrics_rx = events_tx.subscribe();
+    let metrics_task = tokio::spawn(async move {
+        // Defer the FIRST tick by one interval (`interval` fires immediately at t=0):
+        // no `metrics.update` is broadcast until a full window has elapsed, so a client
+        // that connects and reads a fixed sequence right after boot is not disrupted.
+        let start = tokio::time::Instant::now() + metrics_interval;
+        let mut ticker = tokio::time::interval_at(start, metrics_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // Drain every envelope observed since the last tick, counting only those
+            // NOT produced by this emitter (self-emitted `metrics.update`s excluded).
+            let mut observed: u64 = 0;
+            loop {
+                match metrics_rx.try_recv() {
+                    Ok(env) => {
+                        if env.event_type != EventType::MetricsUpdate {
+                            observed += 1;
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Closed) => return,
+                }
+            }
+            let per_sec_milli = events_per_sec_milli(observed, metrics_interval);
+            // Hold the graph lock only long enough to snapshot the counts/memory/latency
+            // entries; the `parse_latency` sort, the clock read, and the envelope assembly
+            // all run AFTER the guard drops (via `into_envelope`), so the emitter never
+            // contends with the watcher/collector on the graph mutex.
+            let snapshot = {
+                let graph = metrics_graph.lock().await;
+                graph.metrics_snapshot()
+            };
+            let env = snapshot.into_envelope(per_sec_milli);
+            // Best-effort: a full/absent channel just drops this tick's snapshot.
+            let _ = metrics_events.send(env);
+        }
+    });
+
     Ok(RunHandle {
         addr,
         server,
         watcher_task,
         pump_task,
         collector_task,
+        metrics_task,
         store_task,
     })
+}
+
+/// Converts a window's observed event count into `eventsPerSecMilli` (events/sec ×1000).
+///
+/// `observed / (interval_secs) × 1000`, kept in integer milli-units to preserve the
+/// `metrics.update` `Eq` derive (Design Decision #3). `interval` is clamped to at least
+/// 1ms so a degenerate zero interval can never divide by zero; the multiply saturates
+/// rather than overflowing. A quiet window (`observed == 0`) yields exactly 0.
+fn events_per_sec_milli(observed: u64, interval: Duration) -> u64 {
+    let interval_ms = (interval.as_millis() as u64).max(1);
+    observed.saturating_mul(1_000_000) / interval_ms
 }
 
 #[cfg(test)]
@@ -717,7 +865,19 @@ mod tests {
     async fn partial_line_is_parsed_only_after_its_newline() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
-        let handle = run(dir.path().to_path_buf(), local()).await.expect("run");
+        // Boot with a metrics interval far longer than the negative window below, so the
+        // self-observability emitter never fires a `metrics.update` inside the 900ms wait
+        // and the "no envelope arrives" assertion cannot be tripped by a metrics tick.
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .expect("run");
 
         let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
             .await
@@ -1400,6 +1560,240 @@ mod tests {
         assert!(
             roots.iter().any(|id| id == "file:survives.rs"),
             "a schema error must degrade to empty-then-parse, still serving the on-disk file: {roots:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    // ---- P9-4: metrics emitter task (broadcast + events/sec accounting) ----
+
+    /// Reads envelopes until a `metrics.update` arrives (or times out via
+    /// [`next_envelope`]). The metrics emitter broadcasts on the same channel the WS
+    /// server fans out to clients, so a connected client observes each tick.
+    async fn next_metrics_update(ws: &mut ClientWs) -> EventEnvelope {
+        loop {
+            let env = next_envelope(ws).await;
+            if matches!(env.payload, Payload::MetricsUpdate { .. }) {
+                return env;
+            }
+        }
+    }
+
+    /// P9-4 AC: the emitter task broadcasts a `metrics.update` within a bounded window.
+    /// Booting the full stack over a single source file with a short **injected** metrics
+    /// interval (no wall-clock flakiness), a connected client observes a `metrics.update`
+    /// whose `node_count`/`edge_count` match the parsed graph and whose `parse_latency`
+    /// includes the parsed file (presence, not an exact latency value).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_emitter_broadcasts_update_reflecting_the_graph() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await; // drain the initial snapshot
+
+        let env = next_metrics_update(&mut ws).await;
+        assert_eq!(env.event_type, EventType::MetricsUpdate);
+        match env.payload {
+            Payload::MetricsUpdate {
+                node_count,
+                edge_count,
+                parse_latency,
+                ..
+            } => {
+                // `fn f() {}` → file:a.rs + fn:a.rs:f, joined by one file→function edge.
+                assert_eq!(node_count, 2, "node_count must match the live graph");
+                assert_eq!(edge_count, 1, "edge_count must match the live graph");
+                assert!(
+                    parse_latency.iter().any(|f| f.file_path == "a.rs"),
+                    "parse_latency must include the parsed file: {parse_latency:?}"
+                );
+            }
+            other => panic!("expected metrics.update, got {other:?}"),
+        }
+        handle.shutdown().await;
+    }
+
+    /// P9-4 AC: `events_per_sec_milli` is 0 for a quiet window. Booting an empty repo
+    /// (no source files → no broadcast activity) with a short injected interval, every
+    /// metrics tick reports 0 throughput — proving the emitter does NOT count its own
+    /// `metrics.update` broadcasts (else the second window would be non-zero).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_per_sec_milli_is_zero_in_a_quiet_window() {
+        let dir = tempdir().expect("tempdir"); // empty repo: nothing to broadcast
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        for _ in 0..2 {
+            let env = next_metrics_update(&mut ws).await;
+            match env.payload {
+                Payload::MetricsUpdate {
+                    events_per_sec_milli,
+                    ..
+                } => {
+                    assert_eq!(
+                        events_per_sec_milli, 0,
+                        "a quiet window must yield 0 events/sec"
+                    );
+                }
+                other => panic!("expected metrics.update, got {other:?}"),
+            }
+        }
+        handle.shutdown().await;
+    }
+
+    /// P9-4 AC: `events_per_sec_milli` reflects broadcast throughput. Booting over one
+    /// file, then generating broadcast activity (each CLV `test` line folds onto
+    /// `fn:a.rs:f` and broadcasts a `test.result` patch the emitter must count), at
+    /// least one metrics window overlapping the activity reports a non-zero throughput.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_per_sec_milli_is_non_zero_after_broadcast_activity() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn f() {}").expect("write");
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: None,
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await;
+
+        // Drive broadcast events: each line folds onto fn:a.rs:f and broadcasts a
+        // test.result patch the emitter counts toward the window's throughput.
+        for _ in 0..6 {
+            append_sink_line(
+                dir.path(),
+                r#"#CLV1 {"event":"test","session":"s1","node":"fn:a.rs:f","outcome":"fail"}"#,
+            );
+        }
+
+        let saw_non_zero = timeout(Duration::from_secs(6), async {
+            loop {
+                let env = next_metrics_update(&mut ws).await;
+                if let Payload::MetricsUpdate {
+                    events_per_sec_milli,
+                    ..
+                } = env.payload
+                {
+                    if events_per_sec_milli > 0 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            saw_non_zero.is_ok(),
+            "a window with observed broadcast events must yield non-zero events/sec"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Reads the row count of every persisted table at `db_url` (the same set the storage
+    /// layer manages), returning them keyed by table name so two reads can be compared for
+    /// equality. A not-yet-created table is treated as `0`. Test-only; opens and closes
+    /// its own read pool. The table names are fixed literals, never client input.
+    async fn all_table_counts(db_url: &str) -> Vec<(&'static str, i64)> {
+        const TABLES: [&str; 7] = [
+            "sessions",
+            "agents",
+            "protocol_versions",
+            "nodes",
+            "edges",
+            "test_results",
+            "agent_activity",
+        ];
+        let pool = sqlx::SqlitePool::connect(db_url)
+            .await
+            .expect("open db for read");
+        let mut counts = Vec::with_capacity(TABLES.len());
+        for table in TABLES {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+            counts.push((table, n));
+        }
+        pool.close().await;
+        counts
+    }
+
+    /// P9-4 AC (emitter → persist integration): with persistence enabled AND the metrics
+    /// emitter running on a short injected interval, a client observes `metrics.update`
+    /// frames on the broadcast channel, yet each one persists as a **no-op** — the store's
+    /// per-table row counts are identical across two consecutive ticks (`DATA_MODEL.md`
+    /// §B.5: self-observability metrics are ephemeral). Booting over an EMPTY repo makes
+    /// the emitter the only source of broadcast traffic, so any row a `metrics.update`
+    /// wrote would surface as a delta between the two snapshots. Bounded by
+    /// [`next_metrics_update`]'s timeout so it can never hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_update_broadcast_persists_as_a_no_op() {
+        let dir = tempdir().expect("tempdir"); // empty repo: only the emitter broadcasts
+        let db_dir = tempdir().expect("db tempdir");
+        let db_url = format!("sqlite://{}", db_dir.path().join("events.db").display());
+        let handle = run_with_config(
+            dir.path().to_path_buf(),
+            local(),
+            RunConfig {
+                db_url: Some(db_url.clone()),
+                metrics_interval: Duration::from_millis(80),
+            },
+        )
+        .await
+        .expect("run");
+        assert!(
+            handle.store_task.is_some(),
+            "a persistence task exists when a db_url is set"
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{}/", handle.addr))
+            .await
+            .expect("connect");
+        let _snapshot = next_envelope(&mut ws).await; // drain the initial snapshot
+
+        // Observe one metrics.update, snapshot the table counts, observe another, snapshot
+        // again. At least one full tick's worth of `metrics.update`s flows through the
+        // persist task between the two reads, so a metrics write would show as a delta.
+        let _ = next_metrics_update(&mut ws).await;
+        let before = all_table_counts(&db_url).await;
+        let _ = next_metrics_update(&mut ws).await;
+        let after = all_table_counts(&db_url).await;
+
+        assert_eq!(
+            before, after,
+            "a broadcast metrics.update must persist nothing — counts changed: {before:?} -> {after:?}"
         );
         handle.shutdown().await;
     }

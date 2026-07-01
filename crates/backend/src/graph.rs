@@ -49,6 +49,16 @@
 //! unchanged file reconciles to a no-op with no spurious removals. The agent roster is
 //! **not** restored (no table) — it repopulates from live activity.
 //!
+//! Self-observability (Phase 9). [`Graph::record_parse_latency`] stamps each file's
+//! most-recent parse `duration_us` into a map bounded by the distinct-file count, and
+//! [`Graph::metrics_payload`] renders a **clock-free, deterministic** `metrics.update`
+//! [`Payload`] (live node/edge counts, a pure `memoryBytes` estimate, the passed-in
+//! events/sec, and the per-file latencies); [`Graph::metrics_envelope`] is the public
+//! wrapper that stamps the envelope's `v`/`ts`/`sessionId`. To keep the metrics emitter
+//! off the graph mutex's critical section, both are built over [`Graph::metrics_snapshot`]
+//! — a lock-light read of counts/memory/latencies — with the `parseLatency` sort and the
+//! clock reading deferred to [`MetricsSnapshot::into_envelope`] after the guard is dropped.
+//!
 //! Per `AGENT_PROTOCOL.md` §6 this is panic-free: a clock error or a parse with no
 //! `file` node degrades to a safe default rather than unwrapping.
 
@@ -58,7 +68,7 @@ use crate::clv::ClvEvent;
 use crate::parser::ParsedFile;
 use crate::wire::{
     agent_node_id, derive_child_ids, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
-    EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+    EventType, FileParseLatency, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
 };
 
 /// CLV protocol version stamped on every envelope this graph emits.
@@ -112,6 +122,14 @@ pub struct Graph {
     /// flipped to `"inactive"`. Same monotonic-millisecond domain as
     /// [`monotonic_now_ms`].
     last_seen: HashMap<u32, u64>,
+    /// Most-recent parse latency (microseconds) per repo-relative source path (Phase 9).
+    ///
+    /// [`Graph::record_parse_latency`] stamps a file's `duration_us` here on every
+    /// parse, overwriting the prior value, so the map is **bounded by the number of
+    /// distinct source files** — never by the number of edits. It is a pure
+    /// self-observability read: [`Graph::metrics_payload`] snapshots it into the
+    /// `metrics.update` envelope's `parseLatency` rows without a clock.
+    parse_latency: HashMap<String, u64>,
 }
 
 impl Default for Graph {
@@ -136,6 +154,7 @@ impl Graph {
             file_edges: HashMap::new(),
             roster: HashMap::new(),
             last_seen: HashMap::new(),
+            parse_latency: HashMap::new(),
         }
     }
 
@@ -755,6 +774,90 @@ impl Graph {
         )
     }
 
+    /// Records `micros` as the most-recent parse latency for repo-relative `path`.
+    ///
+    /// Overwrites any prior value for the same path, so re-parsing a file does **not**
+    /// grow the map — it stays bounded by the number of distinct source files, never by
+    /// the number of edits (Phase 9 self-observability, `SPEC.md` §11.3). The recorded
+    /// durations surface via [`Graph::metrics_payload`]'s `parseLatency` rows.
+    pub fn record_parse_latency(&mut self, path: &str, micros: u64) {
+        self.parse_latency.insert(path.to_string(), micros);
+    }
+
+    /// Builds a deterministic `metrics.update` [`Payload`] over the current graph state.
+    ///
+    /// **Clock-free and pure** (Design Decision #3): given the same nodes, edges and
+    /// recorded parse latencies it always returns the same scalars, so it is
+    /// unit-testable without timers. `nodeCount`/`edgeCount` mirror the live map sizes,
+    /// `memoryBytes` is the deterministic [`Graph::estimated_memory_bytes`] estimate
+    /// (not platform RSS), `eventsPerSecMilli` is `events_per_sec_milli` verbatim, and
+    /// `parseLatency` lists each recorded file (sorted by path for a stable order) with
+    /// its most-recent `durationUs`. The payload's `ts` is left **empty** here — the
+    /// authoritative timestamp is stamped by [`Graph::metrics_envelope`] — so this
+    /// method takes no clock reading. Implemented over [`Graph::metrics_snapshot`], so
+    /// the `parseLatency` sort lives in [`MetricsSnapshot::into_payload`] rather than
+    /// under any lock a caller holds while reading `&self`.
+    pub fn metrics_payload(&self, events_per_sec_milli: u64) -> Payload {
+        self.metrics_snapshot()
+            .into_payload(events_per_sec_milli, String::new())
+    }
+
+    /// Wraps [`Graph::metrics_payload`] in a fully stamped `metrics.update` envelope.
+    ///
+    /// Reads the clock **once**, stamps that timestamp into both the envelope and the
+    /// payload's `ts`, and returns the same [`EventEnvelope`] as before. The metrics
+    /// emitter no longer calls this **under** the graph lock — it takes a lock-light
+    /// [`Graph::metrics_snapshot`], drops the guard, then assembles the envelope off-lock
+    /// via [`MetricsSnapshot::into_envelope`]. This method is retained (delegating through
+    /// that same snapshot) so its signature and result are unchanged for any other caller.
+    pub fn metrics_envelope(&self, events_per_sec_milli: u64) -> EventEnvelope {
+        self.metrics_snapshot().into_envelope(events_per_sec_milli)
+    }
+
+    /// Captures the minimal graph state a `metrics.update` needs, reading **no clock and
+    /// doing no sort** while `&self` is borrowed.
+    ///
+    /// The lock-contention seam for the Phase-9 metrics emitter (`SPEC.md` §11.3): the
+    /// emitter holds the graph [`Mutex`](tokio::sync::Mutex) only long enough to read the
+    /// live node/edge counts, the deterministic [`Graph::estimated_memory_bytes`]
+    /// estimate, the session id, and a snapshot of the per-file parse-latency entries —
+    /// then drops the guard and does the sort + clock stamp + envelope assembly off-lock
+    /// via [`MetricsSnapshot::into_envelope`]. Keeping the sort and clock reading out of
+    /// the critical section stops the emitter contending with the watcher and collector
+    /// on the same mutex. The captured `parse_latency` is left **unsorted** here.
+    pub(crate) fn metrics_snapshot(&self) -> MetricsSnapshot {
+        let parse_latency: Vec<FileParseLatency> = self
+            .parse_latency
+            .iter()
+            .map(|(file_path, &duration_us)| FileParseLatency {
+                file_path: file_path.clone(),
+                duration_us,
+            })
+            .collect();
+        MetricsSnapshot {
+            session_id: self.session_id.clone(),
+            node_count: self.nodes.len() as u64,
+            edge_count: self.edges.len() as u64,
+            memory_bytes: self.estimated_memory_bytes(),
+            parse_latency,
+        }
+    }
+
+    /// Deterministic estimate of this graph's structural memory use, in bytes.
+    ///
+    /// A **pure function of the map sizes** (Design Decision #3): each of the
+    /// `nodes`/`edges`/`parse_latency` counts times that element type's fixed stack
+    /// size. Same graph state → same value on every call, so [`Graph::metrics_payload`]
+    /// is unit-testable. This is a self-observability estimate, **not** platform RSS: it
+    /// deliberately undercounts heap-owned strings in exchange for determinism.
+    fn estimated_memory_bytes(&self) -> u64 {
+        let node_bytes = self.nodes.len() as u64 * std::mem::size_of::<Node>() as u64;
+        let edge_bytes = self.edges.len() as u64 * std::mem::size_of::<Edge>() as u64;
+        let latency_bytes =
+            self.parse_latency.len() as u64 * std::mem::size_of::<FileParseLatency>() as u64;
+        node_bytes + edge_bytes + latency_bytes
+    }
+
     /// Wraps `payload` in an [`EventEnvelope`] stamped now with this graph's session.
     fn envelope(&self, event_type: EventType, payload: Payload) -> EventEnvelope {
         self.envelope_at(rfc3339_now(), event_type, payload)
@@ -771,6 +874,59 @@ impl Graph {
             ts,
             session_id: self.session_id.clone(),
             event_type,
+            payload,
+        }
+    }
+}
+
+/// A minimal owned snapshot of the graph state a `metrics.update` needs.
+///
+/// Produced by [`Graph::metrics_snapshot`] while the graph lock is held, so the sort,
+/// clock reading, and envelope assembly can all run **after** the guard is dropped — the
+/// Phase-9 fix that keeps the metrics emitter from contending with the watcher and
+/// collector on the graph mutex (`SPEC.md` §11.3). `parse_latency` is captured
+/// **unsorted** here and ordered off-lock by [`MetricsSnapshot::into_payload`].
+pub(crate) struct MetricsSnapshot {
+    session_id: String,
+    node_count: u64,
+    edge_count: u64,
+    memory_bytes: u64,
+    parse_latency: Vec<FileParseLatency>,
+}
+
+impl MetricsSnapshot {
+    /// Builds the deterministic `metrics.update` [`Payload`] from this snapshot, stamping
+    /// the payload's `ts` with `ts` (empty for the clock-free [`Graph::metrics_payload`]
+    /// path). Sorts the captured `parse_latency` by `file_path` for a stable order — this
+    /// is the sort lifted out of the graph lock's critical section, so the same graph
+    /// state always yields the same ordered `parseLatency` regardless of map iteration.
+    fn into_payload(mut self, events_per_sec_milli: u64, ts: String) -> Payload {
+        self.parse_latency
+            .sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Payload::MetricsUpdate {
+            session_id: self.session_id,
+            ts,
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+            memory_bytes: self.memory_bytes,
+            events_per_sec_milli,
+            parse_latency: self.parse_latency,
+        }
+    }
+
+    /// Assembles a fully stamped `metrics.update` [`EventEnvelope`] from this snapshot,
+    /// reading the clock **once** off-lock and stamping that timestamp into both the
+    /// envelope and the payload's `ts`. This is the emitter's off-lock path; it returns
+    /// the same envelope [`Graph::metrics_envelope`] would for the same graph state.
+    pub(crate) fn into_envelope(self, events_per_sec_milli: u64) -> EventEnvelope {
+        let ts = rfc3339_now();
+        let session_id = self.session_id.clone();
+        let payload = self.into_payload(events_per_sec_milli, ts.clone());
+        EventEnvelope {
+            v: PROTOCOL_VERSION,
+            ts,
+            session_id,
+            event_type: EventType::MetricsUpdate,
             payload,
         }
     }
@@ -880,7 +1036,8 @@ mod tests {
     use crate::parser::{parse_rust_source, parse_source};
     use crate::wire::{
         agent_node_id, edge_id, node_id, typed_edge_id, AgentInfo, Edge, EdgeKind, EventEnvelope,
-        EventType, HotEdgeState, Node, NodeStatus, NodeType, Payload, TestOutcome,
+        EventType, FileParseLatency, HotEdgeState, Node, NodeStatus, NodeType, Payload,
+        TestOutcome,
     };
 
     fn function_node(id: &str, label: &str) -> Node {
@@ -1951,5 +2108,184 @@ mod tests {
             rebuilt.nodes.contains_key(&agent_vertex),
             "the agent vertex must survive the reparse"
         );
+    }
+
+    // ---- P9-4: self-observability metrics (deterministic builder + latency map) ----
+
+    /// Destructures a [`Payload::MetricsUpdate`] into
+    /// `(node_count, edge_count, memory_bytes, events_per_sec_milli, parse_latency)`,
+    /// panicking on any other payload — a test-only reader for the P9-4 metrics tests.
+    fn metrics_fields(payload: &Payload) -> (u64, u64, u64, u64, &[FileParseLatency]) {
+        match payload {
+            Payload::MetricsUpdate {
+                node_count,
+                edge_count,
+                memory_bytes,
+                events_per_sec_milli,
+                parse_latency,
+                ..
+            } => (
+                *node_count,
+                *edge_count,
+                *memory_bytes,
+                *events_per_sec_milli,
+                parse_latency,
+            ),
+            other => panic!("expected MetricsUpdate payload, got {other:?}"),
+        }
+    }
+
+    /// P9-4 AC: `metrics_payload` is a deterministic builder. Given a known graph and
+    /// several recorded per-file latencies, it returns a [`Payload::MetricsUpdate`] whose
+    /// `node_count`/`edge_count` mirror the live graph, whose `memory_bytes` is a pure
+    /// function of state (identical across two calls), whose `events_per_sec_milli` is
+    /// exactly the value passed in, and whose `parse_latency` vec is identical across two
+    /// calls **including order** and ascending by `file_path`. Recording MORE THAN ONE
+    /// path makes the ordering a real variable, so this pins the builder's
+    /// `sort_by(file_path)` against `HashMap` iteration nondeterminism — dropping the sort
+    /// would leave raw map order and fail the expected-order assertion. No timers, no
+    /// sleeps — pure over graph state.
+    #[test]
+    fn metrics_payload_is_deterministic_and_reflects_the_graph() {
+        let mut graph = graph_with_function(); // file:a.rs + fn:a.rs:f
+                                               // Two+ distinct paths so the emitted order is not trivially a single element.
+        graph.record_parse_latency("a.rs", 1234);
+        graph.record_parse_latency("b.rs", 5678);
+        graph.record_parse_latency("c.rs", 42);
+
+        let first = graph.metrics_payload(4200);
+        let second = graph.metrics_payload(4200);
+
+        let (n1, e1, m1, eps1, lat1) = metrics_fields(&first);
+        let (n2, e2, m2, eps2, lat2) = metrics_fields(&second);
+
+        // Deterministic: identical graph state → identical scalar metrics every call.
+        assert_eq!(
+            m1, m2,
+            "memory_bytes must be a pure function of graph state"
+        );
+        assert_eq!(
+            (n1, e1, eps1),
+            (n2, e2, eps2),
+            "counts/throughput must be stable across calls"
+        );
+
+        // Counts mirror the live in-memory graph exactly.
+        assert_eq!(
+            n1,
+            graph.nodes.len() as u64,
+            "node_count must equal live nodes"
+        );
+        assert_eq!(
+            e1,
+            graph.edges.len() as u64,
+            "edge_count must equal live edges"
+        );
+        // Throughput is exactly the argument (events/sec ×1000).
+        assert_eq!(eps1, 4200, "events_per_sec_milli must echo the argument");
+
+        // The full parse_latency vec is identical across two calls, order included …
+        assert_eq!(
+            lat1, lat2,
+            "parse_latency must be byte-identical across calls, order included: {lat1:?} vs {lat2:?}"
+        );
+        // … and that order is exactly ascending by file_path. This locks the builder's
+        // `sort_by(file_path)`: without it, `lat1` would be raw HashMap order and fail.
+        let expected = [
+            FileParseLatency {
+                file_path: "a.rs".to_string(),
+                duration_us: 1234,
+            },
+            FileParseLatency {
+                file_path: "b.rs".to_string(),
+                duration_us: 5678,
+            },
+            FileParseLatency {
+                file_path: "c.rs".to_string(),
+                duration_us: 42,
+            },
+        ];
+        assert_eq!(
+            lat1,
+            expected.as_slice(),
+            "parse_latency must be sorted ascending by file_path: {lat1:?}"
+        );
+    }
+
+    /// P9-4: `metrics_envelope` is the retained public wrapper — it stamps a single clock
+    /// reading into BOTH the envelope's `ts` and the payload's `ts`, and otherwise mirrors
+    /// [`Graph::metrics_payload`]. Exercised directly so the retained seam stays covered
+    /// even though the metrics emitter now assembles envelopes off-lock via
+    /// [`Graph::metrics_snapshot`] + [`MetricsSnapshot::into_envelope`].
+    #[test]
+    fn metrics_envelope_stamps_one_timestamp_into_envelope_and_payload() {
+        let mut graph = graph_with_function(); // file:a.rs + fn:a.rs:f
+        graph.record_parse_latency("a.rs", 99);
+
+        let env = graph.metrics_envelope(1500);
+        assert_eq!(env.event_type, EventType::MetricsUpdate);
+        assert!(!env.ts.is_empty(), "the envelope ts must be stamped");
+        match &env.payload {
+            Payload::MetricsUpdate {
+                ts,
+                session_id,
+                node_count,
+                events_per_sec_milli,
+                ..
+            } => {
+                assert_eq!(*ts, env.ts, "payload ts must equal the envelope ts");
+                assert_eq!(
+                    *session_id, env.session_id,
+                    "payload session must match the envelope session"
+                );
+                assert_eq!(
+                    *node_count,
+                    graph.nodes.len() as u64,
+                    "node_count must mirror the live graph"
+                );
+                assert_eq!(
+                    *events_per_sec_milli, 1500,
+                    "events_per_sec_milli must echo the argument"
+                );
+            }
+            other => panic!("expected metrics.update, got {other:?}"),
+        }
+    }
+
+    /// P9-4 AC: `record_parse_latency` keeps the most-recent duration per repo-relative
+    /// path and is bounded by the distinct-file count. Re-recording a path overwrites
+    /// (the map stays size 1, latest value wins); a second distinct path grows it to 2.
+    #[test]
+    fn record_parse_latency_is_bounded_and_overwrites_per_path() {
+        let mut graph = Graph::new();
+        graph.record_parse_latency("a.rs", 100);
+        graph.record_parse_latency("a.rs", 250); // same path → overwrite, not append
+
+        let payload = graph.metrics_payload(0);
+        let (.., latency) = metrics_fields(&payload);
+        assert_eq!(
+            latency.len(),
+            1,
+            "re-parsing one path stays a single entry: {latency:?}"
+        );
+        assert_eq!(
+            latency[0].duration_us, 250,
+            "the latest recorded duration must win: {latency:?}"
+        );
+
+        graph.record_parse_latency("b.rs", 500); // a distinct path → bounded growth to 2
+        let payload = graph.metrics_payload(0);
+        let (.., latency) = metrics_fields(&payload);
+        assert_eq!(
+            latency.len(),
+            2,
+            "two distinct paths → two entries: {latency:?}"
+        );
+        assert!(latency
+            .iter()
+            .any(|f| f.file_path == "a.rs" && f.duration_us == 250));
+        assert!(latency
+            .iter()
+            .any(|f| f.file_path == "b.rs" && f.duration_us == 500));
     }
 }
