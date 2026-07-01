@@ -486,6 +486,9 @@ impl Storage for PostgresStore {
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
             }
+            Payload::MetricsUpdate { .. } => {
+                // Self-observability metrics are ephemeral — persist nothing (§B.5).
+            }
             Payload::AgentActivity {
                 agent_id,
                 action,

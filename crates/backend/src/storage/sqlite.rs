@@ -218,9 +218,10 @@ impl Storage for SqliteStore {
     /// `agent.roster` upserts a **real** `agents` row per [`AgentInfo`] plus a
     /// `protocol_versions` row per process; `agent.activity` inserts an
     /// `agent_activity` row (upserting its `agents` parent first for the FK);
-    /// `snapshot`/`subtree` (view frames) persist nothing. A `sessions` row is
-    /// upserted per event (the DB no-ops a duplicate), and an `agents` row when a
-    /// pid is present, before the event row.
+    /// `snapshot`/`subtree` view frames, the `*.remove` arms, and `metrics.update`
+    /// persist nothing. For the persisted arms a `sessions` row is upserted per
+    /// event (the DB no-ops a duplicate), and an `agents` row when a pid is
+    /// present, before the event row.
     async fn persist(&self, env: &EventEnvelope) -> Result<(), StorageError> {
         // One timestamp per event, reused by every write below (decision-3).
         let now = now_rfc3339();
@@ -354,6 +355,9 @@ impl Storage for SqliteStore {
             }
             Payload::Snapshot { .. } | Payload::Subtree { .. } => {
                 // View frames (server→client) — persist nothing (§B.5).
+            }
+            Payload::MetricsUpdate { .. } => {
+                // Self-observability metrics are ephemeral — persist nothing (§B.5).
             }
             Payload::AgentActivity {
                 agent_id,
@@ -1203,6 +1207,39 @@ mod tests {
         store.persist(&subtree).await.unwrap();
         for table in TABLES {
             assert_eq!(count(&store, table).await, 0, "view frame wrote to {table}");
+        }
+    }
+
+    /// P9-3: a `metrics.update` envelope is **ephemeral** (`DATA_MODEL.md` §B.5 — no
+    /// DDL table), so persisting it writes **no row to any table**. The table counts
+    /// before and after must both be zero. RED until P9-3 (GREEN) adds
+    /// `EventType::MetricsUpdate` / `Payload::MetricsUpdate` plus the no-op skip arm
+    /// `Payload::MetricsUpdate { .. } => {}` to `persist`.
+    #[tokio::test]
+    async fn metrics_update_persists_nothing() {
+        let (store, _dir) = temp_store().await;
+        let metrics = EventEnvelope {
+            v: 1,
+            ts: "2026-06-30T00:00:00Z".to_string(),
+            session_id: "sess-1".to_string(),
+            event_type: EventType::MetricsUpdate,
+            payload: Payload::MetricsUpdate {
+                session_id: "sess-1".to_string(),
+                ts: "2026-06-30T00:00:00Z".to_string(),
+                node_count: 128,
+                edge_count: 342,
+                memory_bytes: 1_048_576,
+                events_per_sec_milli: 4200,
+                parse_latency: Vec::new(),
+            },
+        };
+        store.persist(&metrics).await.expect("metrics persist");
+        for table in TABLES {
+            assert_eq!(
+                count(&store, table).await,
+                0,
+                "metrics.update wrote to {table} — metrics are ephemeral (§B.5)"
+            );
         }
     }
 

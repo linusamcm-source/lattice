@@ -64,7 +64,8 @@ edge: e:<source-symbol>-><target-symbol>   e.g.  e:authenticate->verify_token
 ```json
 { "v": 1, "ts": "2026-06-27T10:32:01.123Z", "sessionId": "sess-abc123", "type": "node.upsert", "payload": {} }
 ```
-- **`type`**: `node.upsert | node.remove | edge.upsert | edge.remove | status.update | test.result | agent.activity | hot_edge | agent.roster | snapshot | subtree | error`
+- **`type`**: `node.upsert | node.remove | edge.upsert | edge.remove | status.update | test.result | agent.activity | hot_edge | agent.roster | snapshot | subtree | error | metrics.update`
+  - `metrics.update` (P9-3) is a **deliberate additive, non-breaking** extension of the §A.4 vocabulary: it stays `v: 1` / `#CLV1` (the sentinel is unchanged), appends a new tag without altering any existing payload, and is **ephemeral** (see §A.5 and §B.5 — never persisted).
 - `snapshot` is the **lazy (root-only) top level**: it carries only root nodes (file nodes, `parentId == null`) and the edges among them, sent on connect / reconnect resync. Deeper tiers (functions, variables) load on demand via `expand`.
 - `subtree` is the server's reply to an `expand` request. Payload: `{ "parentId": "<id>", "nodes": Node[], "edges": Edge[] }`, where `nodes` are `parentId`'s **direct** children (one tier down, not grandchildren) and `edges` are the `contains` edges from `parentId` to them.
 - Client→server requests: `expand` (request a node's direct children → `subtree`), `snapshot` (request a fresh root-level resync).
@@ -99,6 +100,13 @@ edge: e:<source-symbol>-><target-symbol>   e.g.  e:authenticate->verify_token
 ]}
 ```
 
+**`metrics.update`** (P9-3 — self-observability snapshot of the running backend)
+```json
+{"sessionId":"sess-abc123","ts":"2026-06-27T10:32:01.500Z","nodeCount":128,"edgeCount":342,"memoryBytes":1048576,"eventsPerSecMilli":4200,"parseLatency":[{"filePath":"src/auth/login.rs","durationUs":812}]}
+```
+- **All-integer** by design: `nodeCount`/`edgeCount`/`memoryBytes`/`eventsPerSecMilli` are `u64`, and `parseLatency` is an array of `{ filePath, durationUs }` where `durationUs` is a `u64` microsecond count. No floating field, so the Rust `Payload`/`EventEnvelope` keep their `Eq` derive (`eventsPerSecMilli` is events/sec ×1000; `memoryBytes` is a deterministic estimate from in-memory map sizes, not platform RSS).
+- **Ephemeral** — broadcast to clients but **never persisted** (§B.5; no DDL table). A deliberate additive extension: still `v: 1` / `#CLV1`.
+
 ---
 
 ## Part B — Database schema
@@ -126,7 +134,7 @@ The backend **upserts** an agent row on the **first CLV line** from a process: `
 Each process is **pinned** to its CLV version in `protocol_versions` (keyed by `process_id`). Breaking changes bump the sentinel (`#CLV1` → `#CLV2`); both can be supported during a transition, and `deprecated_at` lets the backend warn before a cutover.
 
 ### B.5 Persisted vs ephemeral
-Only **parsed, structured CLV events** are written (`test_results`, `agent_activity`, hot-edge records, node/edge state). **Raw stdout is ephemeral and not persisted** — it already exists in the terminal, and storing it would bloat the DB without adding queryable value.
+Only **parsed, structured CLV events** are written (`test_results`, `agent_activity`, hot-edge records, node/edge state). **Raw stdout is ephemeral and not persisted** — it already exists in the terminal, and storing it would bloat the DB without adding queryable value. **`snapshot`/`subtree` view frames and `metrics.update` self-observability snapshots (§A.5, P9-3) are likewise ephemeral** — they carry no durable state, so the persist path skips them with a no-op arm (no DDL table).
 
 ### B.6 Tables (DDL sketch)
 

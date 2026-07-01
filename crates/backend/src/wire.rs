@@ -14,7 +14,9 @@
 //!   [`Payload::HotEdge`] (carrying [`HotEdgeState`]), and the Phase-8 agent-layer
 //!   payloads [`Payload::AgentActivity`] and [`Payload::AgentRoster`] (the latter
 //!   carrying [`AgentInfo`] rows), whose agent vertices are addressed by
-//!   [`agent_node_id`].
+//!   [`agent_node_id`], and the Phase-9 self-observability payload
+//!   [`Payload::MetricsUpdate`] (carrying [`FileParseLatency`] rows, all-integer
+//!   to preserve `Eq`).
 //!
 //! It also pins the wire payload contract as the typed [`Payload`] variants: the
 //! Phase-0 `snapshot`/`node.upsert`/`node.remove`/`edge.upsert`/`edge.remove`
@@ -24,7 +26,9 @@
 //! [`Payload::StatusUpdate`]), the Phase-6 §A.5 `hot_edge` payload
 //! ([`Payload::HotEdge`], toggling an [`Edge::hot`] flag via [`HotEdgeState`]), and
 //! the Phase-8 §A.5 agent-layer `agent.activity` / `agent.roster` payloads
-//! ([`Payload::AgentActivity`], [`Payload::AgentRoster`]).
+//! ([`Payload::AgentActivity`], [`Payload::AgentRoster`]), and the Phase-9 §A.5
+//! self-observability `metrics.update` payload ([`Payload::MetricsUpdate`],
+//! carrying [`FileParseLatency`] rows).
 //! Per `AGENT_PROTOCOL.md` §5 the
 //! protocol is identified on the CLV stdio channel by the `#CLV1` sentinel (see
 //! [`crate::protocol_sentinel`]).
@@ -200,6 +204,10 @@ pub enum EventType {
     /// An out-of-band error notification.
     #[serde(rename = "error")]
     Error,
+    /// A self-observability metrics snapshot (P9-3; `payload` is
+    /// [`Payload::MetricsUpdate`]). Ephemeral — never persisted (`DATA_MODEL.md` §B.5).
+    #[serde(rename = "metrics.update")]
+    MetricsUpdate,
 }
 
 /// One typed parameter of a function [`Signature`] (`DATA_MODEL.md` §A.2).
@@ -324,6 +332,12 @@ pub struct Edge {
 /// required field no earlier variant carries (`action` for `agent.activity`, the
 /// `agents` array for `agent.roster`), so they neither mis-decode as an earlier
 /// variant nor capture any earlier payload.
+///
+/// The P9-3 self-observability variant [`Payload::MetricsUpdate`] is declared
+/// **last of all** and gated on the unique required `nodeCount`/`parseLatency`
+/// fields no earlier variant carries, so it neither mis-decodes as an earlier
+/// variant nor captures any earlier payload. Its fields are all-integer, which is
+/// what lets `Payload`/[`EventEnvelope`] keep their `Eq` derive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
@@ -506,6 +520,54 @@ pub enum Payload {
         /// One [`AgentInfo`] row per tracked agent in the session.
         agents: Vec<AgentInfo>,
     },
+    /// `metrics.update` — a self-observability snapshot of the running backend
+    /// (`DATA_MODEL.md` §A.5, P9-3).
+    ///
+    /// Declared **last of all** in this `#[serde(untagged)]` enum: it is gated on
+    /// the required `nodeCount`/`parseLatency` fields, which no earlier variant
+    /// carries, so a `metrics.update` object resolves here and never captures — nor
+    /// is captured by — an earlier variant. Every field is an integer (or a
+    /// `Vec<FileParseLatency>` of integers/strings), so `Payload`/[`EventEnvelope`]
+    /// keep their `Eq` derive — a floating latency/throughput field would break it.
+    /// Metrics are **ephemeral**: this payload is broadcast to clients but never
+    /// persisted (`DATA_MODEL.md` §B.5 — no DDL table).
+    MetricsUpdate {
+        /// Originating session id.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// ISO-8601 timestamp of the metrics snapshot.
+        ts: String,
+        /// Live node count in the in-memory graph.
+        #[serde(rename = "nodeCount")]
+        node_count: u64,
+        /// Live edge count in the in-memory graph.
+        #[serde(rename = "edgeCount")]
+        edge_count: u64,
+        /// Deterministic estimate of graph memory use, in bytes (not platform RSS).
+        #[serde(rename = "memoryBytes")]
+        memory_bytes: u64,
+        /// Broadcast throughput over the last window, in events/sec ×1000 (milli).
+        #[serde(rename = "eventsPerSecMilli")]
+        events_per_sec_milli: u64,
+        /// Most-recent parse duration per source file.
+        #[serde(rename = "parseLatency")]
+        parse_latency: Vec<FileParseLatency>,
+    },
+}
+
+/// One file's most-recent parse latency, carried in [`Payload::MetricsUpdate`]
+/// (`DATA_MODEL.md` §A.5, P9-3).
+///
+/// `durationUs` is an integer count of microseconds, so this struct derives `Eq`
+/// and lets the enclosing `Payload`/[`EventEnvelope`] keep their `Eq` derive. JSON
+/// keys are camelCase (`filePath`, `durationUs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileParseLatency {
+    /// Repo-relative path of the parsed source file.
+    pub file_path: String,
+    /// Most-recent parse duration for the file, in microseconds.
+    pub duration_us: u64,
 }
 
 /// A single tracked agent in an [`Payload::AgentRoster`] (`DATA_MODEL.md` §A.5).
@@ -1726,5 +1788,154 @@ mod tests {
                 "unchanged passthrough for {input:?}"
             );
         }
+    }
+
+    // ---- P9-3: `metrics.update` wire contract (DATA_MODEL §A.4 / §A.5) ----
+    //
+    // RED-phase contract for the self-observability envelope. These tests reference
+    // `EventType::MetricsUpdate`, `Payload::MetricsUpdate`, and `FileParseLatency`,
+    // which do not exist on the P9-2 base, so the crate FAILS TO COMPILE until P9-3
+    // (GREEN) adds them. The variant is all-integer (so `Payload`/`EventEnvelope`
+    // keep their `Eq` derive) and is declared **last** in the untagged `Payload`
+    // enum, gated on the unique `nodeCount`/`parseLatency` shape (Design Decision #3).
+
+    /// The literal `metrics.update` payload object expected in `DATA_MODEL.md` §A.5
+    /// (spec ⇄ code parity — this exact object must decode to `Payload::MetricsUpdate`).
+    const METRICS_UPDATE_A5_JSON: &str = r##"{"sessionId":"sess-abc123","ts":"2026-06-27T10:32:01.500Z","nodeCount":128,"edgeCount":342,"memoryBytes":1048576,"eventsPerSecMilli":4200,"parseLatency":[{"filePath":"src/auth/login.rs","durationUs":812}]}"##;
+
+    /// The §A.5 `metrics.update` payload wrapped in the §A.4 envelope, used to prove the
+    /// envelope `type` resolves to `EventType::MetricsUpdate`.
+    const METRICS_UPDATE_ENVELOPE_A5_JSON: &str = r##"{"v":1,"ts":"2026-06-27T10:32:01.500Z","sessionId":"sess-abc123","type":"metrics.update","payload":{"sessionId":"sess-abc123","ts":"2026-06-27T10:32:01.500Z","nodeCount":128,"edgeCount":342,"memoryBytes":1048576,"eventsPerSecMilli":4200,"parseLatency":[{"filePath":"src/auth/login.rs","durationUs":812}]}}"##;
+
+    /// Builds a `metrics.update` envelope with a **non-empty** `parseLatency` Vec, so the
+    /// round-trip exercises the nested `FileParseLatency` rows too.
+    fn metrics_update_envelope() -> EventEnvelope {
+        EventEnvelope {
+            v: 1,
+            ts: "2026-06-27T10:32:01.500Z".to_string(),
+            session_id: "sess-abc123".to_string(),
+            event_type: EventType::MetricsUpdate,
+            payload: Payload::MetricsUpdate {
+                session_id: "sess-abc123".to_string(),
+                ts: "2026-06-27T10:32:01.500Z".to_string(),
+                node_count: 128,
+                edge_count: 342,
+                memory_bytes: 1_048_576,
+                events_per_sec_milli: 4200,
+                parse_latency: vec![
+                    FileParseLatency {
+                        file_path: "src/auth/login.rs".to_string(),
+                        duration_us: 812,
+                    },
+                    FileParseLatency {
+                        file_path: "src/auth/token.rs".to_string(),
+                        duration_us: 1_504,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn metrics_update_envelope_round_trips() {
+        // serialize → deserialize → equal proves the all-integer fields survive the
+        // wire and that the `Eq`/`PartialEq` derive still holds on `Payload`/`EventEnvelope`.
+        let env = metrics_update_envelope();
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"metrics.update\""),
+            "missing metrics.update envelope type: {json}"
+        );
+        assert!(
+            json.contains("\"nodeCount\":128") && json.contains("\"eventsPerSecMilli\":4200"),
+            "camelCase metric keys must serialize via explicit serde rename: {json}"
+        );
+        assert!(
+            json.contains("\"filePath\":\"src/auth/login.rs\"")
+                && json.contains("\"durationUs\":812"),
+            "nested FileParseLatency keys must be camelCase: {json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.event_type, EventType::MetricsUpdate);
+        assert!(
+            matches!(back.payload, Payload::MetricsUpdate { .. }),
+            "metrics.update mis-decoded as {:?}",
+            back.payload
+        );
+    }
+
+    #[test]
+    fn metrics_update_decodes_from_data_model_a5_literal() {
+        // The exact §A.5 payload object must decode into `Payload::MetricsUpdate` with
+        // every field value preserved (spec ⇄ code parity).
+        let payload: Payload = serde_json::from_str(METRICS_UPDATE_A5_JSON)
+            .expect("decode §A.5 metrics.update payload object");
+        match payload {
+            Payload::MetricsUpdate {
+                session_id,
+                ts,
+                node_count,
+                edge_count,
+                memory_bytes,
+                events_per_sec_milli,
+                parse_latency,
+            } => {
+                assert_eq!(session_id, "sess-abc123");
+                assert_eq!(ts, "2026-06-27T10:32:01.500Z");
+                assert_eq!(node_count, 128);
+                assert_eq!(edge_count, 342);
+                assert_eq!(memory_bytes, 1_048_576);
+                assert_eq!(events_per_sec_milli, 4200);
+                assert_eq!(
+                    parse_latency,
+                    vec![FileParseLatency {
+                        file_path: "src/auth/login.rs".to_string(),
+                        duration_us: 812,
+                    }]
+                );
+            }
+            other => panic!("metrics.update mis-decoded as {other:?}"),
+        }
+
+        // The full §A.4 envelope must carry `EventType::MetricsUpdate`.
+        let env: EventEnvelope = serde_json::from_str(METRICS_UPDATE_ENVELOPE_A5_JSON)
+            .expect("decode §A.5 metrics.update envelope");
+        assert_eq!(env.event_type, EventType::MetricsUpdate);
+        assert!(
+            matches!(env.payload, Payload::MetricsUpdate { .. }),
+            "envelope payload mis-decoded as {:?}",
+            env.payload
+        );
+    }
+
+    #[test]
+    fn untagged_decode_disambiguates_metrics_update() {
+        // The `Payload` enum is `#[serde(untagged)]` with order-sensitive decode and
+        // `MetricsUpdate` is declared last. A metrics.update object must resolve to
+        // `Payload::MetricsUpdate`, NOT to any earlier variant (it is gated on the
+        // unique `nodeCount`/`parseLatency` fields that no earlier variant carries).
+        let metrics: Payload = serde_json::from_str(METRICS_UPDATE_A5_JSON)
+            .expect("decode metrics.update payload object");
+        assert!(
+            matches!(metrics, Payload::MetricsUpdate { .. }),
+            "metrics.update mis-decoded as {metrics:?}"
+        );
+
+        // Conversely, no earlier variant's JSON may decode as `MetricsUpdate`. The
+        // agent.roster object shares `sessionId` with metrics but lacks
+        // `nodeCount`/`parseLatency`, so it must NOT resolve here.
+        let roster: Payload =
+            serde_json::from_str(AGENT_ROSTER_A5_JSON).expect("decode agent.roster payload object");
+        assert!(
+            !matches!(roster, Payload::MetricsUpdate { .. }),
+            "agent.roster mis-decoded as MetricsUpdate: {roster:?}"
+        );
+        let activity: Payload = serde_json::from_str(AGENT_ACTIVITY_A5_JSON)
+            .expect("decode agent.activity payload object");
+        assert!(
+            !matches!(activity, Payload::MetricsUpdate { .. }),
+            "agent.activity mis-decoded as MetricsUpdate: {activity:?}"
+        );
     }
 }
