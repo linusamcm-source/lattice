@@ -2,7 +2,9 @@
  * Typed WebSocket client and reactive graph store for the Phase 0 walking skeleton.
  *
  * Event flow:
- * 1. {@link connect} opens a socket and registers an `onmessage` handler.
+ * 1. {@link connect} opens a socket and registers `open`/`message`/`close`/`error`
+ *    listeners, so it can drive the {@link connectionStatus} lifecycle and
+ *    auto-reconnect a dropped socket.
  * 2. Each raw message is run through {@link parseEnvelope}, which validates the
  *    discriminant and returns a typed {@link EventEnvelope} (or `null`).
  * 3. Valid envelopes are folded into {@link graphStore} via the pure reducer
@@ -21,7 +23,21 @@
  * {@link GraphState.metrics}, surfaced via the derived {@link metrics} store that
  * `MetricsPanel` renders. Subtrees are fetched only via {@link requestExpand} and
  * discarded via {@link collapse}.
- * Auto-reconnect is deliberately out of scope for Phase 0 (it lands in Phase 9).
+ *
+ * The Phase-9 socket lifecycle: {@link connect} auto-reconnects with exponential
+ * backoff (cap + jitter) and, on every *re*-open (not the first — the server
+ * already pushes a root snapshot on connect), resyncs by sending
+ * `{"type":"snapshot"}` first, then one `expand` per still-open node
+ * ({@link ConnectOptions.getExpandedNodes}), so the client converges back to the
+ * server's state after a drop. {@link connectionStatus} exposes the lifecycle
+ * (`connecting`/`open`/`reconnecting`/`closed`) for the UI's reconnecting badge, and
+ * the returned {@link WsClient} hands back stable `requestExpand`/`send` handles
+ * that always target the current live socket — never a stale one held from before a
+ * drop. Every send is gated on `readyState === OPEN` ({@link safeSend}) so a click
+ * during the reconnect window neither throws nor writes to a dead socket; the
+ * dropped `expand` is replayed by the next re-open's resync. Each socket's four
+ * lifecycle listeners are bound under a per-socket `AbortController`, aborted on
+ * swap, so a stale socket's late terminal event can't drive a second reconnect.
  *
  * @module
  */
@@ -338,28 +354,187 @@ export function ingest(envelope: EventEnvelope): void {
 	graphStore.update((state) => applyEvent(state, envelope));
 }
 
-/** A live WebSocket connection and its teardown handle. */
+/**
+ * The socket lifecycle the UI badge reflects:
+ * - `connecting` — a socket is opening for the first time (pre-`open`);
+ * - `open` — the live socket is up and streaming;
+ * - `reconnecting` — the socket dropped and a backed-off retry is scheduled;
+ * - `closed` — {@link WsClient.close} tore the client down intentionally.
+ */
+export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
+
+/**
+ * Reactive connection lifecycle, driven by {@link connect} and read by the UI to
+ * show a "reconnecting" indicator while the socket is down. A module singleton so
+ * any component can subscribe without threading a prop.
+ */
+export const connectionStatus: Writable<ConnectionStatus> = writable('connecting');
+
+/**
+ * A live WebSocket connection plus the stable handles callers use to talk to it.
+ * `socket` is swapped to the current live socket on every reconnect, and
+ * {@link WsClient.requestExpand}/{@link WsClient.send} always target that current
+ * socket — never a stale one held from before a drop.
+ */
 export interface WsClient {
+	/** The current live socket (reassigned on each reconnect). */
 	socket: WebSocket;
+	/** Send a lazy `expand` request over the current live socket. */
+	requestExpand: (nodeId: string) => void;
+	/** Send a raw frame over the current live socket. */
+	send: (data: string) => void;
+	/** Tear the client down intentionally; stops reconnecting. */
 	close: () => void;
 }
 
+/** Options for {@link connect}. */
+export interface ConnectOptions {
+	/**
+	 * Supplies the set of currently-open node ids, re-read **fresh on every
+	 * re-open** so a node collapsed between drops is not re-expanded. This is how
+	 * the render-side `expanded` set (owned by `Graph.svelte`) crosses the layer
+	 * into the reconnect resync.
+	 */
+	getExpandedNodes?: () => Iterable<string>;
+	/** Exponential-backoff schedule; a sensible default is used when omitted. */
+	backoff?: { baseMs: number; maxMs: number; jitter?: () => number };
+}
+
+/** Default backoff: 0.5s base, 15s cap, up to 250ms of jitter to de-sync retries. */
+const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000, jitter: () => Math.random() * 250 };
+
+/** The canonical resync frame sent first on every (re-)open. */
+const SNAPSHOT_REQUEST = JSON.stringify({ type: 'snapshot' });
+
 /**
- * Open a WebSocket to `url` and stream incoming CLV envelopes into the graph
- * store. Each message is validated by {@link parseEnvelope}; malformed messages
- * are ignored. No reconnection logic (Phase 9).
+ * Open a resilient WebSocket to `url` and stream incoming CLV envelopes into the
+ * graph store. Each message is validated by {@link parseEnvelope} (malformed
+ * messages are ignored) and folded through the single {@link ingest} entry point.
  *
- * @param url - the WebSocket URL (e.g. `ws://localhost:7000`).
- * @returns the socket plus a `close()` handle.
+ * Lifecycle: {@link connectionStatus} goes `connecting` → `open` on the socket's
+ * `open` event → `reconnecting` when it drops (`close`/`error`) → `open` again on
+ * recovery → `closed` when {@link WsClient.close} is called. A drop schedules one
+ * reconnect via `setTimeout` after {@link connect~backoffDelay}; a successful
+ * re-open **resets** the attempt counter. On every (re-)open the client sends the
+ * `{"type":"snapshot"}` resync frame **first**, then one `expand` per id from
+ * {@link ConnectOptions.getExpandedNodes}, so the graph converges back to the
+ * server's state (BUILD_PLAN cross-cutting).
+ *
+ * @param url - the WebSocket URL (e.g. `ws://127.0.0.1:7000`).
+ * @param options - optional open-node supplier and backoff schedule.
+ * @returns a {@link WsClient} whose `socket` and send handles always target the
+ *   current live socket.
  */
-export function connect(url: string): WsClient {
-	const socket = new WebSocket(url);
-	socket.addEventListener('message', (event: MessageEvent) => {
+export function connect(url: string, options?: ConnectOptions): WsClient {
+	const backoff = options?.backoff ?? DEFAULT_BACKOFF;
+	let socket: WebSocket;
+	let attempt = 0;
+	let intentionalClose = false;
+	let reconnectPending = false;
+	let hasConnectedOnce = false;
+	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Aborts the current socket's lifecycle listeners when the socket is swapped. */
+	let socketAbort: AbortController | undefined;
+
+	/**
+	 * Delay before the next reconnect: the exponential term
+	 * `baseMs * 2 ** (attempt - 1)` is capped at `maxMs` **before** jitter is
+	 * added, so a zero-jitter schedule is exactly base, 2×, 4×, … up to the cap.
+	 */
+	function backoffDelay(): number {
+		const capped = Math.min(backoff.maxMs, backoff.baseMs * 2 ** (attempt - 1));
+		return capped + (backoff.jitter ? backoff.jitter() : 0);
+	}
+
+	/** Resync a freshly-opened socket: snapshot first, then re-expand each open node. */
+	function resync(): void {
+		safeSend(socket, SNAPSHOT_REQUEST);
+		const open = options?.getExpandedNodes?.();
+		if (open) for (const id of open) requestExpand(socket, id);
+	}
+
+	function handleOpen(): void {
+		attempt = 0; // recovery resets the backoff schedule
+		connectionStatus.set('open');
+		// Skip the redundant resync on the FIRST open: the server already pushes a
+		// root snapshot on connect. Only re-opens replay snapshot + re-expand.
+		if (hasConnectedOnce) resync();
+		else hasConnectedOnce = true;
+	}
+
+	function handleMessage(event: MessageEvent): void {
 		const data: unknown = event.data;
 		const envelope = parseEnvelope(data);
 		if (envelope) ingest(envelope);
-	});
-	return { socket, close: () => socket.close() };
+	}
+
+	/**
+	 * A socket drop (`close`/`error`, not an intentional `close()`) schedules one
+	 * backed-off reconnect. `reconnectPending` dedupes the `error`-then-`close`
+	 * pair browsers fire, so a single drop advances the backoff only once.
+	 */
+	function handleDrop(): void {
+		if (intentionalClose || reconnectPending) return;
+		reconnectPending = true;
+		attempt += 1;
+		connectionStatus.set('reconnecting');
+		reconnectTimer = setTimeout(() => {
+			reconnectPending = false;
+			openSocket();
+		}, backoffDelay());
+	}
+
+	/**
+	 * Open a fresh socket and bind the lifecycle listeners onto it under a
+	 * per-socket {@link AbortController}. The outgoing socket's controller is
+	 * aborted first, detaching its listeners so a stale socket's late
+	 * `close`/`error` can't resolve the shared {@link handleDrop} and drive a
+	 * second reconnect.
+	 */
+	function openSocket(): void {
+		socketAbort?.abort();
+		const controller = new AbortController();
+		socketAbort = controller;
+		const { signal } = controller;
+		socket = new WebSocket(url);
+		socket.addEventListener('open', handleOpen, { signal });
+		socket.addEventListener('message', handleMessage, { signal });
+		socket.addEventListener('close', handleDrop, { signal });
+		socket.addEventListener('error', handleDrop, { signal });
+	}
+
+	connectionStatus.set('connecting');
+	openSocket();
+
+	return {
+		get socket() {
+			return socket;
+		},
+		requestExpand: (nodeId: string) => requestExpand(socket, nodeId),
+		send: (data: string) => safeSend(socket, data),
+		close: () => {
+			intentionalClose = true;
+			clearTimeout(reconnectTimer);
+			socketAbort?.abort();
+			connectionStatus.set('closed');
+			socket.close();
+		}
+	};
+}
+
+/**
+ * Send `data` over `socket` only while it is `OPEN`. During the reconnect window a
+ * socket is either `CLOSED` (a `send` is silently dropped) or `CONNECTING` (a
+ * `send` throws `InvalidStateError`), so an unguarded send from a user expand click
+ * mid-reconnect surfaces an uncaught `DOMException`. Gating here makes that click a
+ * no-op; the id it targeted is already in the render-side open set, so the next
+ * re-open's {@link connect~resync} replays the `expand`.
+ *
+ * @param socket - the (possibly not-yet-open) WebSocket.
+ * @param data - the frame to send when the socket is open.
+ */
+function safeSend(socket: WebSocket, data: string): void {
+	if (socket.readyState === WebSocket.OPEN) socket.send(data);
 }
 
 /**
@@ -369,13 +544,57 @@ export function connect(url: string): WsClient {
  * exactly `{"type":"expand","nodeId":"<nodeId>"}` (keys `type` then `nodeId`),
  * which the backend answers with a `subtree` envelope carrying that node's
  * direct children. Children are fetched only on this explicit request — the
- * client never pre-fetches a subtree.
+ * client never pre-fetches a subtree. The send is gated on `readyState === OPEN`
+ * ({@link safeSend}) so an expand issued during the reconnect window is dropped
+ * rather than thrown, and replayed by the next re-open's resync.
  *
  * @param socket - the live WebSocket connection.
  * @param nodeId - the id of the node whose children to load.
  */
 export function requestExpand(socket: WebSocket, nodeId: string): void {
-	socket.send(JSON.stringify({ type: 'expand', nodeId }));
+	safeSend(socket, JSON.stringify({ type: 'expand', nodeId }));
+}
+
+/**
+ * BFS the transitive descendants of `nodeId` down `parentId` links. Shared by
+ * {@link collapse} (which discards these nodes + their incident edges) and
+ * {@link descendantIds} (which exposes the same set to the render layer), so the
+ * two can never disagree about what a collapse removes. `nodeId` itself is never
+ * included; an absent id yields the empty set.
+ *
+ * @param state - the current graph state.
+ * @param nodeId - the root whose descendants to collect.
+ * @returns the set of transitive descendant ids (excluding `nodeId`).
+ */
+function collectDescendants(state: GraphState, nodeId: string): Set<string> {
+	const removed = new Set<string>();
+	const queue: string[] = [nodeId];
+	while (queue.length > 0) {
+		const parent = queue.shift() as string;
+		for (const node of state.nodes.values()) {
+			if (node.parentId === parent && !removed.has(node.id)) {
+				removed.add(node.id);
+				queue.push(node.id);
+			}
+		}
+	}
+	return removed;
+}
+
+/**
+ * Return the transitive descendant ids of `nodeId` — every node reachable by
+ * following `parentId` links downward from it, `nodeId` itself excluded. This is
+ * exactly the set {@link collapse} discards from the store; exposing it lets the
+ * render layer prune a collapsed node's descendants from its `expanded` gate, so a
+ * later reconnect resync never re-`expand`s an orphan id whose children the layout
+ * can no longer place (the P9-6 stale-descendant leak). The input is never mutated.
+ *
+ * @param state - the current graph state.
+ * @param nodeId - the node whose descendants to enumerate.
+ * @returns a set of descendant ids (empty when `nodeId` is a leaf or absent).
+ */
+export function descendantIds(state: GraphState, nodeId: string): Set<string> {
+	return collectDescendants(state, nodeId);
 }
 
 /**
@@ -392,17 +611,7 @@ export function requestExpand(socket: WebSocket, nodeId: string): void {
  * @returns the next graph state without `nodeId`'s descendants.
  */
 export function collapse(state: GraphState, nodeId: string): GraphState {
-	const removed = new Set<string>();
-	const queue: string[] = [nodeId];
-	while (queue.length > 0) {
-		const parent = queue.shift() as string;
-		for (const node of state.nodes.values()) {
-			if (node.parentId === parent && !removed.has(node.id)) {
-				removed.add(node.id);
-				queue.push(node.id);
-			}
-		}
-	}
+	const removed = collectDescendants(state, nodeId);
 	const nextNodes = new Map<string, Node>();
 	for (const [id, node] of state.nodes) {
 		if (!removed.has(id)) nextNodes.set(id, node);

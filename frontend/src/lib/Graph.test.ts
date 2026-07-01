@@ -4,7 +4,12 @@ import { get } from 'svelte/store';
 import { tick } from 'svelte';
 import Graph from './Graph.svelte';
 import HierarchyNodeHarness from './HierarchyNode.harness.svelte';
-import { ingest, graphStore, initialState } from './ws';
+import GraphExpandedHarness from './Graph.expanded.harness.svelte';
+import { ingest, graphStore, initialState, requestExpand } from './ws';
+// P9-6 (RED): namespace import so the not-yet-exported `connectionStatus` store reads
+// as `undefined` at runtime (fails the test on the missing store, not a module crash)
+// while `svelte-check` errors on `WS.connectionStatus` — proving the store is absent.
+import * as WS from './ws';
 import type { Node, Edge, EventEnvelope, NodeStatus, TestOutcome } from './types';
 
 const fileNode: Node = {
@@ -107,11 +112,14 @@ describe('Graph.svelte lazy hierarchy render', () => {
 		expect(await screen.findByText('alpha')).toBeTruthy();
 	});
 
-	it('without an injected onExpand, expanding requests the subtree over the socket', async () => {
+	it('expanding routes the canonical expand frame through the onExpand handler', async () => {
 		ingest(snapshot([fileNode]));
 		const send = vi.fn();
-		const socket = { send } as unknown as WebSocket;
-		const screen = render(Graph, { props: { socket } });
+		// Mirror +page.svelte: onExpand routes through the stable WsClient/requestExpand,
+		// never a socket prop captured by Graph (the removed P9-6 foot-gun).
+		const socket = { send, readyState: WebSocket.OPEN } as unknown as WebSocket;
+		const onExpand = (nodeId: string): void => requestExpand(socket, nodeId);
+		const screen = render(Graph, { props: { onExpand } });
 		await tick();
 
 		await fireEvent.click(await screen.findByTestId(toggleId('file:src/x.rs')));
@@ -422,5 +430,65 @@ describe('Graph.svelte hot edge rendering', () => {
 		ingest(hotEdge(dataEdge.id, 'exit'));
 		await waitFor(() => expect(container.querySelector('.svelte-flow__edge.hot-edge')).toBeNull());
 		expect(container.querySelectorAll('.svelte-flow__edge.animated').length).toBe(1);
+	});
+});
+
+// P9-6 (RED): the connection-status indicator. GREEN adds the `connectionStatus`
+// writable store to ws.ts (`'connecting' | 'open' | 'reconnecting' | 'closed'`) and a
+// small badge in Graph.svelte gated on it, carrying data-testid="connection-status".
+// The badge is visible while the socket is not open (so the user sees the resync in
+// flight) and absent once the socket recovers. RED until both exist.
+describe('Graph.svelte connection-status reconnecting indicator', () => {
+	it('shows a "reconnecting" indicator while disconnected and hides it once open', async () => {
+		const screen = render(Graph);
+		await tick();
+
+		WS.connectionStatus.set('reconnecting');
+		await tick();
+		const badge = await screen.findByTestId('connection-status');
+		expect(badge.textContent).toMatch(/reconnect/i);
+
+		WS.connectionStatus.set('open');
+		await tick();
+		expect(screen.queryByTestId('connection-status')).toBeNull();
+	});
+});
+
+// P9-6 fix: the REAL toggle() collapse path must prune the collapsed node's id AND
+// its transitive descendant ids from the render-side `expanded` open set. Driven end
+// to end through the component (expand file → expand fn → collapse file) and read back
+// via a `bind:expanded` harness. Before the fix toggle() deleted only the collapsed
+// id, leaving `fn:src/x.rs:alpha` a stale entry a reconnect resync would re-expand
+// into an invisible orphan.
+describe('Graph.svelte collapse prunes descendants from the open set (P9-6)', () => {
+	it('expand file → expand fn → collapse file leaves neither the file id nor its orphaned fn descendant open', async () => {
+		// Store holds the full file→fn→var tree so descendantIds can walk it at collapse time.
+		ingest(snapshot([fileNode, fnNode, varNode]));
+		let open = new Set<string>();
+		const onExpand = vi.fn();
+		const screen = render(GraphExpandedHarness, {
+			props: { onExpand, report: (s: Set<string>) => (open = s) }
+		});
+		await tick();
+
+		// Expand the file → its function child renders and the file id enters the open set.
+		await fireEvent.click(await screen.findByTestId(toggleId('file:src/x.rs')));
+		expect(await screen.findByText('alpha')).toBeTruthy();
+		// Expand the function → the fn id enters the open set too (nested expansion).
+		await fireEvent.click(await screen.findByTestId(toggleId('fn:src/x.rs:alpha')));
+		await tick();
+		expect(open.has('file:src/x.rs')).toBe(true);
+		expect(open.has('fn:src/x.rs:alpha')).toBe(true);
+
+		// Collapse the file: toggle() must drop the file id AND its orphaned fn descendant.
+		await fireEvent.click(await screen.findByTestId(toggleId('file:src/x.rs')));
+		await tick();
+		expect(open.has('file:src/x.rs')).toBe(false);
+		expect(open.has('fn:src/x.rs:alpha')).toBe(false);
+		expect(open.size).toBe(0);
+
+		// And every surviving open id still exists in the (collapsed) store — no orphans.
+		const state = get(graphStore);
+		for (const id of open) expect(state.nodes.has(id)).toBe(true);
 	});
 });
